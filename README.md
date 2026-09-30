@@ -129,28 +129,17 @@ See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the full design: threat m
 
 ## Installing
 
-One script for Linux, macOS and Windows (in Git Bash, which GitHub Actions uses for `shell: bash`):
+The latest release, command line and desktop app:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aleslanik2/nepomuk/main/install.sh | sh
-sh install.sh --version v0.1.0 --dir /usr/local/bin
-sh install.sh --from-source            # build with cargo instead of downloading
+curl -fsSL https://github.com/aleslanik2/nepomuk/releases/latest/download/install.sh -o install.sh
+sh install.sh          # the CLI, into ~/.local/bin
+sh install.sh --gui    # the desktop app
 ```
 
-The desktop app (macOS: `nepomuk.app` in Applications, Linux: an AppImage with a menu entry, Windows: a per-user installer):
+The script works on Linux, macOS and Windows (in Git Bash); on Windows without Git Bash use `install.ps1` from the same release (`./install.ps1`, `./install.ps1 -Gui`). The desktop app goes to Applications on macOS, to an AppImage with a menu entry on Linux, and through a per-user installer on Windows. Nothing is installed unless `SHA256SUMS` carries a valid release signature and the download matches it.
 
-```bash
-sh install.sh --gui                                  # from the release (v0.2.0 and later)
-sh install.sh --gui --from-source --source .         # build it from this checkout (needs cargo and Node.js)
-./install.ps1 -Gui                                   # Windows PowerShell
-```
-
-The binary is installed only if `SHA256SUMS` carries a valid release signature (`ssh-keygen -Y verify`) and the archive matches it. In CI, pin the exact archive hash instead:
-
-```yaml
-- run: sh install.sh --version v0.1.0 --sha256 <published SHA-256>
-  shell: bash
-```
+Options: `--version <tag>` installs a specific release, `--dir <path>` changes where the CLI goes, `--sha256 <hash>` pins the exact archive (recommended in CI), and `--from-source` builds with cargo instead of downloading (`--source <dir>` for a local checkout; the GUI also needs Node.js). While the repository is private, set `GH_TOKEN` and the script downloads through the GitHub CLI.
 
 ## Building
 
