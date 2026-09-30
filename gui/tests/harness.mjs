@@ -51,6 +51,9 @@ m(["grant", "group:android-release", "read", "/projects/eshop-android/signing"])
 m(["grant", "user:jane@example.com", "write", "/infra/db"]);
 m(["revoke", "user:jane@example.com", "/infra/db"]);
 const fp = JSON.parse(m(["info"])).data.master_fingerprint;
+// A second vault for switching.
+const vault2 = join(work, "second.nepomuk");
+run(["--vault", vault2, "init", "--out", join(work, "master2.npk")], { NEPOMUK_PASSPHRASE: MASTER_PASS });
 
 // ------------------------------------------------------------------ Bridge server
 
@@ -365,6 +368,18 @@ step("enrollment", async () => {
   await click("Save access request");
   await waitFor(hasText("Send this file to an administrator"), "request saved");
   await shot("13-enroll");
+});
+
+step("switch to another vault", async () => {
+  await click("Back");
+  await waitFor(hasText("Change vault"), "login with the change button");
+  await click("Change vault");
+  await waitFor("!!document.querySelector('dialog[open]')", "switch dialog");
+  await shot("14-switch-vault");
+  picks.push(vault2);
+  await click("Vault file", "dialog button");
+  // The second vault has a different master, not pinned yet.
+  await waitFor(hasText("Verify the master"), "trust screen of the second vault");
 });
 
 let failed = false;

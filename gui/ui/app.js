@@ -67,6 +67,38 @@ async function connect(target) {
   }
 }
 
+const currentPath = () => state.conn?.vault || state.conn?.project || "";
+
+/** Lets the user open a different vault file or project folder; locks the current session first. */
+export async function switchVault() {
+  const target = await dialog("Open a different vault", (close) => {
+    const pickBtn = (kind, label, hint) => {
+      const b = h("button", { onClick: async () => {
+        const path = await busy(b, () => invoke("pick", { kind }));
+        if (path) close(kind === "vault" ? { vault: path } : { project: path });
+      } }, label, h("span", hint));
+      return b;
+    };
+    const others = recent().filter((r) => (r.vault || r.project) !== currentPath());
+    return h("div", { class: "stack" },
+      currentPath() ? h("p", { class: "muted" }, "Open now: ", h("span", { class: "mono" }, currentPath())) : null,
+      h("div", { class: "choice" },
+        pickBtn("vault", "Vault file", "A .nepomuk file"),
+        pickBtn("project", "Project folder", "A folder with .nepomuk.toml")),
+      others.length ? h("div", { class: "stack" }, h("h3", "Recently opened"),
+        h("div", { class: "recent" }, others.map((r) => h("button", { class: "quiet", onClick: () => close(r) }, r.vault || r.project)))) : null,
+      h("div", { class: "actions end" }, h("button", { class: "quiet", onClick: () => close() }, "Cancel")));
+  });
+  if (!target) return;
+  if (state.unlocked) await rpc("session.lock").catch(() => {});
+  state.unlocked = false;
+  state.me = null;
+  state.selected = null;
+  state.view = "secrets";
+  refs = {};
+  await connect(target);
+}
+
 async function afterConnect() {
   try {
     state.info = await rpc("vault.info");
@@ -226,7 +258,9 @@ export function renderLogin(message) {
     h("div", { class: "stack" },
       h("p", "Master of this vault:"),
       state.info ? fingerprint(state.info.master_fingerprint, 72) : null,
-      h("p", { class: "mono" }, state.conn?.vault || state.conn?.project || "")),
+      h("div", { class: "stack" },
+        h("p", { class: "mono" }, currentPath()),
+        h("div", h("button", { class: "small on-ink", onClick: () => switchVault() }, "Change vault")))),
     h("h1", "Unlock"),
     message ? h("div", { class: "notice seal" }, message) : null,
     touchBox,
@@ -235,7 +269,7 @@ export function renderLogin(message) {
     h("div", { class: "actions" },
       h("button", { class: "quiet small", onClick: () => renderEnroll() }, "Request access"),
       h("button", { class: "quiet small", onClick: () => renderNewIdentity() }, "Create an identity file"),
-      h("button", { class: "quiet small", onClick: async () => { await invoke("disconnect"); renderStart(); } }, "Open another vault"))));
+      h("button", { class: "quiet small", onClick: () => switchVault() }, "Open another vault"))));
 }
 
 function shortPath(p) {
@@ -386,8 +420,9 @@ export async function loadShell() {
   refs = { statusEl, title, content, nav };
   mount(app, h("div", { class: "shell" },
     h("aside", { class: "sidebar" },
-      h("div", { class: "vault", title: state.conn?.vault || state.conn?.project || "" },
-        h("strong", "nepomuk"), h("small", basename(state.conn?.vault || state.conn?.project || ""))),
+      h("div", { class: "vault", title: currentPath() },
+        h("strong", "nepomuk"), h("small", basename(currentPath())),
+        h("div", h("button", { class: "small on-ink", onClick: () => switchVault() }, "Switch vault"))),
       nav,
       h("div", { class: "me" },
         h("strong", state.me.name),

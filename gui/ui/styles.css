@@ -318,3 +318,6 @@ button.touch small { grid-column: 2; font-weight: 400; opacity: 0.85; }
 .gate-side .mono { word-break: break-all; font-size: var(--step--1); }
 .fingerprint > .fp-text { min-width: 0; }
 .sidebar .muted { color: var(--ink-text); opacity: 0.8; }
+button.on-ink { background: transparent; color: var(--ink-text); border-color: var(--ink-2); margin-top: 0.4rem; }
+button.on-ink:hover { color: #fff; border-color: var(--ink-text); }
+dialog .mono { word-break: break-all; }

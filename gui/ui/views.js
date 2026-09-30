@@ -650,7 +650,8 @@ async function vaultView(target, ctx) {
       h("h3", "Settings on this computer"),
       h("div", { class: "field-row" }, h("label", "Clear copied secrets after (seconds)", clip), h("label", "Lock after inactivity (minutes)", idle)),
       h("div", { class: "actions" }, saveSettings)),
-    h("div", { class: "actions" }, h("button", { class: "quiet", onClick: async () => { await invoke("disconnect"); location.reload(); } }, "Close this vault"))));
+    h("div", { class: "actions" }, h("button", { onClick: () => import("./app.js").then((m) => m.switchVault()) }, "Open a different vault"),
+      h("button", { class: "quiet", onClick: async () => { await invoke("disconnect"); location.reload(); } }, "Close this vault"))));
 }
 
 export const views = {
