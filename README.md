@@ -135,3 +135,7 @@ See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the full design: threat m
 1. MVP: CLI, GUI, identities, permissions, groups, records and templates, `exec`, signed log, git integration, offboarding, hardware-token master.
 2. Google Workspace directory check (alerts on departed employees, group mapping).
 3. More templates (iOS signing, TLS), pull-request workflow for selected folders.
+
+## License
+
+[Apache License 2.0](LICENSE)
