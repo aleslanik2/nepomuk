@@ -1,0 +1,285 @@
+//! nepomuk GUI backend (§13): translates between the web UI and `nepomuk serve --stdio`.
+//! It holds no keys and does no cryptography; the web layer gets no file system or network
+//! access beyond the explicit commands below.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod clipboard;
+mod lockwatch;
+mod sidecar;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use base64::Engine;
+use serde_json::{Value, json};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
+use zeroize::Zeroizing;
+
+use sidecar::{Sidecar, err};
+
+const API_VERSION: u64 = 1;
+
+struct AppState {
+    sidecar: Mutex<Option<Arc<Sidecar>>>,
+    clipboard: clipboard::SecretClipboard,
+}
+
+impl AppState {
+    fn current(&self) -> Result<Arc<Sidecar>, Value> {
+        self.sidecar
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| err("GUI_NOT_CONNECTED", "no vault is open"))
+    }
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Value> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| err("GUI_INTERNAL", e.to_string()))
+}
+
+/// Starts the CLI for a vault file or a project folder (with `.nepomuk.toml`) and checks
+/// API compatibility (§12.3).
+#[tauri::command]
+async fn connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    vault: Option<String>,
+    project: Option<String>,
+) -> Result<Value, Value> {
+    state.sidecar.lock().unwrap().take();
+    let vault = vault.map(PathBuf::from);
+    let project = project.map(PathBuf::from);
+    let sc = Sidecar::spawn(app, vault.clone(), project.clone())?;
+    let s2 = sc.clone();
+    let version = blocking(move || s2.call("version", json!({}))).await??;
+    if version.get("api").and_then(Value::as_u64) != Some(API_VERSION) {
+        return Err(json!({
+            "code": "GUI_INCOMPATIBLE_CLI",
+            "message": format!("this GUI needs JSON API {API_VERSION}; the bundled CLI reports {}", version["api"]),
+            "details": version,
+        }));
+    }
+    *state.sidecar.lock().unwrap() = Some(sc);
+    Ok(json!({
+        "version": version,
+        "vault": vault.map(|p| p.display().to_string()),
+        "project": project.map(|p| p.display().to_string()),
+    }))
+}
+
+#[tauri::command]
+async fn disconnect(state: State<'_, AppState>) -> Result<(), Value> {
+    state.sidecar.lock().unwrap().take();
+    Ok(())
+}
+
+/// Forwards one JSON-RPC call to the CLI.
+#[tauri::command]
+async fn rpc(
+    state: State<'_, AppState>,
+    method: String,
+    params: Option<Value>,
+) -> Result<Value, Value> {
+    let sc = state.current()?;
+    blocking(move || sc.call(&method, params.unwrap_or_else(|| json!({})))).await?
+}
+
+fn path_string(p: tauri_plugin_dialog::FilePath) -> Option<String> {
+    p.into_path().ok().map(|p| p.display().to_string())
+}
+
+/// System dialogs for choosing a vault, a project folder, an identity or a request file.
+#[tauri::command]
+async fn pick(app: AppHandle, kind: String) -> Result<Option<String>, Value> {
+    blocking(move || {
+        let d = app.dialog().file();
+        match kind.as_str() {
+            "vault" => d
+                .set_title("Open a vault")
+                .add_filter("nepomuk vault", &["nepomuk"])
+                .blocking_pick_file(),
+            "project" => d
+                .set_title("Open a project folder with .nepomuk.toml")
+                .blocking_pick_folder(),
+            "identity" => d
+                .set_title("Choose an identity file")
+                .add_filter("nepomuk identity", &["npk"])
+                .blocking_pick_file(),
+            "request" => d
+                .set_title("Choose an access request")
+                .add_filter("nepomuk request", &["request"])
+                .blocking_pick_file(),
+            _ => d.blocking_pick_file(),
+        }
+        .and_then(path_string)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn pick_save(app: AppHandle, default_name: String) -> Result<Option<String>, Value> {
+    blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&default_name)
+            .blocking_save_file()
+            .and_then(path_string)
+    })
+    .await
+}
+
+/// Reads a file chosen by the user (binary secrets and record fields).
+#[tauri::command]
+async fn pick_file_b64(app: AppHandle) -> Result<Option<Value>, Value> {
+    blocking(move || {
+        let path = app
+            .dialog()
+            .file()
+            .set_title("Choose a file to store")
+            .blocking_pick_file()
+            .and_then(|p| p.into_path().ok())?;
+        let data = Zeroizing::new(std::fs::read(&path).ok()?);
+        Some(json!({
+            "name": path.file_name().map(|n| n.to_string_lossy().to_string()),
+            "size": data.len(),
+            "base64": base64::engine::general_purpose::STANDARD.encode(&*data),
+        }))
+    })
+    .await
+}
+
+fn secret_bytes(v: &Value) -> Result<Zeroizing<Vec<u8>>, Value> {
+    if let Some(s) = v.get("value").and_then(Value::as_str) {
+        return Ok(Zeroizing::new(s.as_bytes().to_vec()));
+    }
+    if let Some(b) = v.get("base64").and_then(Value::as_str) {
+        return base64::engine::general_purpose::STANDARD
+            .decode(b)
+            .map(Zeroizing::new)
+            .map_err(|_| err("GUI_INTERNAL", "invalid base64 from the CLI"));
+    }
+    Err(err("USAGE", "choose a single value or a record field"))
+}
+
+/// Copies a secret without handing it to the web layer.
+#[tauri::command]
+async fn copy_secret(
+    state: State<'_, AppState>,
+    spec: String,
+    seconds: Option<u64>,
+) -> Result<(), Value> {
+    let sc = state.current()?;
+    let v = blocking(move || sc.call("node.get", json!({ "path": spec }))).await??;
+    if v.get("value").is_none() {
+        return Err(err(
+            "USAGE",
+            "only text values can be copied; save files instead",
+        ));
+    }
+    let bytes = secret_bytes(&v)?;
+    let text = Zeroizing::new(String::from_utf8_lossy(&bytes).to_string());
+    state.clipboard.copy_secret(
+        text,
+        Duration::from_secs(seconds.unwrap_or(30).clamp(5, 600)),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn copy_plain(state: State<'_, AppState>, text: String) -> Result<(), Value> {
+    state.clipboard.copy_plain(text);
+    Ok(())
+}
+
+/// Saves a secret only through the system dialog (§13), readable only by the user.
+#[tauri::command]
+async fn save_secret(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    spec: String,
+    default_name: String,
+) -> Result<Option<String>, Value> {
+    let sc = state.current()?;
+    blocking(move || {
+        let v = sc.call("node.get", json!({ "path": spec }))?;
+        let bytes = secret_bytes(&v)?;
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_file_name(&default_name)
+            .blocking_save_file()
+            .and_then(|p| p.into_path().ok())
+        else {
+            return Ok(None);
+        };
+        write_private(&path, &bytes)
+            .map_err(|e| err("GENERAL", format!("cannot write {}: {e}", path.display())))?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await?
+}
+
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// Locks the session whenever the screen gets locked.
+fn watch_screen_lock(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut was_locked = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(3));
+            let locked = lockwatch::screen_locked().unwrap_or(false);
+            if locked && !was_locked {
+                let sc = app.state::<AppState>().sidecar.lock().unwrap().clone();
+                if let Some(sc) = sc {
+                    let _ = sc.call("session.lock", json!({}));
+                }
+                let _ = app.emit("nepomuk:locked", json!({ "reason": "screen" }));
+            }
+            was_locked = locked;
+        }
+    });
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState {
+            sidecar: Mutex::new(None),
+            clipboard: clipboard::SecretClipboard::start(),
+        })
+        .setup(|app| {
+            watch_screen_lock(app.handle().clone());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            connect,
+            disconnect,
+            rpc,
+            pick,
+            pick_save,
+            pick_file_b64,
+            copy_secret,
+            copy_plain,
+            save_secret
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running the nepomuk GUI");
+}

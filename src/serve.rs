@@ -117,13 +117,35 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                 ctx.opts.identity = Some(i.into());
                 ctx.opts.email = None;
             }
-            *ctx.password_override.borrow_mut() = Some(Zeroizing::new(p_str(p, "password")?));
+            let use_touchid = p_bool(p, "touchid");
+            if !use_touchid {
+                *ctx.password_override.borrow_mut() = Some(Zeroizing::new(p_str(p, "password")?));
+            }
+            ctx.opts.touchid = use_touchid;
+            ctx.opts.session = !use_touchid;
+            ctx.opts.remember_touchid = p_bool(p, "remember_touchid");
             let result = app::open_vault(ctx, true).and_then(|o| {
                 let id = ctx.unlock(&o.v.state)?;
-                Ok(json!({ "name": id.name, "fingerprint": id.fingerprint() }))
+                Ok(json!({ "name": id.name, "fingerprint": id.fingerprint(), "touchid": crate::touchid::enabled_for(o.v.file.vault_id).is_some() }))
             });
+            ctx.opts.touchid = false;
+            ctx.opts.session = true;
+            ctx.opts.remember_touchid = false;
             ctx.password_override.borrow_mut().take();
             result
+        }
+        "touchid.status" => {
+            let loc = ctx.location()?;
+            let loaded = loc.load(false)?;
+            let vault = crate::format::peek_vault_id(&loaded.bytes)?;
+            Ok(
+                json!({ "available": crate::touchid::available(), "enabled": crate::touchid::enabled_for(vault) }),
+            )
+        }
+        "touchid.disable" => {
+            let loaded = ctx.location()?.load(false)?;
+            let vault = crate::format::peek_vault_id(&loaded.bytes)?;
+            Ok(json!({ "disabled": crate::touchid::disable(vault) }))
         }
         "session.lock" => {
             *ctx.unlocked.borrow_mut() = None;
@@ -287,6 +309,106 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             notify("sync.progress", json!({ "stage": "done" }));
             Ok(out)
         }
+        "identity.request" => {
+            // Password enrollment request (§4.3); keys and password stay on this machine.
+            let email = p_str(p, "email")?;
+            let password = Zeroizing::new(p_str(p, "password")?);
+            let out = std::path::PathBuf::from(p_str(p, "out")?);
+            crate::identity::validate_name(&email)?;
+            crate::password::check(&password, &[&email])?;
+            let id =
+                crate::identity::Unlocked::generate(&email, crate::model::IdentityKind::Password);
+            let cred = crate::identity::password_credential(&id, &password)?;
+            let req = crate::identity::Request::new(&id, Some(cred));
+            std::fs::write(&out, req.to_text())?;
+            Ok(
+                json!({ "name": email, "request": out.display().to_string(), "fingerprint": req.fingerprint() }),
+            )
+        }
+        "identity.new" => {
+            let name = p_str(p, "name")?;
+            let pass = Zeroizing::new(p_str(p, "passphrase")?);
+            let out = std::path::PathBuf::from(p_str(p, "out")?);
+            crate::identity::validate_name(&name)?;
+            crate::password::check(&pass, &[&name])?;
+            if out.exists() {
+                return Err(Error::new(
+                    Code::AlreadyExists,
+                    format!("{} already exists", out.display()),
+                ));
+            }
+            let id = crate::identity::Unlocked::generate(&name, crate::model::IdentityKind::Local);
+            let f = crate::identity::IdentityFile::create(&id, &pass)?;
+            crate::config::write_private(&out, f.to_text().as_bytes())?;
+            let req = crate::identity::Request::new(&id, None);
+            let req_path = out.with_extension("request");
+            std::fs::write(&req_path, req.to_text())?;
+            Ok(
+                json!({ "name": name, "identity": out.display().to_string(), "request": req_path.display().to_string(), "fingerprint": id.fingerprint() }),
+            )
+        }
+        "request.inspect" => {
+            let req =
+                crate::identity::Request::parse(&std::fs::read_to_string(p_str(p, "path")?)?)?;
+            req.verify()?;
+            Ok(
+                json!({ "name": req.name, "kind": req.kind, "fingerprint": req.fingerprint(), "request": req.to_text() }),
+            )
+        }
+        "identity.local" => {
+            // Identity files in the default folder (~/.config/nepomuk); no passphrase needed.
+            let dir = crate::config::config_dir();
+            let default = ctx
+                .user
+                .identity
+                .clone()
+                .unwrap_or_else(crate::config::default_identity_path);
+            let mut files: Vec<Value> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "npk"))
+                        .filter_map(|p| {
+                            let f = crate::identity::IdentityFile::parse(&std::fs::read_to_string(&p).ok()?).ok()?;
+                            Some(json!({ "path": p.display().to_string(), "name": f.name, "fingerprint": f.fingerprint() }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if default.is_file()
+                && !files
+                    .iter()
+                    .any(|f| f["path"] == default.display().to_string())
+                && let Ok(f) =
+                    crate::identity::IdentityFile::parse(&std::fs::read_to_string(&default)?)
+            {
+                files.push(json!({ "path": default.display().to_string(), "name": f.name, "fingerprint": f.fingerprint() }));
+            }
+            files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+            // The CLI's default identity, or the only identity in the folder (e.g. master.npk after init).
+            let default_path = if default.is_file() {
+                Some(default.display().to_string())
+            } else if files.len() == 1 {
+                files[0]["path"].as_str().map(str::to_string)
+            } else {
+                None
+            };
+            Ok(json!({ "dir": dir.display().to_string(), "default": default_path, "files": files }))
+        }
+        "templates.list" => Ok(
+            json!({ "templates": crate::templates::TEMPLATES.iter().map(|t| json!({
+            "name": t.name,
+            "fields": t.fields.iter().map(|(n, b)| json!({ "name": n, "binary": b })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>() }),
+        ),
+        "user.access" => {
+            queries::user_access(ctx, &app::open_vault(ctx, true)?, &p_str(p, "name")?)
+        }
+        "exec.profiles" => Ok(
+            json!({ "profiles": ctx.project.as_ref().map(|c| c.exec.iter().map(|(n, pr)| json!({
+            "name": n, "env": pr.env.keys().collect::<Vec<_>>(), "files": pr.file.keys().collect::<Vec<_>>(),
+        })).collect::<Vec<_>>()).unwrap_or_default() }),
+        ),
         "passgen" => {
             let words = p.get("words").and_then(|w| w.as_u64()).unwrap_or(6) as usize;
             Ok(json!({ "passphrase": crate::password::passgen(words.max(4)).as_str() }))

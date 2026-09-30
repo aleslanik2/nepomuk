@@ -36,9 +36,29 @@ fn entry(state: &State, acc: &Access, id: Id) -> Value {
     });
     if let Some(c) = &c {
         e["updated"] = json!(iso(c.meta.updated));
-        if let Content::Record { template, fields } = &c.content {
-            e["template"] = json!(template);
-            e["fields"] = json!(fields.keys().collect::<Vec<_>>());
+        match &c.content {
+            Content::Record { template, fields } => {
+                e["template"] = json!(template);
+                e["fields"] = json!(fields.keys().collect::<Vec<_>>());
+                let types: serde_json::Map<String, Value> = fields
+                    .iter()
+                    .map(|(k, f)| {
+                        let t = match f {
+                            Field::Text { .. } => json!({ "type": "text" }),
+                            Field::Binary { mime, data } => {
+                                json!({ "type": "binary", "mime": mime, "size": data.len() })
+                            }
+                        };
+                        (k.clone(), t)
+                    })
+                    .collect();
+                e["field_types"] = Value::Object(types);
+            }
+            Content::Binary { mime, data } => {
+                e["mime"] = json!(mime);
+                e["size"] = json!(data.len());
+            }
+            _ => {}
         }
         if let Some(na) = c.meta.not_after {
             e["expires"] = json!(iso(na));
@@ -263,6 +283,32 @@ pub fn access(ctx: &Ctx, o: &Opened, path: &str) -> Result<Value> {
         .collect();
     effective.sort_by(|a, b| a["user"].as_str().cmp(&b["user"].as_str()));
     Ok(json!({ "path": path, "grants": grants, "effective": effective }))
+}
+
+/// What a user can access (§13), limited to what the viewer can see.
+pub fn user_access(ctx: &Ctx, o: &Opened, name: &str) -> Result<Value> {
+    let (_, acc) = access_for(ctx, o)?;
+    let s = &o.v.state;
+    let u = s
+        .user_by_name(name)
+        .ok_or_else(|| Error::not_found(&format!("user {name}")))?;
+    let mut entries: Vec<Value> = acc
+        .nodes
+        .iter()
+        .filter_map(|(id, v)| {
+            let own = s.effective_right(u.id, *id)?;
+            // Report only where the right starts, not every descendant.
+            let parent = s.nodes[id].parent;
+            let inherited = parent.is_some_and(|p| {
+                s.effective_right(u.id, p) == Some(own) && acc.nodes.contains_key(&p)
+            });
+            (!inherited).then(|| json!({ "path": v.path, "right": own.as_str() }))
+        })
+        .collect();
+    entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    Ok(
+        json!({ "user": u.name, "master": s.is_master(u.id), "disabled": u.disabled, "access": entries }),
+    )
 }
 
 pub fn whoami(ctx: &Ctx, o: &Opened) -> Result<Value> {
