@@ -310,7 +310,10 @@ gui_from_release() {
         macos)
             mnt="$WORK/mnt"
             mkdir "$mnt"
-            hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$WORK/$asset" || die "cannot open $asset"
+            # The image shows the Apache 2.0 license; accept it non-interactively.
+            # (-quiet would decline it).
+            yes | PAGER=cat hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$WORK/$asset" >/dev/null 2>&1 ||
+                die "cannot open $asset"
             app=$(find "$mnt" -maxdepth 1 -name "*.app" | head -n1)
             [ -n "$app" ] || { hdiutil detach -quiet "$mnt"; die "no app in $asset"; }
             install_app_macos "$app"
