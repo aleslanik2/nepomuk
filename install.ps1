@@ -16,7 +16,10 @@
     ./install.ps1 -Version v0.1.0 -Sha256 <published SHA-256>
 
 .EXAMPLE
-    ./install.ps1 -Gui        # the desktop app (runs its installer silently, per user)
+    ./install.ps1 -System     # for all users: Program Files\nepomuk and the system PATH (as administrator)
+
+.EXAMPLE
+    ./install.ps1 -Gui        # the CLI and the desktop app (its installer runs silently)
 #>
 [CmdletBinding()]
 param(
@@ -26,7 +29,8 @@ param(
     [string]$Signers,
     [string]$BaseUrl = $env:NEPOMUK_BASE_URL,
     [switch]$NoPath,
-    [switch]$Gui
+    [switch]$Gui,
+    [switch]$System
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +56,11 @@ switch ($arch) {
     'AMD64' { $Target = 'x86_64-pc-windows-msvc' }
     'ARM64' { $Target = 'aarch64-pc-windows-msvc' }
     default { Die "unsupported architecture: $arch" }
+}
+if ($System) {
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $admin) { Die 'installing for all users needs an administrator PowerShell' }
+    if (-not $Dir) { $Dir = Join-Path $env:ProgramFiles 'nepomuk' }
 }
 if (-not $Dir) { $Dir = Join-Path $env:LOCALAPPDATA 'nepomuk\bin' }
 
@@ -129,16 +138,6 @@ function Get-Verified([string]$asset) {
 try {
     if ($Version -eq 'latest') { $Version = Resolve-Latest }
 
-    if ($Gui) {
-        # ARM64 Windows runs the x86_64 app through emulation.
-        $installer = Get-Verified "nepomuk-gui-$Version-x86_64-pc-windows-msvc.exe"
-        Say 'running the installer'
-        $p = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-        if ($p.ExitCode -ne 0) { Die "the installer failed with code $($p.ExitCode)" }
-        Say 'installed the nepomuk desktop app; start it from the Start menu'
-        return
-    }
-
     $asset = "nepomuk-$Version-$Target.tar.gz"
     $archive = Get-Verified $asset
 
@@ -162,13 +161,26 @@ try {
     if ($env:GITHUB_PATH) {
         Add-Content -LiteralPath $env:GITHUB_PATH -Value $Dir
     } elseif (-not $NoPath) {
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $parts = @($userPath -split ';' | Where-Object { $_ })
+        $scope = if ($System) { 'Machine' } else { 'User' }
+        $current = [Environment]::GetEnvironmentVariable('Path', $scope)
+        $parts = @($current -split ';' | Where-Object { $_ })
         if ($parts -notcontains $Dir) {
-            [Environment]::SetEnvironmentVariable('Path', (($parts + $Dir) -join ';'), 'User')
+            [Environment]::SetEnvironmentVariable('Path', (($parts + $Dir) -join ';'), $scope)
             $env:Path = "$env:Path;$Dir"
-            Say "added $Dir to your user PATH (open a new terminal)"
+            Say "added $Dir to the $($scope.ToLower()) PATH (open a new terminal)"
         }
+    }
+
+    # The desktop app comes in addition to the CLI.
+    if ($Gui) {
+        # ARM64 Windows runs the x86_64 app through emulation.
+        $installer = Get-Verified "nepomuk-gui-$Version-x86_64-pc-windows-msvc.exe"
+        Say 'running the installer'
+        # /AllUsers is the NSIS installer's per-machine mode.
+        $installArgs = if ($System) { @('/S', '/AllUsers') } else { @('/S') }
+        $p = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Die "the installer failed with code $($p.ExitCode)" }
+        Say 'installed the nepomuk desktop app; start it from the Start menu'
     }
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

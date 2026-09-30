@@ -3,7 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/aleslanik2/nepomuk/main/install.sh | sh
 #   sh install.sh --version v0.1.0 --dir /usr/local/bin
-#   sh install.sh --gui                              # the desktop app instead of the CLI
+#   sh install.sh --system                           # the CLI for all users (/usr/local/bin, sudo)
+#   sh install.sh --gui --system                     # the CLI and the desktop app, for all users
 #   sh install.sh --gui --from-source --source .     # build the app from a local checkout
 #
 # The binary is installed only after its SHA-256 matches SHA256SUMS and SHA256SUMS carries a
@@ -38,12 +39,14 @@ Usage: install.sh [options]
 Options:
   --version <tag>     Release to install (default: latest; env NEPOMUK_VERSION)
   --dir <path>        Installation directory (default: ~/.local/bin; env NEPOMUK_INSTALL_DIR)
+  --system            Install for all users: /usr/local/bin (Windows: Program Files\nepomuk),
+                      using sudo when needed; with --gui the system-wide app locations
   --sha256 <hash>     Expected SHA-256 of the release archive (env NEPOMUK_SHA256)
   --signers <file>    allowed_signers file with release keys (default: keys in this script)
   --base-url <url>    Download from a mirror instead of GitHub releases (env NEPOMUK_BASE_URL)
   --from-source       Build from source (cargo; for --gui also Node.js) instead of downloading
   --source <dir>      Local checkout to build from (default: clone the git tag)
-  --gui               Install the desktop app (macOS: Applications, Linux: AppImage, Windows: installer)
+  --gui               Also install the desktop app (macOS: Applications, Linux: AppImage, Windows: installer)
   --app-dir <path>    Where to put nepomuk.app on macOS (default: /Applications or ~/Applications)
   -h, --help          Show this help
 EOF
@@ -61,6 +64,8 @@ FROM_SOURCE=0
 SOURCE_DIR=""
 GUI=0
 APP_DIR=""
+SYSTEM=0
+SUDO=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,6 +78,7 @@ while [ $# -gt 0 ]; do
         --source) SOURCE_DIR="${2:?}"; shift 2 ;;
         --gui) GUI=1; shift ;;
         --app-dir) APP_DIR="${2:?}"; shift 2 ;;
+        --system) SYSTEM=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -97,7 +103,15 @@ detect_target() {
 }
 
 default_dir() {
-    if [ "$OS" = windows ] && [ -n "${LOCALAPPDATA:-}" ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        if [ "$OS" = windows ]; then
+            pf="${PROGRAMFILES:-C:\\Program Files}"
+            if command -v cygpath >/dev/null 2>&1; then pf=$(cygpath -u "$pf"); fi
+            printf '%s/nepomuk' "$pf"
+        else
+            printf '/usr/local/bin'
+        fi
+    elif [ "$OS" = windows ] && [ -n "${LOCALAPPDATA:-}" ]; then
         if command -v cygpath >/dev/null 2>&1; then
             printf '%s/nepomuk/bin' "$(cygpath -u "$LOCALAPPDATA")"
         else
@@ -167,12 +181,30 @@ resolve_latest() {
 
 # ---------------------------------------------------------------- Install
 
+# Uses sudo (or NEPOMUK_SUDO, e.g. doas) when a target directory is not writable.
+choose_sudo() { # directory
+    d="$1"
+    while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+    if [ -w "$d" ] || [ "$(id -u 2>/dev/null || echo 0)" = 0 ]; then
+        SUDO=""
+        return
+    fi
+    [ "$OS" != windows ] || die "$1 needs administrator rights: run Git Bash as administrator"
+    SUDO="${NEPOMUK_SUDO:-sudo}"
+    command -v "$SUDO" >/dev/null 2>&1 || die "$1 is not writable and $SUDO is not available"
+    say "installing into $1 needs administrator rights; using $SUDO"
+}
+
+put_file() { # source dir name
+    $SUDO mkdir -p "$2"
+    $SUDO cp "$1" "$2/.$3.tmp.$$"
+    $SUDO chmod 755 "$2/.$3.tmp.$$"
+    $SUDO mv -f "$2/.$3.tmp.$$" "$2/$3"
+}
+
 install_binary() { # source-file
-    mkdir -p "$INSTALL_DIR"
-    tmp_bin="$INSTALL_DIR/.$EXE.tmp.$$"
-    cp "$1" "$tmp_bin"
-    chmod 755 "$tmp_bin"
-    mv -f "$tmp_bin" "$INSTALL_DIR/$EXE"
+    choose_sudo "$INSTALL_DIR"
+    put_file "$1" "$INSTALL_DIR" "$EXE"
 }
 
 from_source() {
@@ -237,9 +269,7 @@ from_release() {
     install_binary "$bin"
     helper=$(find "$WORK/x" -type f -name nepomuk-touchid | head -n1)
     if [ -n "$helper" ]; then
-        cp "$helper" "$INSTALL_DIR/.nepomuk-touchid.tmp.$$"
-        chmod 755 "$INSTALL_DIR/.nepomuk-touchid.tmp.$$"
-        mv -f "$INSTALL_DIR/.nepomuk-touchid.tmp.$$" "$INSTALL_DIR/nepomuk-touchid"
+        put_file "$helper" "$INSTALL_DIR" nepomuk-touchid
     fi
 }
 
@@ -258,32 +288,35 @@ gui_target() {
 
 install_app_macos() { # path to nepomuk.app
     if [ -z "$APP_DIR" ]; then
-        if [ -w /Applications ]; then APP_DIR=/Applications; else APP_DIR="$HOME/Applications"; fi
+        if [ "$SYSTEM" = 1 ] || [ -w /Applications ]; then APP_DIR=/Applications; else APP_DIR="$HOME/Applications"; fi
     fi
-    mkdir -p "$APP_DIR"
+    choose_sudo "$APP_DIR"
+    $SUDO mkdir -p "$APP_DIR"
     if pgrep -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" >/dev/null 2>&1; then
         say "quitting the running app"
         pkill -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" || true
         sleep 1
     fi
-    rm -rf "$APP_DIR/nepomuk.app.tmp.$$"
-    cp -R "$1" "$APP_DIR/nepomuk.app.tmp.$$"
-    rm -rf "$APP_DIR/nepomuk.app"
-    mv "$APP_DIR/nepomuk.app.tmp.$$" "$APP_DIR/nepomuk.app"
+    $SUDO rm -rf "$APP_DIR/nepomuk.app.tmp.$$"
+    $SUDO cp -R "$1" "$APP_DIR/nepomuk.app.tmp.$$"
+    $SUDO rm -rf "$APP_DIR/nepomuk.app"
+    $SUDO mv "$APP_DIR/nepomuk.app.tmp.$$" "$APP_DIR/nepomuk.app"
     # Verified above; a copy made by this script carries no quarantine flag.
-    xattr -dr com.apple.quarantine "$APP_DIR/nepomuk.app" 2>/dev/null || true
+    $SUDO xattr -dr com.apple.quarantine "$APP_DIR/nepomuk.app" 2>/dev/null || true
     GUI_INSTALLED="$APP_DIR/nepomuk.app"
 }
 
 install_app_linux() { # path to the AppImage
-    [ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(default_dir)
-    mkdir -p "$INSTALL_DIR"
-    cp "$1" "$INSTALL_DIR/.nepomuk-gui.tmp.$$"
-    chmod 755 "$INSTALL_DIR/.nepomuk-gui.tmp.$$"
-    mv -f "$INSTALL_DIR/.nepomuk-gui.tmp.$$" "$INSTALL_DIR/nepomuk-gui"
-    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-    mkdir -p "$apps"
-    cat >"$apps/nepomuk.desktop" <<DESKTOP
+    choose_sudo "$INSTALL_DIR"
+    put_file "$1" "$INSTALL_DIR" nepomuk-gui
+    if [ "$SYSTEM" = 1 ]; then
+        apps=/usr/share/applications
+    else
+        apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    fi
+    choose_sudo "$apps"
+    $SUDO mkdir -p "$apps"
+    $SUDO tee "$apps/nepomuk.desktop" >/dev/null <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=nepomuk
@@ -354,16 +387,10 @@ gui_from_source() {
 }
 
 detect_target
+[ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(default_dir)
 
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t nepomuk-install)
 trap 'rm -rf "$WORK"' EXIT INT TERM
-
-if [ "$GUI" = 1 ]; then
-    if [ "$FROM_SOURCE" = 1 ]; then gui_from_source; else gui_from_release; fi
-    say "installed the nepomuk desktop app to $GUI_INSTALLED"
-    [ "$OS" = macos ] && say "start it from Launchpad or with: open \"$GUI_INSTALLED\""
-    exit 0
-fi
 
 if [ "$FROM_SOURCE" = 1 ]; then
     from_source
@@ -381,5 +408,20 @@ if [ -n "${GITHUB_PATH:-}" ]; then
 fi
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
-    *) [ -n "${GITHUB_PATH:-}" ] || say "note: $INSTALL_DIR is not in PATH; add it to your shell profile" ;;
+    *)
+        if [ -z "${GITHUB_PATH:-}" ]; then
+            if [ "$OS" = windows ] && [ "$SYSTEM" = 1 ]; then
+                say "note: add $INSTALL_DIR to the system PATH (or use install.ps1 -System, which does it)"
+            else
+                say "note: $INSTALL_DIR is not in PATH; add it to your shell profile"
+            fi
+        fi
+        ;;
 esac
+
+# The desktop app comes in addition to the CLI.
+if [ "$GUI" = 1 ]; then
+    if [ "$FROM_SOURCE" = 1 ]; then gui_from_source; else gui_from_release; fi
+    say "installed the nepomuk desktop app to $GUI_INSTALLED"
+    if [ "$OS" = macos ]; then say "start it from Launchpad or with: open \"$GUI_INSTALLED\""; fi
+fi

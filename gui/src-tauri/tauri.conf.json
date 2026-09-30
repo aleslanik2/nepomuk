@@ -38,6 +38,11 @@
     ],
     "externalBin": [
       "binaries/nepomuk"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "both"
+      }
+    }
   }
 }

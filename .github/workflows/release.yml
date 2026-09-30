@@ -132,6 +132,11 @@ jobs:
           "$smoke/bin-signed/nepomuk" version --json
           sum=$(cut -d' ' -f1 "$smoke/rel/SHA256SUMS")
           sh install.sh --version "$TAG" --base-url "$base" --sha256 "$sum" --dir "$smoke/bin-pinned"
+          # Without --dir: the default location (~/.local/bin; %LOCALAPPDATA% on Windows).
+          if [[ "$TARGET" != *windows* ]]; then
+            HOME="$smoke/home" sh install.sh --version "$TAG" --base-url "$base" --sha256 "$sum"
+            test -x "$smoke/home/.local/bin/nepomuk"
+          fi
           # A tampered archive must be refused.
           printf x >> "$smoke/rel/"*.tar.gz
           if sh install.sh --version "$TAG" --base-url "$base" --signers "$smoke/signers" --dir "$smoke/bin-bad"; then
@@ -155,6 +160,9 @@ jobs:
           ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Signers "$smoke/signers" -Dir "$smoke/bin-signed" -NoPath
           & "$smoke/bin-signed/nepomuk.exe" version --json
           ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Sha256 $sum -Dir "$smoke/bin-pinned" -NoPath
+          # For all users (the runner is an administrator).
+          ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Sha256 $sum -System -NoPath
+          & "$env:ProgramFiles\nepomuk\nepomuk.exe" version --json
           Add-Content -Path $archive.FullName -Value 'x'
           $refused = $false
           try { ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Signers "$smoke/signers" -Dir "$smoke/bin-bad" -NoPath } catch { $refused = $true }
