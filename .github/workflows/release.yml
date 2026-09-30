@@ -1,0 +1,209 @@
+# Builds release binaries for all platforms when a tag v* is pushed (§15.5).
+#
+# Signing – one of:
+#  - secret NEPOMUK_RELEASE_SIGNING_KEY (OpenSSH private key, ssh-keygen -t ed25519) and, if the key
+#    has one, NEPOMUK_RELEASE_SIGNING_PASSPHRASE: the workflow signs SHA256SUMS and publishes the
+#    release. Store them in the environment "release" and restrict it to tags v*;
+#  - no secret: the release stays a draft; sign it offline with scripts/sign-release.sh.
+# Either way the signature must verify against the key embedded in install.sh / install.ps1.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true, smoke: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true, smoke: false }
+          - { target: aarch64-apple-darwin, os: macos-latest, smoke: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, smoke: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, smoke: true }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, smoke: false }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ "v$version" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $version"; exit 1; }
+
+      - name: Build
+        run: |
+          # Paths of the build machine must not end up in the binary.
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$HOME/.cargo=/cargo"
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            pip install --quiet ziglang==0.16.0
+            cargo install --locked cargo-zigbuild@0.23.4
+            cargo zigbuild --release --locked --target "$TARGET"
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
+
+      - name: Package
+        run: |
+          exe=nepomuk; [[ "$TARGET" == *windows* ]] && exe=nepomuk.exe
+          name="nepomuk-$TAG-$TARGET"
+          mkdir -p "stage/$name" dist
+          cp "target/$TARGET/release/$exe" LICENSE README.md "stage/$name/"
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          if tar --version 2>/dev/null | grep -q GNU; then
+            tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+              -C stage -cf - "$name" | gzip -n > "dist/$name.tar.gz"
+          else
+            tar -C stage -cf - "$name" | gzip -n > "dist/$name.tar.gz"
+          fi
+          ls -l dist
+
+      - name: Smoke test install.sh
+        if: matrix.smoke
+        run: |
+          # A throwaway key exercises the signature path; the pinned hash path is tested too.
+          smoke="$RUNNER_TEMP/smoke"; mkdir -p "$smoke/rel"
+          cp dist/*.tar.gz "$smoke/rel/"
+          (cd "$smoke/rel" && { sha256sum -- *.tar.gz 2>/dev/null || shasum -a 256 -- *.tar.gz; } > SHA256SUMS)
+          ssh-keygen -q -t ed25519 -N '' -f "$smoke/key"
+          echo "release@nepomuk $(cut -d' ' -f1,2 "$smoke/key.pub")" > "$smoke/signers"
+          ssh-keygen -Y sign -q -n nepomuk-release -f "$smoke/key" "$smoke/rel/SHA256SUMS"
+          base="file://$smoke/rel"
+          [[ "$TARGET" == *windows* ]] && base="file:///$(cygpath -m "$smoke/rel")"
+          sh install.sh --version "$TAG" --base-url "$base" --signers "$smoke/signers" --dir "$smoke/bin-signed"
+          "$smoke/bin-signed/nepomuk" version --json
+          sum=$(cut -d' ' -f1 "$smoke/rel/SHA256SUMS")
+          sh install.sh --version "$TAG" --base-url "$base" --sha256 "$sum" --dir "$smoke/bin-pinned"
+          # A tampered archive must be refused.
+          printf x >> "$smoke/rel/"*.tar.gz
+          if sh install.sh --version "$TAG" --base-url "$base" --signers "$smoke/signers" --dir "$smoke/bin-bad"; then
+            echo "tampered archive was installed"; exit 1
+          fi
+
+      - name: Smoke test install.ps1
+        if: matrix.smoke && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP 'smoke-ps'
+          New-Item -ItemType Directory -Force -Path "$smoke/rel" | Out-Null
+          Copy-Item dist/*.tar.gz "$smoke/rel/"
+          $archive = Get-ChildItem "$smoke/rel/*.tar.gz" | Select-Object -First 1
+          $sum = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$smoke/rel/SHA256SUMS", "$sum  $($archive.Name)`n")
+          ssh-keygen -q -t ed25519 -N '' -f "$smoke/key"
+          $pub = (Get-Content "$smoke/key.pub") -split ' '
+          [IO.File]::WriteAllText("$smoke/signers", "release@nepomuk $($pub[0]) $($pub[1])`n")
+          ssh-keygen -Y sign -q -n nepomuk-release -f "$smoke/key" "$smoke/rel/SHA256SUMS"
+          ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Signers "$smoke/signers" -Dir "$smoke/bin-signed" -NoPath
+          & "$smoke/bin-signed/nepomuk.exe" version --json
+          ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Sha256 $sum -Dir "$smoke/bin-pinned" -NoPath
+          Add-Content -Path $archive.FullName -Value 'x'
+          $refused = $false
+          try { ./install.ps1 -Version $env:TAG -BaseUrl "$smoke/rel" -Signers "$smoke/signers" -Dir "$smoke/bin-bad" -NoPath } catch { $refused = $true }
+          if (-not $refused) { throw 'tampered archive was installed' }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      SIGNING_KEY: ${{ secrets.NEPOMUK_RELEASE_SIGNING_KEY }}
+      SIGNING_PASSPHRASE: ${{ secrets.NEPOMUK_RELEASE_SIGNING_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 6 ] || { echo "expected 6 archives"; exit 1; }
+
+      - name: Installers carry the same release key
+        run: scripts/release-signers.sh check
+
+      - name: Sign
+        id: sign
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No NEPOMUK_RELEASE_SIGNING_KEY – the release stays a draft; sign it with scripts/sign-release.sh $TAG"
+            exit 0
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release-key"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          if [ -n "$SIGNING_PASSPHRASE" ]; then
+            # ssh-keygen reads the passphrase only through an askpass program.
+            askpass="$RUNNER_TEMP/askpass"
+            printf '#!/bin/sh\nprintf "%%s\\n" "$SIGNING_PASSPHRASE"\n' > "$askpass"
+            chmod 700 "$askpass"
+            export SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=none
+          fi
+          ssh-keygen -Y sign -q -n nepomuk-release -f "$key" dist/SHA256SUMS < /dev/null
+          rm -f "$key" "$RUNNER_TEMP/askpass"
+          scripts/release-signers.sh verify dist/SHA256SUMS dist/SHA256SUMS.sig
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create the release
+        run: |
+          cp install.sh install.ps1 dist/
+          draft=--draft
+          [ "${{ steps.sign.outputs.signed }}" = "true" ] && draft=
+          gh release create "$TAG" dist/* $draft --verify-tag --title "nepomuk $TAG" \
+            --notes "Install: \`sh install.sh --version $TAG\` (Linux, macOS, Git Bash) or \`./install.ps1 -Version $TAG\` (Windows). SHA256SUMS is signed with the release key embedded in the installers."
