@@ -169,14 +169,27 @@ const url = `http://127.0.0.1:${server.address().port}/`;
 
 const port = 9300 + Math.floor(Math.random() * 500);
 const browser = spawn(chrome, ["--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${join(work, "chrome")}`,
-  "--no-first-run", "--window-size=1280,820", "--force-device-scale-factor=1", ...(process.env.CI ? ["--no-sandbox"] : []), "about:blank"], { stdio: "ignore" });
+  "--no-first-run", "--window-size=1280,820", "--force-device-scale-factor=1", ...(process.env.CI ? ["--no-sandbox"] : []), "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+let chromeLog = "";
+browser.stderr.on("data", (d) => { chromeLog = (chromeLog + d).slice(-4000); });
 let wsUrl;
-for (let i = 0; i < 50 && !wsUrl; i++) {
+let browserExited = false;
+browser.on("exit", () => { browserExited = true; });
+for (let i = 0; i < 300 && !wsUrl && !browserExited; i++) {
   await new Promise((r) => setTimeout(r, 200));
   try {
     const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
     wsUrl = targets.find((t) => t.type === "page")?.webSocketDebuggerUrl;
+    if (!wsUrl && i > 10) {
+      // Some headless builds start without a page.
+      const created = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
+      wsUrl = created.webSocketDebuggerUrl;
+    }
   } catch { /* not up yet */ }
+}
+if (!wsUrl) {
+  console.log(`Chrome did not start (${chrome})${browserExited ? " – it exited" : ""}\n${chromeLog}`);
+  process.exit(1);
 }
 const ws = new WebSocket(wsUrl);
 await new Promise((ok) => ws.addEventListener("open", ok));
