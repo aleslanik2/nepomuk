@@ -134,6 +134,14 @@ sh install.sh --version v0.1.0 --dir /usr/local/bin
 sh install.sh --from-source            # build with cargo instead of downloading
 ```
 
+The desktop app (macOS: `nepomuk.app` in Applications, Linux: an AppImage with a menu entry, Windows: a per-user installer):
+
+```bash
+sh install.sh --gui                                  # from the release (v0.2.0 and later)
+sh install.sh --gui --from-source --source .         # build it from this checkout (needs cargo and Node.js)
+./install.ps1 -Gui                                   # Windows PowerShell
+```
+
 The binary is installed only if `SHA256SUMS` carries a valid release signature (`ssh-keygen -Y verify`) and the archive matches it. In CI, pin the exact archive hash instead:
 
 ```yaml
@@ -161,6 +169,16 @@ git config merge.nepomuk.driver "nepomuk git-merge %O %A %B"
 2. Bump `version` in `Cargo.toml`, then push a tag `v<version>`. [`.github/workflows/release.yml`](.github/workflows/release.yml) tests, builds six targets (static musl on Linux), smoke-tests both installers, and creates the release with `SHA256SUMS`.
 3. Signing: with the secret `NEPOMUK_RELEASE_SIGNING_KEY` the workflow signs and publishes; without it the release stays a draft and `scripts/sign-release.sh v<version> <key>` signs it offline and publishes it.
 
+## GUI
+
+```bash
+gui/scripts/prepare-sidecars.sh                 # builds the CLI (and the Touch ID helper) for bundling
+cd gui/src-tauri && cargo tauri build            # or: cargo run for development
+node gui/tests/harness.mjs target/debug/nepomuk  # drives the UI in headless Chrome against the real CLI
+```
+
+The web UI has no file system or network access; the Rust backend only forwards JSON-RPC to `nepomuk serve --stdio`, which holds the unlocked identity.
+
 ## Implementation status
 
 Implemented in the CLI:
@@ -173,8 +191,10 @@ Implemented in the CLI:
 - git: reads `origin/main`, plumbing commit + push on every write, retry on a rejected push, `--offline` queue (encrypted to the own identity) and `sync` with conflict resolution
 - `exec` profiles (memfd on Linux, private `0700`/`0600` files elsewhere, output masking, `::add-mask::`, signal forwarding, cleanup)
 - `--json` for every command, `serve --stdio` (JSON-RPC 2.0 with session lock and inactivity timeout)
+- GUI (Tauri, [`gui/`](gui)) driving the bundled CLI: pinning the master with a visual fingerprint, login and enrollment, secrets tree with sealed values, template forms, access management, users, groups, offboarding checklist, rotation, audit log, sync and conflicts, `exec` profiles; clipboard excluded from history and cleared after 30 s, lock on inactivity and screen lock
+- Touch ID on macOS (optional, per Mac): `nepomuk identity touchid enable` or the checkbox at login seals the password with a Secure Enclave key usable only after Touch ID with the currently enrolled fingers ([`macos/touchid`](macos/touchid)); `--touchid` or the button at login unlocks with it
 
-Not implemented yet: the Tauri GUI, PQ SSH identities (`mldsa44-ed25519` keys are recognized and refused), master on a hardware token and Shamir backup (`master backup`/`restore`), Have I Been Pwned check, zxcvbn estimation (a simple heuristic warns instead), the verification cache, nested groups, Windows ACLs for `exec` files, and automatic strengthening of Argon2id parameters (a warning is shown instead).
+Not implemented yet: notarized / Authenticode-signed GUI installers, PQ SSH identities (`mldsa44-ed25519` keys are recognized and refused), master on a hardware token and Shamir backup (`master backup`/`restore`), Have I Been Pwned check, zxcvbn estimation (a simple heuristic warns instead), the verification cache, nested groups, Windows ACLs for `exec` files, and automatic strengthening of Argon2id parameters (a warning is shown instead).
 
 ## What nepomuk cannot do
 

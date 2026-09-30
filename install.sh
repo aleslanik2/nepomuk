@@ -3,6 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/aleslanik2/nepomuk/main/install.sh | sh
 #   sh install.sh --version v0.1.0 --dir /usr/local/bin
+#   sh install.sh --gui                              # the desktop app instead of the CLI
+#   sh install.sh --gui --from-source --source .     # build the app from a local checkout
 #
 # The binary is installed only after its SHA-256 matches SHA256SUMS and SHA256SUMS carries a
 # valid release signature (`ssh-keygen -Y verify`, namespace "nepomuk-release"), or after it
@@ -13,6 +15,7 @@
 #
 # Release assets expected for tag <v>:
 #   nepomuk-<v>-<target>.tar.gz   containing `nepomuk` (`nepomuk.exe` on Windows)
+#   nepomuk-gui-<v>-<target>.dmg | .AppImage | .exe   the desktop app (--gui)
 #   SHA256SUMS                    `<sha256>  <asset>` lines
 #   SHA256SUMS.sig                ssh-keygen -Y sign -n nepomuk-release -f <key> SHA256SUMS
 # Targets: x86_64|aarch64-unknown-linux-musl, x86_64|aarch64-apple-darwin,
@@ -38,7 +41,10 @@ Options:
   --sha256 <hash>     Expected SHA-256 of the release archive (env NEPOMUK_SHA256)
   --signers <file>    allowed_signers file with release keys (default: keys in this script)
   --base-url <url>    Download from a mirror instead of GitHub releases (env NEPOMUK_BASE_URL)
-  --from-source       Build with cargo from the git tag instead of downloading a binary
+  --from-source       Build from source (cargo; for --gui also Node.js) instead of downloading
+  --source <dir>      Local checkout to build from (default: clone the git tag)
+  --gui               Install the desktop app (macOS: Applications, Linux: AppImage, Windows: installer)
+  --app-dir <path>    Where to put nepomuk.app on macOS (default: /Applications or ~/Applications)
   -h, --help          Show this help
 EOF
 }
@@ -52,6 +58,9 @@ EXPECTED_SHA="${NEPOMUK_SHA256:-}"
 SIGNERS_FILE=""
 BASE_URL="${NEPOMUK_BASE_URL:-}"
 FROM_SOURCE=0
+SOURCE_DIR=""
+GUI=0
+APP_DIR=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -61,6 +70,9 @@ while [ $# -gt 0 ]; do
         --signers) SIGNERS_FILE="${2:?}"; shift 2 ;;
         --base-url) BASE_URL="${2:?}"; shift 2 ;;
         --from-source) FROM_SOURCE=1; shift ;;
+        --source) SOURCE_DIR="${2:?}"; shift 2 ;;
+        --gui) GUI=1; shift ;;
+        --app-dir) APP_DIR="${2:?}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -171,13 +183,18 @@ from_source() {
     else
         set -- --tag "$VERSION"
     fi
-    cargo install --locked --git "https://github.com/$REPO" "$@" --root "$WORK/root" nepomuk
+    if [ -n "$SOURCE_DIR" ]; then
+        cargo install --locked --path "$SOURCE_DIR" --root "$WORK/root"
+    else
+        cargo install --locked --git "https://github.com/$REPO" "$@" --root "$WORK/root" nepomuk
+    fi
     install_binary "$WORK/root/bin/$EXE"
 }
 
-from_release() {
+# Downloads a release asset and verifies it (pinned hash, or signed SHA256SUMS).
+download_verified() { # asset
+    asset="$1"
     [ "$VERSION" = latest ] && VERSION=$(resolve_latest)
-    asset="nepomuk-$VERSION-$TARGET.tar.gz"
     base="${BASE_URL:-https://github.com/$REPO/releases/download/$VERSION}"
     say "downloading $asset"
     fetch "$asset" || die "download failed: $asset"
@@ -207,19 +224,143 @@ from_release() {
         [ "$actual" = "$(lower "$expected")" ] || die "SHA-256 mismatch for $asset"
         say "signature and SHA-256 verified"
     fi
+}
 
+from_release() {
+    [ "$VERSION" = latest ] && VERSION=$(resolve_latest)
+    asset="nepomuk-$VERSION-$TARGET.tar.gz"
+    download_verified "$asset"
     mkdir "$WORK/x"
     tar -xzf "$WORK/$asset" -C "$WORK/x"
     bin=$(find "$WORK/x" -type f -name "$EXE" | head -n1)
     [ -n "$bin" ] || die "$EXE not found in $asset"
     install_binary "$bin"
+    helper=$(find "$WORK/x" -type f -name nepomuk-touchid | head -n1)
+    if [ -n "$helper" ]; then
+        cp "$helper" "$INSTALL_DIR/.nepomuk-touchid.tmp.$$"
+        chmod 755 "$INSTALL_DIR/.nepomuk-touchid.tmp.$$"
+        mv -f "$INSTALL_DIR/.nepomuk-touchid.tmp.$$" "$INSTALL_DIR/nepomuk-touchid"
+    fi
+}
+
+# ---------------------------------------------------------------- Desktop app
+
+gui_target() {
+    case "$OS" in
+        macos) GUI_TARGET="$TARGET"; GUI_EXT=dmg ;;
+        linux)
+            [ "${TARGET%%-*}" = x86_64 ] || die "the desktop app is built for x86_64 Linux only"
+            GUI_TARGET=x86_64-unknown-linux-gnu; GUI_EXT=AppImage ;;
+        # ARM64 Windows runs the x86_64 app through emulation.
+        windows) GUI_TARGET=x86_64-pc-windows-msvc; GUI_EXT=exe ;;
+    esac
+}
+
+install_app_macos() { # path to nepomuk.app
+    if [ -z "$APP_DIR" ]; then
+        if [ -w /Applications ]; then APP_DIR=/Applications; else APP_DIR="$HOME/Applications"; fi
+    fi
+    mkdir -p "$APP_DIR"
+    if pgrep -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" >/dev/null 2>&1; then
+        say "quitting the running app"
+        pkill -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" || true
+        sleep 1
+    fi
+    rm -rf "$APP_DIR/nepomuk.app.tmp.$$"
+    cp -R "$1" "$APP_DIR/nepomuk.app.tmp.$$"
+    rm -rf "$APP_DIR/nepomuk.app"
+    mv "$APP_DIR/nepomuk.app.tmp.$$" "$APP_DIR/nepomuk.app"
+    # Verified above; a copy made by this script carries no quarantine flag.
+    xattr -dr com.apple.quarantine "$APP_DIR/nepomuk.app" 2>/dev/null || true
+    GUI_INSTALLED="$APP_DIR/nepomuk.app"
+}
+
+install_app_linux() { # path to the AppImage
+    [ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(default_dir)
+    mkdir -p "$INSTALL_DIR"
+    cp "$1" "$INSTALL_DIR/.nepomuk-gui.tmp.$$"
+    chmod 755 "$INSTALL_DIR/.nepomuk-gui.tmp.$$"
+    mv -f "$INSTALL_DIR/.nepomuk-gui.tmp.$$" "$INSTALL_DIR/nepomuk-gui"
+    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$apps"
+    cat >"$apps/nepomuk.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=nepomuk
+Comment=Post-quantum secrets vault
+Exec=$INSTALL_DIR/nepomuk-gui
+Terminal=false
+Categories=Utility;Security;
+DESKTOP
+    GUI_INSTALLED="$INSTALL_DIR/nepomuk-gui"
+}
+
+install_app_windows() { # path to the NSIS installer
+    say "running the installer"
+    "$1" /S || die "the installer failed"
+    GUI_INSTALLED="the Start menu (nepomuk)"
+}
+
+gui_from_release() {
+    gui_target
+    [ "$VERSION" = latest ] && VERSION=$(resolve_latest)
+    asset="nepomuk-gui-$VERSION-$GUI_TARGET.$GUI_EXT"
+    download_verified "$asset"
+    case "$OS" in
+        macos)
+            mnt="$WORK/mnt"
+            mkdir "$mnt"
+            hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$WORK/$asset" || die "cannot open $asset"
+            app=$(find "$mnt" -maxdepth 1 -name "*.app" | head -n1)
+            [ -n "$app" ] || { hdiutil detach -quiet "$mnt"; die "no app in $asset"; }
+            install_app_macos "$app"
+            hdiutil detach -quiet "$mnt" || true
+            ;;
+        linux) install_app_linux "$WORK/$asset" ;;
+        windows) install_app_windows "$WORK/$asset" ;;
+    esac
+}
+
+gui_from_source() {
+    gui_target
+    command -v cargo >/dev/null 2>&1 || die "cargo is required (https://rustup.rs)"
+    command -v npx >/dev/null 2>&1 || die "Node.js (npx) is required to run the Tauri CLI"
+    if [ -n "$SOURCE_DIR" ]; then
+        src=$(cd "$SOURCE_DIR" && pwd)
+    else
+        src="$WORK/src"
+        ref=main; [ "$VERSION" = latest ] || ref="$VERSION"
+        say "cloning $REPO ($ref)"
+        git clone -q --depth 1 --branch "$ref" "https://github.com/$REPO.git" "$src" || die "cannot clone $REPO"
+    fi
+    [ -f "$src/gui/src-tauri/tauri.conf.json" ] || die "$src is not a nepomuk checkout"
+    case "$OS" in
+        macos) bundles=app ;;
+        linux) bundles=appimage ;;
+        windows) bundles=nsis ;;
+    esac
+    say "building the desktop app in $src (this takes a few minutes)"
+    "$src/gui/scripts/prepare-sidecars.sh" "$GUI_TARGET" >&2
+    (cd "$src/gui/src-tauri" && npx --yes @tauri-apps/cli@2.12.0 build --target "$GUI_TARGET" --bundles "$bundles" >&2) || die "the build failed"
+    b="$src/gui/src-tauri/target/$GUI_TARGET/release/bundle"
+    case "$OS" in
+        macos) install_app_macos "$b/macos/nepomuk.app" ;;
+        linux) install_app_linux "$(find "$b/appimage" -name '*.AppImage' | head -n1)" ;;
+        windows) install_app_windows "$(find "$b/nsis" -name '*.exe' | head -n1)" ;;
+    esac
 }
 
 detect_target
-[ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(default_dir)
 
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t nepomuk-install)
 trap 'rm -rf "$WORK"' EXIT INT TERM
+
+if [ "$GUI" = 1 ]; then
+    if [ "$FROM_SOURCE" = 1 ]; then gui_from_source; else gui_from_release; fi
+    say "installed the nepomuk desktop app to $GUI_INSTALLED"
+    [ "$OS" = macos ] && say "start it from Launchpad or with: open \"$GUI_INSTALLED\""
+    exit 0
+fi
 
 if [ "$FROM_SOURCE" = 1 ]; then
     from_source

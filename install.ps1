@@ -14,6 +14,9 @@
 
 .EXAMPLE
     ./install.ps1 -Version v0.1.0 -Sha256 <published SHA-256>
+
+.EXAMPLE
+    ./install.ps1 -Gui        # the desktop app (runs its installer silently, per user)
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +25,8 @@ param(
     [string]$Sha256 = $env:NEPOMUK_SHA256,
     [string]$Signers,
     [string]$BaseUrl = $env:NEPOMUK_BASE_URL,
-    [switch]$NoPath
+    [switch]$NoPath,
+    [switch]$Gui
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,9 +91,8 @@ function Resolve-Latest {
     return $t
 }
 
-try {
-    if ($Version -eq 'latest') { $Version = Resolve-Latest }
-    $asset = "nepomuk-$Version-$Target.tar.gz"
+# Downloads a release asset and verifies it (pinned hash, or signed SHA256SUMS).
+function Get-Verified([string]$asset) {
     Say "downloading $asset"
     $archive = Fetch $asset
     $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -120,6 +123,24 @@ try {
         if ($actual -ne $expected) { Die "SHA-256 mismatch for $asset" }
         Say 'signature and SHA-256 verified'
     }
+    return $archive
+}
+
+try {
+    if ($Version -eq 'latest') { $Version = Resolve-Latest }
+
+    if ($Gui) {
+        # ARM64 Windows runs the x86_64 app through emulation.
+        $installer = Get-Verified "nepomuk-gui-$Version-x86_64-pc-windows-msvc.exe"
+        Say 'running the installer'
+        $p = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Die "the installer failed with code $($p.ExitCode)" }
+        Say 'installed the nepomuk desktop app; start it from the Start menu'
+        return
+    }
+
+    $asset = "nepomuk-$Version-$Target.tar.gz"
+    $archive = Get-Verified $asset
 
     $extract = Join-Path $work 'x'
     New-Item -ItemType Directory -Path $extract | Out-Null

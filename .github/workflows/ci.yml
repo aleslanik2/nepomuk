@@ -1,0 +1,43 @@
+# Tests on every push and pull request; releases run release.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: GUI backend lint
+        if: runner.os == 'macOS'
+        working-directory: gui/src-tauri
+        run: |
+          ../scripts/prepare-sidecars.sh
+          cargo clippy --locked -- -D warnings
+      - name: UI flows in headless Chrome
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked
+          CHROME=$(command -v google-chrome || command -v chromium) node gui/tests/harness.mjs target/debug/nepomuk "$RUNNER_TEMP/ui-shots"
+

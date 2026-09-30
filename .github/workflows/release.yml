@@ -36,6 +36,17 @@ jobs:
           components: clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: GUI backend lint
+        if: runner.os == 'macOS'
+        working-directory: gui/src-tauri
+        run: |
+          ../scripts/prepare-sidecars.sh
+          cargo clippy --locked -- -D warnings
+      - name: UI flows in headless Chrome
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked
+          CHROME=$(command -v google-chrome || command -v chromium) node gui/tests/harness.mjs target/debug/nepomuk "$RUNNER_TEMP/ui-shots"
 
   build:
     needs: test
@@ -66,8 +77,11 @@ jobs:
 
       - name: Check the tag matches Cargo.toml
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          [ "v$version" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $version"; exit 1; }
+          for f in Cargo.toml gui/src-tauri/Cargo.toml; do
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$f" | head -n1)
+            [ "v$version" = "$TAG" ] || { echo "tag $TAG does not match $f version $version"; exit 1; }
+          done
+          grep -q "\"version\": \"${TAG#v}\"" gui/src-tauri/tauri.conf.json || { echo "tag $TAG does not match tauri.conf.json"; exit 1; }
 
       - name: Build
         run: |
@@ -88,6 +102,11 @@ jobs:
           name="nepomuk-$TAG-$TARGET"
           mkdir -p "stage/$name" dist
           cp "target/$TARGET/release/$exe" LICENSE README.md "stage/$name/"
+          if [[ "$TARGET" == *apple-darwin ]]; then
+            # Touch ID unlock helper (Secure Enclave), installed next to the CLI.
+            arch=${TARGET%%-*}; [ "$arch" = aarch64 ] && arch=arm64
+            xcrun swiftc -O -target "$arch-apple-macos11" -o "stage/$name/nepomuk-touchid" macos/touchid/main.swift
+          fi
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           if tar --version 2>/dev/null | grep -q GNU; then
             tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
@@ -147,8 +166,60 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  gui:
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, bundles: "app,dmg" }
+          - { target: x86_64-apple-darwin, os: macos-latest, bundles: "app,dmg" }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, bundles: "nsis,msi" }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, bundles: "deb,appimage" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+      - name: Bundled CLI
+        run: gui/scripts/prepare-sidecars.sh "$TARGET"
+      - name: Build the GUI
+        working-directory: gui/src-tauri
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$HOME/.cargo=/cargo"
+          npx --yes @tauri-apps/cli@2.12.0 build --target "$TARGET" --bundles ${{ matrix.bundles }}
+      - name: Collect installers
+        run: |
+          mkdir -p dist
+          b="gui/src-tauri/target/$TARGET/release/bundle"
+          for f in "$b"/dmg/*.dmg "$b"/nsis/*.exe "$b"/msi/*.msi "$b"/deb/*.deb "$b"/appimage/*.AppImage; do
+            [ -f "$f" ] || continue
+            ext="${f##*.}"
+            cp "$f" "dist/nepomuk-gui-$TAG-$TARGET.$ext"
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gui-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, gui]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -170,9 +241,10 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
-          [ "$(wc -l < SHA256SUMS)" -eq 6 ] || { echo "expected 6 archives"; exit 1; }
+          [ "$(ls -- nepomuk-v*.tar.gz | wc -l)" -eq 6 ] || { echo "expected 6 CLI archives"; exit 1; }
+          [ "$(ls -- nepomuk-gui-* | wc -l)" -ge 4 ] || { echo "expected GUI installers"; exit 1; }
 
       - name: Installers carry the same release key
         run: scripts/release-signers.sh check
@@ -206,4 +278,4 @@ jobs:
           draft=--draft
           [ "${{ steps.sign.outputs.signed }}" = "true" ] && draft=
           gh release create "$TAG" dist/* $draft --verify-tag --title "nepomuk $TAG" \
-            --notes "Install: \`sh install.sh --version $TAG\` (Linux, macOS, Git Bash) or \`./install.ps1 -Version $TAG\` (Windows). SHA256SUMS is signed with the release key embedded in the installers."
+            --notes "CLI: \`sh install.sh --version $TAG\` (Linux, macOS, Git Bash) or \`./install.ps1 -Version $TAG\` (Windows). GUI: the nepomuk-gui installers (not yet notarized or Authenticode-signed). SHA256SUMS covers every file and is signed with the release key embedded in the installers."
