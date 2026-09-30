@@ -2,7 +2,10 @@
 
 **A post-quantum secrets vault that lives in a single file in git – with permissions enforced by cryptography, not by code.**
 
-> **Status: early implementation, not audited.** The Rust CLI implements the core of the [specification](docs/SPECIFICATION.md); see [Implementation status](#implementation-status). Do not use it for production secrets before the independent security audit required by the MVP.
+> [!WARNING]
+> **Use at your own risk.** nepomuk is an early, unaudited implementation. It may contain bugs that expose or destroy your secrets, and the file format may still change. It comes without any warranty (see the [license](LICENSE)). Keep an independent copy of everything you store in it, and do not use it for production secrets before the independent security audit required by the MVP.
+
+> **Status: early implementation, not audited.** The CLI and the GUI implement the [specification](docs/SPECIFICATION.md); see [Implementation status](#implementation-status).
 
 nepomuk stores passwords, certificates and binary files (keystores, `.p12`, `.pem`, …) in a folder tree inside one encrypted file that you commit to a git repository. Every user can read only what they hold a key for, and every change must be signed by someone who is allowed to make it. The design and source code are public by intent – knowing how nepomuk works does not help an attacker.
 
