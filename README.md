@@ -15,13 +15,13 @@ nepomuk stores passwords, certificates and binary files (keystores, `.p12`, `.pe
 - **Folder-based permissions** – `read`, `write`, `share` and `admin` on folders or individual secrets, inherited down the tree, granted to users or groups.
 - **Cryptographic enforcement** – reading requires holding a wrapped key; writing requires a valid signature. A custom client cannot bypass either.
 - **Hybrid post-quantum crypto** – ML-KEM-1024 + X25519 for encryption, ML-DSA-65 + Ed25519 for signatures, XChaCha20-Poly1305 for data, Argon2id for passwords. Safe against "harvest now, decrypt later" on git history.
-- **Two ways to log in** – email + password (following NIST SP 800-63B-4), or a post-quantum SSH key (`mldsa44-ed25519`, OpenSSH 10.4+). Classical SSH keys are rejected.
-- **Master + delegation** – one master identity (offline, on a hardware token, Shamir-backed) that can do anything; everyone else only what they were granted, never more than the granter holds.
+- **Two ways to log in** – email + password (following NIST SP 800-63B-4), or an identity file protected by a passphrase (for CI and the master). On macOS, Touch ID can unlock either.
+- **Master + delegation** – one master identity, kept offline, that can do anything; everyone else only what they were granted, never more than the granter holds.
 - **Tamper-evident history** – a signed, hash-chained log of changes with rollback and fork detection.
 - **Git-native workflow** – automatic push after every change, conflict-aware `sync`, readable `git diff` of public metadata.
 - **CI-first** – `nepomuk exec` injects secrets into a single build command and cleans up afterwards.
 - **Offboarding** – one command removes a person everywhere, rotates keys and lists the secrets that must be changed at the source.
-- **CLI + GUI** – a Rust CLI for Linux, Windows and macOS; a Tauri GUI that simply drives the CLI.
+- **CLI + GUI** – a Rust CLI for Linux, Windows and macOS; a desktop app that simply drives the CLI.
 
 ## Examples
 
@@ -30,7 +30,8 @@ nepomuk stores passwords, certificates and binary files (keystores, `.p12`, `.pe
 ```bash
 # in a new, dedicated repository
 nepomuk init --vault vault.nepomuk
-# prints the master fingerprint (npk1…) – pin it in CI and on every client
+# creates the master identity (~/.config/nepomuk/master.npk) and prints its
+# fingerprint (npk1…) – pin it in CI and on every client
 ```
 
 ### Add a user
@@ -38,11 +39,13 @@ nepomuk init --vault vault.nepomuk
 ```bash
 # the new user, on their own machine – keys and password never leave it
 nepomuk identity request --email jane@example.com --out jane.request
-# or with a post-quantum SSH key
-nepomuk identity request --ssh-key ~/.ssh/id_mldsa44_ed25519 --out jane.request
+# or, e.g. for CI, an identity file protected by a passphrase
+nepomuk identity new --name ci-eshop-android --out ci.npk
+nepomuk --identity ci.npk identity request --local --out ci.request
 
 # an administrator with the `users` right
 nepomuk user add jane.request
+nepomuk group create android-release
 nepomuk group add android-release jane@example.com
 ```
 
@@ -116,7 +119,7 @@ In GitHub Actions:
 ### Stay in sync
 
 ```bash
-nepomuk status        # up to date / behind / ahead / conflict
+nepomuk status        # up to date / changes not pushed / offline
 nepomuk sync          # replays your pending changes on top of the latest vault
 nepomuk verify --full # re-verify every signature and permission in the log
 ```
@@ -129,17 +132,13 @@ See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the full design: threat m
 
 ## Installing
 
-The latest release, command line and desktop app:
-
 ```bash
-curl -fsSL https://github.com/aleslanik2/nepomuk/releases/latest/download/install.sh -o install.sh
-sh install.sh          # the CLI, into ~/.local/bin
-sh install.sh --gui    # the desktop app
+curl -fsSL https://github.com/aleslanik2/nepomuk/releases/latest/download/install.sh | sh -s -- --gui --system
 ```
 
-The script works on Linux, macOS and Windows (in Git Bash); on Windows without Git Bash use `install.ps1` from the same release (`./install.ps1`, `./install.ps1 -Gui`). The desktop app goes to Applications on macOS, to an AppImage with a menu entry on Linux, and through a per-user installer on Windows. Nothing is installed unless `SHA256SUMS` carries a valid release signature and the download matches it.
+This installs the latest release: the CLI into `/usr/local/bin` (using sudo) and the desktop app into Applications on macOS, as an AppImage with a menu entry on Linux, or through its installer on Windows. Without `--system` everything goes to your user account (the CLI into `~/.local/bin`); without `--gui` only the CLI is installed. Nothing is installed unless `SHA256SUMS` carries a valid release signature and every download matches it.
 
-Options: `--version <tag>` installs a specific release, `--dir <path>` changes where the CLI goes, `--sha256 <hash>` pins the exact archive (recommended in CI), and `--from-source` builds with cargo instead of downloading (`--source <dir>` for a local checkout; the GUI also needs Node.js). While the repository is private, set `GH_TOKEN` and the script downloads through the GitHub CLI.
+The script runs on Linux, macOS and Windows in Git Bash; for PowerShell use `install.ps1` from the same release (`-Gui`, `-System`). Other options: `--version <tag>` for a specific release, `--dir <path>` for another CLI location, `--sha256 <hash>` to pin the exact archive in CI, and `--from-source` to build with cargo (the app also needs Node.js). While the repository is private, the download above does not work: set `GH_TOKEN`, get `install.sh` with `gh release download -R aleslanik2/nepomuk -p install.sh` and run `sh install.sh --gui --system`.
 
 ## Building
 
@@ -158,14 +157,14 @@ git config merge.nepomuk.driver "nepomuk git-merge %O %A %B"
 ## Releasing
 
 1. Once: create the release signing key (`ssh-keygen -t ed25519 -C release@nepomuk -f nepomuk-release`) and put `release@nepomuk <public key>` into `RELEASE_SIGNERS` in `install.sh` and `$ReleaseSigners` in `install.ps1` (`scripts/release-signers.sh check` compares them).
-2. Bump `version` in `Cargo.toml`, then push a tag `v<version>`. [`.github/workflows/release.yml`](.github/workflows/release.yml) tests, builds six targets (static musl on Linux), smoke-tests both installers, and creates the release with `SHA256SUMS`.
+2. Bump `version` in `Cargo.toml`, `gui/src-tauri/Cargo.toml` and `gui/src-tauri/tauri.conf.json`, then push a tag `v<version>`. [`.github/workflows/release.yml`](.github/workflows/release.yml) runs the tests and the UI harness, builds the CLI for six targets (static musl on Linux) and the desktop app for macOS, Windows and Linux, smoke-tests both installers, and creates the release with `SHA256SUMS` over every file.
 3. Signing: with the secret `NEPOMUK_RELEASE_SIGNING_KEY` the workflow signs and publishes; without it the release stays a draft and `scripts/sign-release.sh v<version> <key>` signs it offline and publishes it.
 
 ## GUI
 
 ```bash
 gui/scripts/prepare-sidecars.sh                 # builds the CLI (and the Touch ID helper) for bundling
-cd gui/src-tauri && cargo tauri build            # or: cargo run for development
+cd gui/src-tauri && npx @tauri-apps/cli build     # or: cargo run for development
 node gui/tests/harness.mjs target/debug/nepomuk  # drives the UI in headless Chrome against the real CLI
 ```
 
@@ -173,7 +172,7 @@ The web UI has no file system or network access; the Rust backend only forwards 
 
 ## Implementation status
 
-Implemented in the CLI:
+Implemented:
 
 - crypto suite `NPQ-1` (ML-KEM-1024 + X25519, ML-DSA-65 + Ed25519, XChaCha20-Poly1305, Argon2id, SHA3-256/HKDF), size padding, zeroized and `mlock`ed seeds, core dumps disabled
 - file format: signed checkpoint + hash-chained signed commits, full replay with per-operation authorization, root-of-trust pinning, rollback/fork detection, submodule pin check in CI, `compact`
@@ -192,11 +191,11 @@ Not implemented yet: notarized / Authenticode-signed GUI installers, PQ SSH iden
 
 - It cannot audit **reads** – decryption happens offline on the user's machine.
 - It cannot take back what someone has already seen – after revoking access, rotate the secret at its source.
-- It cannot protect the vault if the **master key** is compromised – keep it offline and backed up with Shamir shares.
+- It cannot protect the vault if the **master key** is compromised – keep it offline and backed up (a hardware token and Shamir backup are planned).
 
 ## Roadmap
 
-1. MVP: CLI, GUI, identities, permissions, groups, records and templates, `exec`, signed log, git integration, offboarding, hardware-token master.
+1. Finish the MVP: master on a hardware token with Shamir backup, post-quantum SSH identities (`mldsa44-ed25519`), notarized and signed installers, an independent security audit.
 2. Google Workspace directory check (alerts on departed employees, group mapping).
 3. More templates (iOS signing, TLS), pull-request workflow for selected folders.
 
