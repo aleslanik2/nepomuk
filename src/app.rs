@@ -24,7 +24,7 @@ const MAX_PUSH_ATTEMPTS: usize = 5;
 
 // ---------------------------------------------------------------- Context
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     pub vault: Option<PathBuf>,
     pub json: bool,
@@ -36,6 +36,10 @@ pub struct Options {
     pub offline: bool,
     /// `serve --stdio`: identities are unlocked only through `session.unlock`.
     pub session: bool,
+    /// Unlock with Touch ID (macOS, when set up for the vault).
+    pub touchid: bool,
+    /// After a successful unlock, seal the password for Touch ID on this Mac.
+    pub remember_touchid: bool,
 }
 
 pub struct Ctx {
@@ -203,6 +207,46 @@ impl Ctx {
         Ok(None)
     }
 
+    fn identity_file_path(&self) -> Option<PathBuf> {
+        let p = self
+            .opts
+            .identity
+            .clone()
+            .or_else(|| self.user.identity.clone())
+            .unwrap_or_else(config::default_identity_path);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().ok()?.join(p)
+        };
+        p.is_file().then_some(p)
+    }
+
+    fn unlock_touchid(&self, state: &State) -> Result<Unlocked> {
+        let (who, pass) = crate::touchid::unlock(state.vault_id, "unlock the nepomuk vault")?;
+        match who {
+            crate::touchid::Who::Email { email } => {
+                let user = state.user_by_name(&email).ok_or_else(|| {
+                    Error::new(Code::BadCredentials, format!("unknown user {email}"))
+                })?;
+                if user.disabled {
+                    return Err(Error::new(
+                        Code::IdentityDisabled,
+                        "this identity has been disabled",
+                    ));
+                }
+                identity::unlock_password_user(user, &pass).map_err(|e| stale_touchid(state, e))
+            }
+            crate::touchid::Who::File { path } => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|_| Error::not_found(&path.display().to_string()))?;
+                IdentityFile::parse(&text)?
+                    .unlock(&pass)
+                    .map_err(|e| stale_touchid(state, e))
+            }
+        }
+    }
+
     fn email(&self) -> Option<String> {
         self.opts
             .email
@@ -222,12 +266,24 @@ impl Ctx {
                 "the session is locked; call session.unlock",
             ));
         }
+        if self.opts.touchid {
+            let rc = Rc::new(self.unlock_touchid(state)?);
+            *self.unlocked.borrow_mut() = Some(rc.clone());
+            return Ok(rc);
+        }
         let id = if let Some(f) = self.identity_file()? {
             let pass = self.secret(
                 &format!("Passphrase for {}", f.name),
                 &["NEPOMUK_PASSPHRASE"],
             )?;
-            f.unlock(&pass)?
+            let id = f.unlock(&pass)?;
+            if self.opts.remember_touchid {
+                let path = self.identity_file_path().ok_or_else(|| {
+                    Error::usage("Touch ID needs the identity as a file (--identity)")
+                })?;
+                crate::touchid::enable(state.vault_id, crate::touchid::Who::File { path }, &pass)?;
+            }
+            id
         } else if let Some(email) = self.email() {
             let user = state
                 .user_by_name(&email)
@@ -240,6 +296,15 @@ impl Ctx {
             }
             let pass = self.secret(&format!("Password for {email}"), &["NEPOMUK_PASSWORD"])?;
             let id = identity::unlock_password_user(user, &pass)?;
+            if self.opts.remember_touchid {
+                crate::touchid::enable(
+                    state.vault_id,
+                    crate::touchid::Who::Email {
+                        email: user.name.clone(),
+                    },
+                    &pass,
+                )?;
+            }
             if user
                 .credential
                 .as_ref()
@@ -269,6 +334,18 @@ impl Ctx {
         )?;
         Ok(Rc::new(f.unlock(&pass)?))
     }
+}
+
+/// The sealed password no longer works (it was changed): forget it.
+fn stale_touchid(state: &State, e: Error) -> Error {
+    if e.code == Code::BadCredentials {
+        crate::touchid::disable(state.vault_id);
+        return Error::new(
+            Code::BadCredentials,
+            "the password saved for Touch ID no longer works; unlock with your password to set it up again",
+        );
+    }
+    e
 }
 
 fn tty_available() -> bool {

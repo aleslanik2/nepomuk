@@ -16,5 +16,6 @@ pub mod queries;
 pub mod serve;
 pub mod store;
 pub mod templates;
+pub mod touchid;
 pub mod tx;
 pub mod verify;

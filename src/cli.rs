@@ -56,6 +56,9 @@ pub struct Global {
     /// Queue writes locally instead of pushing (emergency option)
     #[arg(long, global = true)]
     pub offline: bool,
+    /// Unlock with Touch ID (macOS; set up with `nepomuk identity touchid enable`)
+    #[arg(long, global = true)]
+    pub touchid: bool,
 }
 
 #[derive(Subcommand)]
@@ -225,6 +228,18 @@ pub enum IdentityCmd {
     Passwd,
     /// Show the fingerprint of a local identity file
     Show,
+    /// Unlock with Touch ID on this Mac (the password is sealed by the Secure Enclave)
+    #[command(subcommand)]
+    Touchid(TouchidCmd),
+}
+
+#[derive(Subcommand)]
+pub enum TouchidCmd {
+    /// Ask for the password once and seal it for Touch ID
+    Enable,
+    /// Forget the sealed password for this vault
+    Disable,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -463,6 +478,8 @@ pub fn main() -> i32 {
         ci: g.ci,
         offline: g.offline,
         session: false,
+        touchid: g.touchid,
+        remember_touchid: false,
     };
     let ctx = match Ctx::new(opts) {
         Ok(c) => c,
@@ -957,6 +974,32 @@ fn strip_user(u: &str) -> String {
 
 fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
     match c {
+        IdentityCmd::Touchid(t) => {
+            let o = app::open_vault(ctx, true)?;
+            let vault = o.v.file.vault_id;
+            match t {
+                TouchidCmd::Enable => {
+                    if !crate::touchid::available() {
+                        return Err(Error::usage("Touch ID is not available on this computer"));
+                    }
+                    let ctx2 = Ctx::new(Options {
+                        remember_touchid: true,
+                        touchid: false,
+                        ..ctx.opts.clone()
+                    })?;
+                    let id = ctx2.unlock(&o.v.state)?;
+                    Ok(Out::data(json!({ "enabled": true, "identity": id.name })))
+                }
+                TouchidCmd::Disable => Ok(Out::data(
+                    json!({ "disabled": crate::touchid::disable(vault) }),
+                )),
+                TouchidCmd::Status => Ok(Out::data(json!({
+                    "available": crate::touchid::available(),
+                    "enabled": crate::touchid::enabled_for(vault).is_some(),
+                    "identity": crate::touchid::enabled_for(vault),
+                }))),
+            }
+        }
         IdentityCmd::New { name, out } => {
             identity::validate_name(&name)?;
             let out = out
