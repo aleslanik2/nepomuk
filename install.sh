@@ -181,25 +181,68 @@ resolve_latest() {
 
 # ---------------------------------------------------------------- Install
 
-# Uses sudo (or NEPOMUK_SUDO, e.g. doas) when a target directory is not writable.
+# Privileged steps are collected in $WORK/priv.sh and run with one elevation at the end:
+# sudo in a terminal (or NEPOMUK_SUDO, e.g. doas), the system administrator dialog on macOS
+# without a terminal (it accepts Touch ID; the password never passes through this script).
+PRIV=0
+
+has_tty() {
+    [ -t 0 ] || { [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null; }
+}
+
 choose_sudo() { # directory
     d="$1"
     while [ ! -d "$d" ]; do d=$(dirname "$d"); done
     if [ -w "$d" ] || [ "$(id -u 2>/dev/null || echo 0)" = 0 ]; then
-        SUDO=""
+        PRIV=0
         return
     fi
     [ "$OS" != windows ] || die "$1 needs administrator rights: run Git Bash as administrator"
-    SUDO="${NEPOMUK_SUDO:-sudo}"
-    command -v "$SUDO" >/dev/null 2>&1 || die "$1 is not writable and $SUDO is not available"
-    say "installing into $1 needs administrator rights; using $SUDO"
+    PRIV=1
+    if [ -n "$SUDO" ]; then return; fi
+    if [ -n "${NEPOMUK_SUDO:-}" ] || has_tty; then
+        SUDO="${NEPOMUK_SUDO:-sudo}"
+        command -v "$SUDO" >/dev/null 2>&1 || die "$1 is not writable and $SUDO is not available"
+        say "installing into $1 needs administrator rights; using $SUDO"
+    elif [ "$OS" = macos ] && command -v osascript >/dev/null 2>&1; then
+        SUDO=osascript
+        say "installing into $1 needs administrator rights; macOS will ask for them"
+    else
+        die "$1 needs administrator rights: run this in a terminal (sudo needs one to ask for the password)"
+    fi
+}
+
+# Runs a command now, or queues it when the current target needs administrator rights.
+priv() {
+    if [ "$PRIV" = 0 ]; then
+        "$@"
+        return
+    fi
+    line=""
+    for arg in "$@"; do
+        line="$line '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+    done
+    printf '%s\n' "$line" >>"$WORK/priv.sh"
+}
+
+flush_priv() {
+    [ -s "$WORK/priv.sh" ] || return 0
+    if [ "$SUDO" = osascript ]; then
+        osascript -e 'on run argv' \
+            -e 'do shell script "/bin/sh -e " & quoted form of (item 1 of argv) with prompt (item 2 of argv) with administrator privileges' \
+            -e 'end run' "$WORK/priv.sh" "The nepomuk installer needs administrator rights to install for all users." \
+            >/dev/null || die "administrator rights were not granted"
+    else
+        $SUDO sh -e "$WORK/priv.sh" || die "the privileged installation steps failed"
+    fi
+    : >"$WORK/priv.sh"
 }
 
 put_file() { # source dir name
-    $SUDO mkdir -p "$2"
-    $SUDO cp "$1" "$2/.$3.tmp.$$"
-    $SUDO chmod 755 "$2/.$3.tmp.$$"
-    $SUDO mv -f "$2/.$3.tmp.$$" "$2/$3"
+    priv mkdir -p "$2"
+    priv cp "$1" "$2/.$3.tmp.$$"
+    priv chmod 755 "$2/.$3.tmp.$$"
+    priv mv -f "$2/.$3.tmp.$$" "$2/$3"
 }
 
 install_binary() { # source-file
@@ -290,19 +333,22 @@ install_app_macos() { # path to nepomuk.app
     if [ -z "$APP_DIR" ]; then
         if [ "$SYSTEM" = 1 ] || [ -w /Applications ]; then APP_DIR=/Applications; else APP_DIR="$HOME/Applications"; fi
     fi
+    # Staged first: the disk image is detached before the privileged steps run.
+    mkdir -p "$WORK/stage"
+    cp -R "$1" "$WORK/stage/nepomuk.app"
     choose_sudo "$APP_DIR"
-    $SUDO mkdir -p "$APP_DIR"
+    priv mkdir -p "$APP_DIR"
     if pgrep -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" >/dev/null 2>&1; then
         say "quitting the running app"
         pkill -f "$APP_DIR/nepomuk.app/Contents/MacOS/nepomuk-gui" || true
         sleep 1
     fi
-    $SUDO rm -rf "$APP_DIR/nepomuk.app.tmp.$$"
-    $SUDO cp -R "$1" "$APP_DIR/nepomuk.app.tmp.$$"
-    $SUDO rm -rf "$APP_DIR/nepomuk.app"
-    $SUDO mv "$APP_DIR/nepomuk.app.tmp.$$" "$APP_DIR/nepomuk.app"
+    priv rm -rf "$APP_DIR/nepomuk.app.tmp.$$"
+    priv cp -R "$WORK/stage/nepomuk.app" "$APP_DIR/nepomuk.app.tmp.$$"
+    priv rm -rf "$APP_DIR/nepomuk.app"
+    priv mv "$APP_DIR/nepomuk.app.tmp.$$" "$APP_DIR/nepomuk.app"
     # Verified above; a copy made by this script carries no quarantine flag.
-    $SUDO xattr -dr com.apple.quarantine "$APP_DIR/nepomuk.app" 2>/dev/null || true
+    priv xattr -cr "$APP_DIR/nepomuk.app"
     GUI_INSTALLED="$APP_DIR/nepomuk.app"
 }
 
@@ -314,9 +360,7 @@ install_app_linux() { # path to the AppImage
     else
         apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     fi
-    choose_sudo "$apps"
-    $SUDO mkdir -p "$apps"
-    $SUDO tee "$apps/nepomuk.desktop" >/dev/null <<DESKTOP
+    cat >"$WORK/nepomuk.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=nepomuk
@@ -325,6 +369,9 @@ Exec=$INSTALL_DIR/nepomuk-gui
 Terminal=false
 Categories=Utility;Security;
 DESKTOP
+    choose_sudo "$apps"
+    priv mkdir -p "$apps"
+    priv cp "$WORK/nepomuk.desktop" "$apps/nepomuk.desktop"
     GUI_INSTALLED="$INSTALL_DIR/nepomuk-gui"
 }
 
@@ -398,6 +445,14 @@ else
     from_release
 fi
 
+# The desktop app comes in addition to the CLI.
+if [ "$GUI" = 1 ]; then
+    if [ "$FROM_SOURCE" = 1 ]; then gui_from_source; else gui_from_release; fi
+fi
+
+# One elevation for everything that needs administrator rights.
+flush_priv
+
 installed="$INSTALL_DIR/$EXE"
 "$installed" version >/dev/null 2>&1 || die "the installed binary does not run: $installed"
 say "installed $("$installed" version | head -n1) to $installed"
@@ -419,9 +474,7 @@ case ":$PATH:" in
         ;;
 esac
 
-# The desktop app comes in addition to the CLI.
 if [ "$GUI" = 1 ]; then
-    if [ "$FROM_SOURCE" = 1 ]; then gui_from_source; else gui_from_release; fi
     say "installed the nepomuk desktop app to $GUI_INSTALLED"
     if [ "$OS" = macos ]; then say "start it from Launchpad or with: open \"$GUI_INSTALLED\""; fi
 fi
