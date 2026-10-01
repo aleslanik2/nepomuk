@@ -249,7 +249,10 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
+          # The installers are covered too: `nepomuk upgrade` runs install.sh only when it matches.
+          cp ../install.sh ../install.ps1 .
           sha256sum -- * > SHA256SUMS
+          grep -q ' install.sh$' SHA256SUMS
           cat SHA256SUMS
           [ "$(ls -- nepomuk-v*.tar.gz | wc -l)" -eq 6 ] || { echo "expected 6 CLI archives"; exit 1; }
           [ "$(ls -- nepomuk-gui-* | wc -l)" -ge 4 ] || { echo "expected GUI installers"; exit 1; }
@@ -282,7 +285,6 @@ jobs:
 
       - name: Create the release
         run: |
-          cp install.sh install.ps1 dist/
           draft=--draft
           [ "${{ steps.sign.outputs.signed }}" = "true" ] && draft=
           gh release create "$TAG" dist/* $draft --verify-tag --title "nepomuk $TAG" \
