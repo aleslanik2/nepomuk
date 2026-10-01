@@ -217,12 +217,18 @@ form { display: grid; gap: 1rem; }
 .tree-tools input { flex: 1; }
 .tree { overflow: auto; padding: 0.4rem 0; flex: 1; }
 .tree ul { list-style: none; margin: 0; padding: 0; }
-.tree li > button {
-  width: 100%; text-align: left; border: none; border-radius: 0; background: none; font-weight: 400;
-  padding: 0.28rem 0.75rem; display: flex; gap: 0.45rem; align-items: center; color: var(--text);
+.tree-row { display: flex; align-items: center; }
+.tree-row:hover { background: var(--vellum); }
+.tree-row:has(> button[aria-selected="true"]) { background: var(--seal-soft); box-shadow: inset 3px 0 0 var(--seal); }
+.tree-row > button[role="treeitem"] {
+  flex: 1; min-width: 0; text-align: left; border: none; border-radius: 0; background: none; font-weight: 400;
+  padding: 0.28rem 0.75rem 0.28rem 0.2rem; display: flex; gap: 0.45rem; align-items: center; color: var(--text);
 }
-.tree li > button:hover { background: var(--vellum); }
-.tree li > button[aria-selected="true"] { background: var(--seal-soft); box-shadow: inset 3px 0 0 var(--seal); }
+.twisty {
+  flex: none; width: 1.4rem; height: 1.4rem; padding: 0; border: none; background: none;
+  color: var(--muted); font-size: 0.8rem; display: inline-flex; align-items: center; justify-content: center;
+}
+button.twisty:hover { color: var(--text); }
 .tree .glyph { width: 1rem; color: var(--muted); flex: none; text-align: center; }
 .tree .flag { margin-left: auto; font-size: 0.72rem; font-weight: 600; }
 .tree .flag.rot { color: var(--seal); }

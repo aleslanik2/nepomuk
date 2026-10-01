@@ -94,6 +94,7 @@ export async function switchVault() {
   state.unlocked = false;
   state.me = null;
   state.selected = null;
+  state.collapsed = null;
   state.view = "secrets";
   refs = {};
   await connect(target);
@@ -205,7 +206,7 @@ export function renderLogin(message) {
       body._remember = () => settings.set("identityPath", identityPath);
     }
     settings.set("loginMode", mode);
-    const remember = h("input", { type: "checkbox", checked: settings.get("rememberTouchid", true) });
+    const remember = h("input", { type: "checkbox", checked: settings.get("rememberTouchid", false) });
     const rememberRow = touch.available && !touch.enabled
       ? h("label", { class: "check" }, remember, h("span", "Use Touch ID to unlock on this Mac"))
       : null;
@@ -512,6 +513,7 @@ export async function lock(message) {
   if (state.unlocked) await rpc("session.lock").catch(() => {});
   state.unlocked = false;
   state.me = null;
+  state.collapsed = null;
   refs = {};
   renderLogin(message);
 }

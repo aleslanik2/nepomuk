@@ -52,34 +52,70 @@ function secretsView(target, ctx) {
     drawDetail();
   };
 
+  // Collapsed folders live only in memory: folder names are encrypted in the vault.
+  const collapsed = ctx.state.collapsed || (ctx.state.collapsed = new Set());
+  const toggle = (path) => {
+    if (collapsed.has(path)) collapsed.delete(path);
+    else collapsed.add(path);
+    drawTree();
+  };
+
+  const sortKids = (n) => [...n.children.values()].sort((a, b) => {
+    const fa = (a.entry?.type || "folder") === "folder" ? 0 : 1;
+    const fb = (b.entry?.type || "folder") === "folder" ? 0 : 1;
+    return fa - fb || a.name.localeCompare(b.name);
+  });
+
   const drawTree = () => {
     const root = buildTree(data.path, data.entries);
     const q = filter.toLowerCase();
     const visible = (n) => !q || n.path.toLowerCase().includes(q) || [...n.children.values()].some(visible);
-    const item = (n, depth) => {
-      if (!visible(n)) return null;
-      const e = n.entry;
-      const type = e ? e.type : "folder";
-      const flags = [];
-      if (e?.rotation_pending) flags.push(h("span", { class: "flag rot", title: "Rotate at the source" }, "rotate"));
-      if (e?.expiring_soon) flags.push(h("span", { class: "flag exp", title: `Expires ${when(e.expires)}` }, "expires"));
+    const row = (n, depth, label, type, flags) => {
+      const kids = sortKids(n);
+      const isFolder = type === "folder";
+      // While filtering, everything matching is shown expanded.
+      const open = !!q || !collapsed.has(n.path);
+      const chevron = isFolder && kids.length
+        ? h("button", {
+          class: "twisty",
+          "aria-label": `${open ? "Collapse" : "Expand"} ${label}`,
+          "aria-expanded": open ? "true" : "false",
+          onClick: () => toggle(n.path),
+        }, open ? "▾" : "▸")
+        : h("span", { class: "twisty", "aria-hidden": "true" }, isFolder ? "" : TYPE_GLYPH[type] || "•");
       const btn = h("button", {
         role: "treeitem",
         "aria-selected": selected === n.path,
+        "aria-expanded": isFolder && kids.length ? (open ? "true" : "false") : false,
         onClick: () => select(n.path),
-      }, h("span", { class: "glyph", "aria-hidden": "true" }, TYPE_GLYPH[type] || "•"), n.name, flags);
-      btn.style.paddingLeft = `${0.75 + depth * 1}rem`;
-      const kids = [...n.children.values()].sort((a, b) => {
-        const fa = (a.entry?.type || "folder") === "folder" ? 0 : 1;
-        const fb = (b.entry?.type || "folder") === "folder" ? 0 : 1;
-        return fa - fb || a.name.localeCompare(b.name);
-      });
-      return h("li", btn, kids.length ? h("ul", kids.map((k) => item(k, depth + 1))) : null);
+        onKeydown: (ev) => {
+          if (!isFolder || !kids.length) return;
+          if ((ev.key === "ArrowLeft" && open) || (ev.key === "ArrowRight" && !open)) {
+            ev.preventDefault();
+            toggle(n.path);
+          }
+        },
+      }, label, flags);
+      const line = h("div", { class: "tree-row" }, chevron, btn);
+      line.style.paddingLeft = `${0.4 + depth * 1}rem`;
+      return h("li", line, open && kids.length ? h("ul", kids.map((k) => item(k, depth + 1))) : null);
     };
-    const rootItem = h("li", h("button", { role: "treeitem", "aria-selected": selected === data.path, onClick: () => select(data.path) },
-      h("span", { class: "glyph", "aria-hidden": "true" }, "▸"), data.path));
-    const kids = [...root.children.values()].sort((a, b) => a.name.localeCompare(b.name)).map((k) => item(k, 1));
-    mount(treeEl, h("ul", rootItem, kids));
+    const item = (n, depth) => {
+      if (!visible(n)) return null;
+      const e = n.entry;
+      const flags = [];
+      if (e?.rotation_pending) flags.push(h("span", { class: "flag rot", title: "Rotate at the source" }, "rotate"));
+      if (e?.expiring_soon) flags.push(h("span", { class: "flag exp", title: `Expires ${when(e.expires)}` }, "expires"));
+      return row(n, depth, n.name, e ? e.type : "folder", flags);
+    };
+    const rootNode = { ...root, path: data.path };
+    mount(treeEl, h("ul", row(rootNode, 0, data.path, "folder", [])));
+  };
+
+  const setAll = (collapse) => {
+    collapsed.clear();
+    if (collapse) data.entries.filter((e) => e.type === "folder").forEach((e) => collapsed.add(e.path));
+    drawTree();
   };
 
   const entryFor = (path) => data.entries.find((e) => e.path === path) || (path === data.path ? { path, name: path, type: "folder" } : null);
@@ -398,7 +434,11 @@ function secretsView(target, ctx) {
 
   const search = h("input", { type: "search", placeholder: "Filter", "aria-label": "Filter secrets", onInput: (ev) => { filter = ev.target.value; drawTree(); } });
   mount(target, h("div", { class: "split" },
-    h("div", { class: "panel tree-panel" }, h("div", { class: "tree-tools" }, search), treeEl),
+    h("div", { class: "panel tree-panel" },
+      h("div", { class: "tree-tools" }, search,
+        h("button", { class: "small quiet", title: "Collapse all folders", "aria-label": "Collapse all folders", onClick: () => setAll(true) }, "▸"),
+        h("button", { class: "small quiet", title: "Expand all folders", "aria-label": "Expand all folders", onClick: () => setAll(false) }, "▾")),
+      treeEl),
     detailEl));
   return load();
 }

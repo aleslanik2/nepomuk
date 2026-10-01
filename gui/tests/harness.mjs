@@ -32,6 +32,8 @@ const env = {
   NEPOMUK_STATE_DIR: join(work, "state"),
   NEPOMUK_INSECURE_TEST_KDF: "1",
   NEPOMUK_VAULT: join(work, "vault.nepomuk"),
+  // Never touch the real Touch ID / Secure Enclave of the machine running the tests.
+  NEPOMUK_TOUCHID_HELPER: "/nonexistent/nepomuk-touchid",
 };
 const run = (args, extraEnv = {}, input) =>
   execFileSync(cli, ["--json", ...args], { env: { ...env, ...extraEnv }, input, cwd: work }).toString();
@@ -282,7 +284,7 @@ step("login with the master identity", async () => {
   await waitFor(hasText("master – ") + " && !" + hasText("Use default"), "back to the default");
   await type("input[type=password]", MASTER_PASS);
   await shot("03-login");
-  await click("Unlock");
+  await click("Unlock", "form button[type=submit]");
   await waitFor("!!document.querySelector('.tree')", "secrets");
   await waitFor(hasText("projects"), "tree");
 });
@@ -293,6 +295,18 @@ step("browse and reveal a record field", async () => {
   await js(`[...document.querySelectorAll(".value")].find(v => v.innerText.includes("key_password")).querySelector("button").click()`);
   await waitFor(hasText("k3y-pass-123"), "revealed value");
   await shot("04-secret-record");
+});
+step("collapse and expand folders", async () => {
+  const treeText = "document.querySelector('.tree').innerText";
+  await js(`document.querySelector('.tree button[aria-label="Collapse projects"]').click()`);
+  await waitFor(`!${treeText}.includes("release")`, "projects collapsed");
+  await shot("04b-collapsed");
+  await js(`document.querySelector('.tree button[aria-label="Expand projects"]').click()`);
+  await waitFor(`${treeText}.includes("release")`, "projects expanded");
+  await js(`document.querySelector('button[aria-label="Collapse all folders"]').click()`);
+  await waitFor(`${treeText}.includes("infra") && !${treeText}.includes("prod-password")`, "all collapsed to the top level");
+  await js(`document.querySelector('button[aria-label="Expand all folders"]').click()`);
+  await waitFor(`${treeText}.includes("prod-password")`, "all expanded");
 });
 step("rotation badge after a revoke", async () => {
   await click("prod-password", ".tree button");
@@ -347,7 +361,7 @@ step("lock and unlock as Jane", async () => {
   await click("Email and password");
   await type("input[type=email]", "jane@example.com");
   await type("input[type=password]", JANE_PASS);
-  await click("Unlock");
+  await click("Unlock", "form button[type=submit]");
   await waitFor("!!document.querySelector('.sidebar')", "shell");
   await click("Secrets", "nav button");
   await waitFor("!!document.querySelector('.tree')", "secrets");
