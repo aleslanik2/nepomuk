@@ -82,6 +82,8 @@ pub struct UserConfig {
     pub email: Option<String>,
     /// `serve --stdio` inactivity limit in seconds.
     pub session_timeout: Option<u64>,
+    /// How long the agent keeps an identity unlocked with Touch ID, in seconds (0 = never).
+    pub agent_timeout: Option<u64>,
 }
 
 impl UserConfig {

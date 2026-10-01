@@ -138,3 +138,58 @@ pub fn unlock(vault: Id, reason: &str) -> Result<(Who, Zeroizing<String>)> {
         .map_err(|_| Error::general("unexpected Touch ID helper output"))?;
     Ok((rec.who, Zeroizing::new(password)))
 }
+
+/// Whether the screen is locked (macOS); used by the agent to forget identities.
+pub fn screen_locked() -> bool {
+    screen::locked()
+}
+
+#[cfg(target_os = "macos")]
+mod screen {
+    use std::ffi::{c_char, c_void};
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFTypeRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFStringCreateWithCString(
+            alloc: CFTypeRef,
+            s: *const c_char,
+            encoding: u32,
+        ) -> CFTypeRef;
+        fn CFBooleanGetValue(b: CFTypeRef) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    pub fn locked() -> bool {
+        unsafe {
+            let dict = CGSessionCopyCurrentDictionary();
+            if dict.is_null() {
+                return false;
+            }
+            let key = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"CGSSessionScreenIsLocked".as_ptr(),
+                0x0800_0100,
+            );
+            let v = CFDictionaryGetValue(dict, key);
+            let locked = !v.is_null() && CFBooleanGetValue(v) != 0;
+            CFRelease(key);
+            CFRelease(dict);
+            locked
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod screen {
+    pub fn locked() -> bool {
+        false
+    }
+}

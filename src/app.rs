@@ -267,7 +267,34 @@ impl Ctx {
             ));
         }
         if self.opts.touchid {
-            let rc = Rc::new(self.unlock_touchid(state)?);
+            let ttl = self
+                .user
+                .agent_timeout
+                .unwrap_or(crate::agent::DEFAULT_TIMEOUT);
+            // Unlocked with Touch ID less than `agent_timeout` ago?
+            let cached = if ttl > 0 && !self.opts.session {
+                crate::agent::get(state.vault_id)
+                    .filter(|id| state.users.values().any(|u| id.matches(u) && !u.disabled))
+            } else {
+                None
+            };
+            let id = match cached {
+                Some(id) => id,
+                None => {
+                    let id = self.unlock_touchid(state)?;
+                    if ttl > 0
+                        && !self.opts.session
+                        && let Err(e) = crate::agent::put(state.vault_id, &id, ttl)
+                    {
+                        self.warn(format!(
+                            "Touch ID will be asked again next time: {}",
+                            e.message
+                        ));
+                    }
+                    id
+                }
+            };
+            let rc = Rc::new(id);
             *self.unlocked.borrow_mut() = Some(rc.clone());
             return Ok(rc);
         }

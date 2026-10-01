@@ -190,6 +190,14 @@ pub enum Cmd {
     /// Master management
     #[command(subcommand)]
     Master(MasterCmd),
+    /// Forget identities kept unlocked by the Touch ID agent
+    Lock,
+    /// The Touch ID agent (started automatically)
+    #[command(hide = true)]
+    Agent {
+        #[arg(long)]
+        daemon: bool,
+    },
     /// git textconv driver: public metadata of a vault file (`diff.nepomuk.textconv`)
     #[command(name = "git-textconv", hide = true)]
     GitTextconv { file: PathBuf },
@@ -882,6 +890,21 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             }
             Ok(Out::data(d))
         }
+        Cmd::Lock => Ok(Out::data(
+            json!({ "locked": crate::agent::forget(None) || crate::agent::status().is_none() }),
+        )),
+        Cmd::Agent { daemon } => {
+            if daemon {
+                return Ok(Out {
+                    data: Value::Null,
+                    human: None,
+                    exit: crate::agent::run_daemon(),
+                });
+            }
+            Ok(Out::data(
+                crate::agent::status().unwrap_or_else(|| json!({ "running": false })),
+            ))
+        }
         Cmd::GitTextconv { file } => {
             print!("{}", textconv(&std::fs::read(&file)?));
             Ok(Out {
@@ -990,9 +1013,12 @@ fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
                     let id = ctx2.unlock(&o.v.state)?;
                     Ok(Out::data(json!({ "enabled": true, "identity": id.name })))
                 }
-                TouchidCmd::Disable => Ok(Out::data(
-                    json!({ "disabled": crate::touchid::disable(vault) }),
-                )),
+                TouchidCmd::Disable => {
+                    crate::agent::forget(Some(vault));
+                    Ok(Out::data(
+                        json!({ "disabled": crate::touchid::disable(vault) }),
+                    ))
+                }
                 TouchidCmd::Status => Ok(Out::data(json!({
                     "available": crate::touchid::available(),
                     "enabled": crate::touchid::enabled_for(vault).is_some(),

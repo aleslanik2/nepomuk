@@ -1,5 +1,6 @@
 //! nepomuk – a post-quantum secrets vault in a single file in git.
 
+pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod config;
