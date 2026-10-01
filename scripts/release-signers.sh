@@ -13,6 +13,10 @@ from_sh() {
     sed -n "/^RELEASE_SIGNERS='/,/^'/p" "$root/install.sh" | sed "1d;\$d" | sed '/^[[:space:]]*$/d'
 }
 
+from_rust() {
+    sed -n '/^pub const RELEASE_SIGNERS: &str = "\\$/,/^";$/p' "$root/src/upgrade.rs" | sed "1d;\$d" | sed '/^[[:space:]]*$/d'
+}
+
 from_ps1() {
     sed -n "/^\$ReleaseSigners = @'/,/^'@/p" "$root/install.ps1" | sed "1d;\$d" | tr -d '\r' | sed '/^[[:space:]]*$/d'
 }
@@ -26,6 +30,7 @@ case "${1:-}" in
         b=$(from_ps1)
         [ -n "$a" ] || { echo "install.sh has no release signing key (RELEASE_SIGNERS)" >&2; exit 1; }
         [ "$a" = "$b" ] || { echo "install.sh and install.ps1 carry different release keys" >&2; exit 1; }
+        [ "$a" = "$(from_rust)" ] || { echo "install.sh and src/upgrade.rs carry different release keys" >&2; exit 1; }
         echo "release keys OK:"
         printf '%s\n' "$a"
         ;;

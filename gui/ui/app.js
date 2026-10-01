@@ -434,6 +434,10 @@ export async function loadShell() {
       content)));
   show(state.view);
   refreshStatus();
+  rpc("update.status").then((u) => {
+    state.update = u;
+    if (u.newer) refs.nav.after(h("div", { class: "update-note" }, `nepomuk ${u.latest} is available.`, h("br"), "Run ", h("code", "nepomuk upgrade")));
+  }).catch(() => {});
 }
 
 export function show(view) {

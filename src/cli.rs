@@ -192,6 +192,23 @@ pub enum Cmd {
     Master(MasterCmd),
     /// Forget identities kept unlocked by the Touch ID agent
     Lock,
+    /// Install the latest release (verified with the release key)
+    Upgrade {
+        /// Only report whether a newer release exists
+        #[arg(long)]
+        check: bool,
+        /// A specific release instead of the latest, e.g. v0.2.3
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Also install or update the desktop app
+        #[arg(long, conflicts_with = "no_gui")]
+        gui: bool,
+        /// Do not touch the desktop app
+        #[arg(long)]
+        no_gui: bool,
+        #[arg(long, hide = true)]
+        refresh: bool,
+    },
     /// The Touch ID agent (started automatically)
     #[command(hide = true)]
     Agent {
@@ -499,7 +516,22 @@ pub fn main() -> i32 {
     if let Cmd::Serve { .. } = cli.cmd {
         return crate::serve::run(ctx);
     }
-    match run(&ctx, cli.cmd) {
+    let quiet = matches!(
+        cli.cmd,
+        Cmd::Upgrade { .. }
+            | Cmd::Agent { .. }
+            | Cmd::GitTextconv { .. }
+            | Cmd::GitMerge { .. }
+            | Cmd::Exec { .. }
+    );
+    let result = run(&ctx, cli.cmd);
+    if !quiet
+        && !ctx.opts.json
+        && let Some(n) = crate::upgrade::notice(&ctx.user)
+    {
+        eprintln!("note: {n}");
+    }
+    match result {
         Ok(out) => {
             if out.exit >= 0 && !(out.data.is_null() && out.human.is_none()) {
                 print_ok(&ctx, &out);
@@ -889,6 +921,62 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
                 ctx.warn(format!("every client and CI must now pin the new master: `nepomuk trust {fp}` / NEPOMUK_ROOT_FP"));
             }
             Ok(Out::data(d))
+        }
+        Cmd::Upgrade {
+            check,
+            tag,
+            gui,
+            no_gui,
+            refresh,
+        } => {
+            if refresh {
+                let _ = crate::upgrade::refresh();
+                return Ok(Out {
+                    data: Value::Null,
+                    human: None,
+                    exit: 0,
+                });
+            }
+            let plan = crate::upgrade::plan(tag.as_deref())?;
+            let current = crate::upgrade::current();
+            if check {
+                let h = if plan.newer {
+                    format!(
+                        "nepomuk {} is available (you have {current}); run `nepomuk upgrade`\n",
+                        plan.tag
+                    )
+                } else {
+                    format!("nepomuk {current} is up to date\n")
+                };
+                return Ok(Out::human(
+                    json!({ "current": current, "latest": plan.tag, "newer": plan.newer }),
+                    h,
+                ));
+            }
+            if !plan.newer && tag.is_none() {
+                return Ok(Out::human(
+                    json!({ "current": current, "latest": plan.tag, "upgraded": false }),
+                    format!("nepomuk {current} is up to date\n"),
+                ));
+            }
+            let gui = if gui {
+                Some(true)
+            } else if no_gui {
+                Some(false)
+            } else {
+                None
+            };
+            let code = crate::upgrade::run(&plan.tag, gui)?;
+            if code != 0 {
+                return Err(Error::general(format!(
+                    "the installer of {} failed",
+                    plan.tag
+                )));
+            }
+            Ok(Out::human(
+                json!({ "previous": current, "installed": plan.tag, "upgraded": true }),
+                String::new(),
+            ))
         }
         Cmd::Lock => Ok(Out::data(
             json!({ "locked": crate::agent::forget(None) || crate::agent::status().is_none() }),

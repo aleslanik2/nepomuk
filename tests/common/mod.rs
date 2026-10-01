@@ -116,6 +116,7 @@ impl Env {
             .env("NEPOMUK_CONFIG_DIR", self.path("cfg"))
             .env("NEPOMUK_STATE_DIR", self.path("state"))
             .env("NEPOMUK_INSECURE_TEST_KDF", "1")
+            .env("NEPOMUK_NO_UPDATE_CHECK", "1")
             .env("NEPOMUK_VAULT", &self.vault)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")

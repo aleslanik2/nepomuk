@@ -681,6 +681,12 @@ async function vaultView(target, ctx) {
          ["Items", info.nodes], ["Grants", info.grants], ["Size", bytes(info.size)], ["Crypto", info.suite], ["Git", info.git ? "pushes on every change" : "local file"]]
           .map(([k, v]) => h("tr", h("th", k), h("td", { class: k === "File" ? "mono" : null }, String(v))))))),
     touchCard,
+    h("div", { class: "card" },
+      h("h3", "Updates"),
+      ctx.state.update?.newer
+        ? h("p", `nepomuk ${ctx.state.update.latest} is available; you have ${ctx.state.update.current}. Quit this app and run `, h("code", "nepomuk upgrade"), " in a terminal – it verifies the release and updates the command line tool and this app.")
+        : h("p", `You have nepomuk ${ctx.state.update?.current || ""}${ctx.state.update?.latest ? `, the latest release is ${ctx.state.update.latest}` : ""}.`),
+      ctx.state.update?.newer ? h("div", { class: "actions" }, h("button", { onClick: () => invoke("copy_plain", { text: "nepomuk upgrade" }).then(() => toast("Command copied.")) }, "Copy the command")) : null),
     h("form", { class: "card", onSubmit: (ev) => {
       ev.preventDefault();
       settings.set("clipboardSeconds", Math.max(5, Number(clip.value) || 30));

@@ -19,4 +19,5 @@ pub mod store;
 pub mod templates;
 pub mod touchid;
 pub mod tx;
+pub mod upgrade;
 pub mod verify;

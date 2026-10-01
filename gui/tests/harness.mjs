@@ -34,6 +34,7 @@ const env = {
   NEPOMUK_VAULT: join(work, "vault.nepomuk"),
   // Never touch the real Touch ID / Secure Enclave of the machine running the tests.
   NEPOMUK_TOUCHID_HELPER: "/nonexistent/nepomuk-touchid",
+  NEPOMUK_NO_UPDATE_CHECK: "1",
 };
 const run = (args, extraEnv = {}, input) =>
   execFileSync(cli, ["--json", ...args], { env: { ...env, ...extraEnv }, input, cwd: work }).toString();

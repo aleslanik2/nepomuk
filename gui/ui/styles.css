@@ -327,3 +327,5 @@ button.touch small { grid-column: 2; font-weight: 400; opacity: 0.85; }
 button.on-ink { background: transparent; color: var(--ink-text); border-color: var(--ink-2); margin-top: 0.4rem; }
 button.on-ink:hover { color: #fff; border-color: var(--ink-text); }
 dialog .mono { word-break: break-all; }
+.update-note { margin: 0.5rem 0.75rem; padding: 0.6rem 0.75rem; border: 1px solid var(--brass); border-radius: var(--radius-s); color: var(--ink-text); font-size: var(--step--1); }
+.update-note code, .card code { font-family: var(--mono); }

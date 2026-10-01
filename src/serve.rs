@@ -134,6 +134,10 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             ctx.password_override.borrow_mut().take();
             result
         }
+        "update.status" => {
+            crate::upgrade::refresh_if_stale(&ctx.user);
+            Ok(crate::upgrade::status())
+        }
         "touchid.status" => {
             let loc = ctx.location()?;
             let loaded = loc.load(false)?;

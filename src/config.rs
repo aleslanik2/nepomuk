@@ -84,6 +84,8 @@ pub struct UserConfig {
     pub session_timeout: Option<u64>,
     /// How long the agent keeps an identity unlocked with Touch ID, in seconds (0 = never).
     pub agent_timeout: Option<u64>,
+    /// Look up new releases once a day (default true; off in CI).
+    pub update_check: Option<bool>,
 }
 
 impl UserConfig {
