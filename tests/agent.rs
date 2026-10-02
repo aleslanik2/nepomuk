@@ -15,6 +15,9 @@ if cmd == "available":
 data = sys.stdin.buffer.read()
 with open(log, "a") as f:
     f.write(cmd + "\n")
+if cmd == "open":
+    with open(sys.argv[0] + ".reason", "a") as f:
+        f.write(sys.argv[2] + "\n")
 if cmd == "seal":
     sys.stdout.write(json.dumps({"version": 1, "fake": base64.b64encode(data).decode()}))
 elif cmd == "open":
@@ -59,6 +62,12 @@ fn touch_id_once_per_timeout() {
 
     assert_eq!(touch().data()["master"], true);
     assert_eq!(prompts(&helper), 1);
+    // The prompt says who, for what and for how long – never paths of identities.
+    let reason = std::fs::read_to_string(helper.with_extension("reason")).unwrap();
+    assert_eq!(
+        reason.trim(),
+        "use master for vault.nepomuk for 3 seconds: nepomuk whoami"
+    );
     // Within the timeout: no new prompt.
     assert_eq!(touch().data()["master"], true);
     e.m(&["ls"]).ok();
@@ -120,5 +129,61 @@ fn agent_can_be_turned_off() {
         prompts(&helper),
         2,
         "with agent_timeout = 0 every command asks"
+    );
+}
+
+#[test]
+fn touch_id_prompt_names_the_project() {
+    let e = Env::new("agent-project");
+    let helper = e.path("nepomuk-touchid");
+    std::fs::write(&helper, FAKE_HELPER).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(e.path("cfg/config.toml"), "agent_timeout = 0\n").unwrap();
+    std::fs::write(
+        e.path(".nepomuk.toml"),
+        format!(
+            "name = \"eshop-android\"\nvault = \"{}\"\n\n[exec.release]\nenv.X = \"/nothing\"\n",
+            e.vault.display()
+        ),
+    )
+    .unwrap();
+    let tmp = std::env::temp_dir();
+    let base = [
+        ("NEPOMUK_TOUCHID_HELPER", helper.to_str().unwrap()),
+        ("TMPDIR", tmp.to_str().unwrap()),
+    ];
+    let id = e.master_identity();
+    e.cmd(
+        &[
+            "--identity",
+            id.to_str().unwrap(),
+            "identity",
+            "touchid",
+            "enable",
+        ],
+        &[base[0], base[1], ("NEPOMUK_PASSPHRASE", MASTER_PASS)],
+        None,
+    )
+    .ok();
+    // exec fails (no such secret), but only after the prompt.
+    let _ = e.cmd(
+        &[
+            "--touchid",
+            "exec",
+            "release",
+            "--",
+            "echo",
+            "SECRET-LOOKING-ARG",
+        ],
+        &base,
+        None,
+    );
+    let reason = std::fs::read_to_string(helper.with_extension("reason")).unwrap();
+    assert_eq!(
+        reason.trim(),
+        "use master for eshop-android (vault.nepomuk): nepomuk exec release"
     );
 }

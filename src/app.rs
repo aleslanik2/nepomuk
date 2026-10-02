@@ -52,6 +52,8 @@ pub struct Ctx {
     pub password_override: RefCell<Option<Zeroizing<String>>>,
     secret_reader: RefCell<Option<Box<dyn BufRead>>>,
     pub warnings: RefCell<Vec<String>>,
+    /// What the identity is unlocked for, shown in the Touch ID prompt.
+    pub purpose: RefCell<Option<String>>,
 }
 
 impl Ctx {
@@ -64,6 +66,7 @@ impl Ctx {
             password_override: RefCell::new(None),
             secret_reader: RefCell::new(None),
             warnings: RefCell::new(Vec::new()),
+            purpose: RefCell::new(None),
         })
     }
 
@@ -222,8 +225,55 @@ impl Ctx {
         p.is_file().then_some(p)
     }
 
+    /// The text of the Touch ID prompt ("nepomuk is trying to <reason>"): which identity, which
+    /// vault, for how long and for what. Never contains secrets: they are never arguments.
+    fn touchid_reason(&self, state: &State) -> String {
+        let who = match crate::touchid::enabled_for(state.vault_id) {
+            Some(crate::touchid::Who::Email { email }) => email,
+            Some(crate::touchid::Who::File { path }) => std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| IdentityFile::parse(&t).ok())
+                .map(|f| f.name)
+                .unwrap_or_else(|| "your identity".into()),
+            None => "your identity".into(),
+        };
+        let vault = self
+            .location()
+            .ok()
+            .and_then(|l| l.path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "the vault".into());
+        let ttl = self
+            .user
+            .agent_timeout
+            .unwrap_or(crate::agent::DEFAULT_TIMEOUT);
+        let lasting = if ttl > 0 && !self.opts.session {
+            match ttl {
+                t if t % 60 == 0 => {
+                    format!(" for {} minute{}", t / 60, if t == 60 { "" } else { "s" })
+                }
+                t => format!(" for {t} seconds"),
+            }
+        } else {
+            String::new()
+        };
+        let purpose = match self.purpose.borrow().as_deref() {
+            Some(p) => p.to_string(),
+            None => String::new(),
+        };
+        let subject = match &self.project {
+            Some(p) => format!("{} ({vault})", p.display_name()),
+            None => vault,
+        };
+        let mut reason = format!("use {who} for {subject}{lasting}{purpose}");
+        if reason.chars().count() > 200 {
+            reason = reason.chars().take(199).collect::<String>() + "…";
+        }
+        reason
+    }
+
     fn unlock_touchid(&self, state: &State) -> Result<Unlocked> {
-        let (who, pass) = crate::touchid::unlock(state.vault_id, "unlock the nepomuk vault")?;
+        let reason = self.touchid_reason(state);
+        let (who, pass) = crate::touchid::unlock(state.vault_id, &reason)?;
         match who {
             crate::touchid::Who::Email { email } => {
                 let user = state.user_by_name(&email).ok_or_else(|| {

@@ -118,6 +118,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                 ctx.opts.email = None;
             }
             let use_touchid = p_bool(p, "touchid");
+            *ctx.purpose.borrow_mut() = Some(" in the nepomuk app".into());
             if !use_touchid {
                 *ctx.password_override.borrow_mut() = Some(Zeroizing::new(p_str(p, "password")?));
             }

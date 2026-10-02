@@ -89,6 +89,7 @@ nepomuk grant user:ci-eshop-android read /projects/eshop-android/signing
 Map the fields to the build in the application's `.nepomuk.toml`:
 
 ```toml
+name   = "eshop-android"                  # shown in the Touch ID prompt
 vault  = "secrets/vault.nepomuk"          # submodule with the company vault
 prefix = "/projects/eshop-android"
 

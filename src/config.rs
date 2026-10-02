@@ -110,6 +110,8 @@ pub struct Profile {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    /// Shown in the Touch ID prompt (default: the project folder's name).
+    pub name: Option<String>,
     pub vault: Option<PathBuf>,
     pub remote_ref: Option<String>,
     pub prefix: Option<String>,
@@ -138,6 +140,18 @@ impl ProjectConfig {
                 return Ok(None);
             }
         }
+    }
+
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| {
+                self.dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "this project".into())
+            })
     }
 
     pub fn vault_path(&self) -> Option<PathBuf> {

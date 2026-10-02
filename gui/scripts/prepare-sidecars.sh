@@ -23,7 +23,9 @@ case "$target" in
     *apple-darwin)
         arch=${target%%-*}
         [ "$arch" = aarch64 ] && arch=arm64
-        xcrun swiftc -O -target "$arch-apple-macos11" -o "$bin/nepomuk-touchid-$target" "$root/macos/touchid/main.swift"
+        INFO_PLIST="$root/macos/touchid/Info.plist"
+        # The embedded Info.plist names the app "nepomuk" in the Touch ID prompt.
+        xcrun swiftc -O -target "$arch-apple-macos11" -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$INFO_PLIST" -o "$bin/nepomuk-touchid-$target" "$root/macos/touchid/main.swift"
         ;;
 esac
 ls -l "$bin"

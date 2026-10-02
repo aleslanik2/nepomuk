@@ -446,6 +446,41 @@ pub fn print_ok(ctx: &Ctx, out: &Out) {
     }
 }
 
+/// The command line without global options and their values (paths of identities and vaults),
+/// for the Touch ID prompt. Secrets are never command-line arguments.
+fn describe_invocation(args: &[String]) -> String {
+    const WITH_VALUE: &[&str] = &["--vault", "--identity", "--email", "--password-fd"];
+    const FLAGS: &[&str] = &[
+        "--json",
+        "--password-stdin",
+        "--ci",
+        "--offline",
+        "--touchid",
+    ];
+    let mut out = vec!["nepomuk".to_string()];
+    let mut skip = false;
+    for a in args.iter().skip(1) {
+        // Arguments of the command run by `exec` are not nepomuk's to show.
+        if a == "--" {
+            break;
+        }
+        if skip {
+            skip = false;
+            continue;
+        }
+        if WITH_VALUE.contains(&a.as_str()) {
+            skip = true;
+            continue;
+        }
+        if FLAGS.contains(&a.as_str()) || WITH_VALUE.iter().any(|f| a.starts_with(&format!("{f}=")))
+        {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.join(" ")
+}
+
 pub fn error_json(e: &Error) -> Value {
     json!({ "api": API_VERSION, "ok": false,
             "error": { "code": e.code.as_str(), "message": e.message, "details": e.details } })
@@ -515,6 +550,7 @@ pub fn main() -> i32 {
             return e.code.exit_code();
         }
     };
+    *ctx.purpose.borrow_mut() = Some(format!(": {}", describe_invocation(&args)));
     if let Cmd::Serve { .. } = cli.cmd {
         return crate::serve::run(ctx);
     }

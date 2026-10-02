@@ -105,7 +105,7 @@ jobs:
           if [[ "$TARGET" == *apple-darwin ]]; then
             # Touch ID unlock helper (Secure Enclave), installed next to the CLI.
             arch=${TARGET%%-*}; [ "$arch" = aarch64 ] && arch=arm64
-            xcrun swiftc -O -target "$arch-apple-macos11" -o "stage/$name/nepomuk-touchid" macos/touchid/main.swift
+            xcrun swiftc -O -target "$arch-apple-macos11" -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker macos/touchid/Info.plist -o "stage/$name/nepomuk-touchid" macos/touchid/main.swift
           fi
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           if tar --version 2>/dev/null | grep -q GNU; then
