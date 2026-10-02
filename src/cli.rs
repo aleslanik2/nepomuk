@@ -190,6 +190,8 @@ pub enum Cmd {
     /// Master management
     #[command(subcommand)]
     Master(MasterCmd),
+    /// Check the installation, the identity configuration and the vault
+    Doctor,
     /// Forget identities kept unlocked by the Touch ID agent
     Lock,
     /// Install the latest release (verified with the release key)
@@ -518,7 +520,8 @@ pub fn main() -> i32 {
     }
     let quiet = matches!(
         cli.cmd,
-        Cmd::Upgrade { .. }
+        Cmd::Doctor
+            | Cmd::Upgrade { .. }
             | Cmd::Agent { .. }
             | Cmd::GitTextconv { .. }
             | Cmd::GitMerge { .. }
@@ -921,6 +924,18 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
                 ctx.warn(format!("every client and CI must now pin the new master: `nepomuk trust {fp}` / NEPOMUK_ROOT_FP"));
             }
             Ok(Out::data(d))
+        }
+        Cmd::Doctor => {
+            let checks = crate::doctor::run(ctx);
+            let problems = checks
+                .iter()
+                .filter(|c| c.level == crate::doctor::Level::Fail)
+                .count();
+            Ok(Out {
+                data: crate::doctor::to_json(&checks),
+                human: Some(crate::doctor::to_text(&checks)),
+                exit: if problems > 0 { 1 } else { 0 },
+            })
         }
         Cmd::Upgrade {
             check,

@@ -5,6 +5,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod crypto;
+pub mod doctor;
 pub mod error;
 pub mod exec;
 pub mod format;
