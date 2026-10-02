@@ -830,3 +830,149 @@ fn git_textconv_shows_public_metadata_only() {
     let r = e.cmd(&["git-merge", "a", "b", "c"], &[], None);
     assert_eq!(r.code, 1);
 }
+
+#[test]
+fn doctor_reports_identity_and_vault() {
+    let e = Env::new("doctor");
+    let id = e.master_identity();
+    let d = e
+        .cmd(&["--identity", id.to_str().unwrap(), "doctor"], &[], None)
+        .data();
+    let checks = d["checks"].as_array().unwrap();
+    let find = |area: &str, text: &str| {
+        checks
+            .iter()
+            .any(|c| c["area"] == area && c["message"].as_str().unwrap().contains(text))
+    };
+    assert!(find("identity", "--identity"), "{d}");
+    assert!(
+        find("identity", "the master identity is on this computer"),
+        "{d}"
+    );
+    assert!(find("vault", "verifies"), "{d}");
+    assert!(find("vault", "the vault's master"), "{d}");
+    assert_eq!(d["problems"], 0);
+
+    // A broken configuration is a problem, with exit code 1.
+    std::fs::write(
+        e.path("cfg/config.toml"),
+        "identity = \"/nonexistent/id.npk\"\n",
+    )
+    .unwrap();
+    let r = e.cmd(&["doctor"], &[], None);
+    assert_eq!(r.code, 1);
+    let j = r.json();
+    assert!(
+        j["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["level"] == "problem"
+                && c["message"].as_str().unwrap().contains("does not exist")),
+        "{j}"
+    );
+}
+
+/// PKCS12 keystores may protect the key with a password different from the store password
+/// (keytool cannot check that; the template must not reject it).
+#[test]
+fn android_signing_pkcs12_with_a_separate_key_password() {
+    let java = std::process::Command::new("java").arg("-version").output();
+    if java.is_err()
+        || std::process::Command::new("keytool")
+            .arg("-help")
+            .output()
+            .is_err()
+    {
+        eprintln!("java/keytool not available, skipping");
+        return;
+    }
+    let e = Env::new("p12keypass");
+    let jks = e.path("tmp.jks");
+    let st = std::process::Command::new("keytool")
+        .args([
+            "-genkeypair",
+            "-storetype",
+            "JKS",
+            "-keystore",
+            jks.to_str().unwrap(),
+            "-storepass",
+            "jks-store-pass",
+            "-keypass",
+            "jks-key-pass",
+            "-alias",
+            "upload",
+            "-keyalg",
+            "EC",
+            "-groupname",
+            "secp256r1",
+            "-validity",
+            "400",
+            "-dname",
+            "CN=Test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    std::fs::write(e.path("ToPkcs12.java"), r#"
+import java.io.*; import java.security.*; import java.security.cert.Certificate;
+public class ToPkcs12 { public static void main(String[] a) throws Exception {
+  KeyStore jks = KeyStore.getInstance("JKS");
+  try (InputStream in = new FileInputStream(a[0])) { jks.load(in, "jks-store-pass".toCharArray()); }
+  Key k = jks.getKey("upload", "jks-key-pass".toCharArray());
+  Certificate[] chain = jks.getCertificateChain("upload");
+  KeyStore p12 = KeyStore.getInstance("PKCS12"); p12.load(null, null);
+  p12.setKeyEntry("upload", k, "key-pass-BBB".toCharArray(), chain);
+  try (OutputStream out = new FileOutputStream(a[1])) { p12.store(out, "store-pass-AAA".toCharArray()); }
+}}
+"#).unwrap();
+    let st = std::process::Command::new("java")
+        .current_dir(e.dir.path())
+        .args(["ToPkcs12.java", "tmp.jks", "release.p12"])
+        .output()
+        .unwrap();
+    if !st.status.success() {
+        eprintln!(
+            "cannot run single-file Java programs (no JDK), skipping: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        return;
+    }
+    e.m(&["mkdir", "/s"]).ok();
+    let put = |name: &str, input: &[u8]| {
+        e.m_in(
+            &[
+                "put",
+                &format!("/s/{name}"),
+                "--template",
+                "android-signing",
+                "--field",
+                "keystore=@release.p12",
+                "--field",
+                "key_alias=upload",
+                "--field-prompt",
+                "store_password",
+                "--field-prompt",
+                "key_password",
+            ],
+            input,
+        )
+    };
+    put("ok", b"store-pass-AAA\nkey-pass-BBB\n").ok();
+    assert_eq!(
+        put("wrong-key", b"store-pass-AAA\nkey-pass-XXX\n").err_code(),
+        "TEMPLATE_VALIDATION"
+    );
+    assert_eq!(
+        put("wrong-store", b"store-pass-XXX\nkey-pass-BBB\n").err_code(),
+        "TEMPLATE_VALIDATION"
+    );
+    assert_eq!(
+        e.m(&["get", "/s/ok#key_password"]).data()["value"],
+        "key-pass-BBB"
+    );
+}

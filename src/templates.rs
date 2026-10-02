@@ -174,7 +174,45 @@ fn keytool_check(
             return Err(invalid(format!("keystore validation failed: {reason}")));
         }
         let not_after = parse_until(&out);
+        let mut warnings = Vec::new();
         if let Some((alias, kp)) = key {
+            let kstype = out
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("Keystore type:"))
+                .map(|t| t.trim().to_uppercase())
+                .unwrap_or_else(|| storetype.unwrap_or("PKCS12").to_uppercase());
+            // Like Gradle: KeyStore.getKey(alias, keyPassword). keytool cannot do this for PKCS12
+            // with a key password different from the store password (it ignores -keypass).
+            match java_key_check(&dir, &ks, &kstype, alias, store_password, kp) {
+                Some(JavaCheck::Ok) => {
+                    return Ok(Validation {
+                        not_after,
+                        warnings,
+                    });
+                }
+                Some(JavaCheck::WrongKeyPassword) => {
+                    return Err(invalid("keystore validation failed: wrong key password"));
+                }
+                Some(JavaCheck::NoKey) => {
+                    return Err(invalid(format!(
+                        "keystore validation failed: alias {alias} has no private key"
+                    )));
+                }
+                None if kstype != "JKS" && kstype != "JCEKS" => {
+                    // keytool alone can verify the key password of a PKCS12 keystore only when it
+                    // equals the store password.
+                    if !certreq(&dir, &ks, alias, store_password, store_password)? {
+                        warnings.push(
+                            "the key password could not be verified: it differs from the store password and this needs Java 11+ (a JDK) to check; it is stored as entered".into(),
+                        );
+                    }
+                    return Ok(Validation {
+                        not_after,
+                        warnings,
+                    });
+                }
+                None => {}
+            }
             let csr = dir.join("csr");
             let csr_s = csr.to_string_lossy().to_string();
             let args = [
@@ -200,11 +238,100 @@ fn keytool_check(
         }
         Ok(Validation {
             not_after,
-            warnings: vec![],
+            warnings,
         })
     })();
     crate::exec::remove_dir(&dir);
     result
+}
+
+/// `keytool -certreq` needs the private key; true when it could be opened.
+fn certreq(
+    dir: &std::path::Path,
+    ks: &str,
+    alias: &str,
+    store_password: &str,
+    key_password: &str,
+) -> Result<bool> {
+    let csr = dir.join("csr-check");
+    let csr_s = csr.to_string_lossy().to_string();
+    let args = [
+        "-certreq",
+        "-keystore",
+        ks,
+        "-storepass:env",
+        "NPK_STOREPASS",
+        "-alias",
+        alias,
+        "-keypass:env",
+        "NPK_KEYPASS",
+        "-file",
+        &csr_s,
+    ];
+    let (ok, _) = keytool(
+        &args,
+        &[
+            ("NPK_STOREPASS", store_password),
+            ("NPK_KEYPASS", key_password),
+        ],
+    )?;
+    Ok(ok)
+}
+
+enum JavaCheck {
+    Ok,
+    WrongKeyPassword,
+    NoKey,
+}
+
+const JAVA_KEY_CHECK: &str = r#"
+import java.io.FileInputStream;
+import java.security.KeyStore;
+import java.security.UnrecoverableKeyException;
+
+public class KeyCheck {
+    public static void main(String[] a) throws Exception {
+        KeyStore ks = KeyStore.getInstance(a[1]);
+        try (FileInputStream in = new FileInputStream(a[0])) {
+            ks.load(in, System.getenv("NPK_STOREPASS").toCharArray());
+        }
+        try {
+            if (ks.getKey(a[2], System.getenv("NPK_KEYPASS").toCharArray()) == null) System.exit(3);
+        } catch (UnrecoverableKeyException e) {
+            System.exit(2);
+        }
+        System.exit(0);
+    }
+}
+"#;
+
+/// Opens the key the way Android builds do; None when Java 11+ cannot run the check.
+fn java_key_check(
+    dir: &std::path::Path,
+    ks: &str,
+    kstype: &str,
+    alias: &str,
+    sp: &str,
+    kp: &str,
+) -> Option<JavaCheck> {
+    let src = dir.join("KeyCheck.java");
+    std::fs::write(&src, JAVA_KEY_CHECK).ok()?;
+    let out = Command::new("java")
+        .arg(&src)
+        .args([ks, kstype, alias])
+        .env("NPK_STOREPASS", sp)
+        .env("NPK_KEYPASS", kp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    match out.code() {
+        Some(0) => Some(JavaCheck::Ok),
+        Some(2) => Some(JavaCheck::WrongKeyPassword),
+        Some(3) => Some(JavaCheck::NoKey),
+        _ => None,
+    }
 }
 
 /// Earliest "until:" date of the certificates in `keytool -list -v` output.
