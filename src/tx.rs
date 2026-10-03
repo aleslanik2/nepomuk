@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::crypto::{self, KemSecret, Key32};
 use crate::error::{Code, Error, Result};
 use crate::format::{CheckpointBody, CommitBody, Envelope, RawEntry, VaultFile, to_cbor};
-use crate::identity::{Request, Unlocked};
+use crate::identity::{Keys, Request, Unlocked};
 use crate::keyring::{self, Access};
 use crate::memory::LockedSeed;
 use crate::model::*;
@@ -175,7 +175,7 @@ pub struct Tx<'a> {
     pub base: &'a Verified,
     pub state: State,
     pub me: Id,
-    pub id: &'a Unlocked,
+    pub id: &'a dyn Keys,
     pub ops: Vec<Op>,
     access: Option<Access>,
     pub warnings: Vec<String>,
@@ -184,7 +184,7 @@ pub struct Tx<'a> {
 }
 
 /// Finds the vault user matching an unlocked identity.
-pub fn find_me(state: &State, id: &Unlocked) -> Result<Id> {
+pub fn find_me(state: &State, id: &dyn Keys) -> Result<Id> {
     let u = state
         .users
         .values()
@@ -205,7 +205,7 @@ pub fn find_me(state: &State, id: &Unlocked) -> Result<Id> {
 }
 
 impl<'a> Tx<'a> {
-    pub fn new(base: &'a Verified, id: &'a Unlocked) -> Result<Tx<'a>> {
+    pub fn new(base: &'a Verified, id: &'a dyn Keys) -> Result<Tx<'a>> {
         let me = find_me(&base.state, id)?;
         Ok(Tx {
             base,
@@ -253,7 +253,7 @@ impl<'a> Tx<'a> {
             time: now(),
             ops: self.ops,
         });
-        let sig = self.id.sig.sign("commit", &body);
+        let sig = self.id.sign("commit", &body)?;
         let mut file = self.base.file.clone();
         file.entries
             .push(RawEntry::from_envelope(Envelope { body, sig }));

@@ -4,12 +4,72 @@
 //! The agent listens on a Unix socket in the user's private state directory (`0700`, socket
 //! `0600`) and serves only peers with the same UID. It forgets everything when the timeout
 //! expires, when the screen locks, on `nepomuk lock`, and exits once it holds nothing.
-//! Trade-off: within the timeout, any program running as this user can use the identity.
+//!
+//! Limits on what a cached identity can be used for:
+//! - **The seed never leaves the agent.** Clients get the public keys and ask the agent to unwrap
+//!   keys wrapped for the identity (grants, group keys, pending changes of that vault); like
+//!   `ssh-agent`, it never hands out the private key, so a program that reaches it can use the
+//!   identity only while it is cached, not keep it.
+//! - **It never signs.** Every change to the vault needs a fresh unlock; the cache only reads.
+//! - **One terminal.** An identity is cached for the terminal session of the program that
+//!   unlocked it (terminal device, session and the session leader's start time, taken from the
+//!   kernel, not from the client) and is served only to programs in that same session. Other
+//!   terminal windows, and programs without a terminal (editors, daemons, cron), get nothing.
+//!
+//! Remaining trade-off: within the timeout, any program in that terminal session – including
+//! background jobs started from it – can read what the identity can read.
 
-use crate::identity::Unlocked;
+use crate::crypto::{KemPublic, SigPublic, Wrapped};
+use crate::error::{Code, Error, Result};
+use crate::identity::{Keys, Unlocked};
 use crate::model::{Id, IdentityKind};
 
 pub const DEFAULT_TIMEOUT: u64 = 600;
+
+/// Whether this process has a controlling terminal (the agent caches only for those).
+pub fn has_terminal() -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::File::open("/dev/tty").is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// An identity served by the agent: public keys only; unwrapping happens inside the agent.
+pub struct AgentKeys {
+    pub vault: Id,
+    pub name: String,
+    pub kind: IdentityKind,
+    pub kem: KemPublic,
+    pub sig: SigPublic,
+}
+
+impl Keys for AgentKeys {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> IdentityKind {
+        self.kind
+    }
+    fn kem_public(&self) -> &KemPublic {
+        &self.kem
+    }
+    fn sig_public(&self) -> &SigPublic {
+        &self.sig
+    }
+    fn unwrap(&self, w: &Wrapped, aad: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        unwrap_remote(self.vault, w, aad)
+    }
+    fn sign(&self, _label: &str, _data: &[u8]) -> Result<Vec<u8>> {
+        Err(Error::new(
+            Code::PasswordRequired,
+            "changing the vault needs a fresh unlock",
+        ))
+    }
+}
 
 #[cfg(unix)]
 pub use imp::*;
@@ -17,10 +77,16 @@ pub use imp::*;
 #[cfg(not(unix))]
 mod fallback {
     use super::*;
-    use crate::error::Result;
 
-    pub fn get(_vault: Id) -> Option<Unlocked> {
+    pub fn keys(_vault: Id) -> Option<AgentKeys> {
         None
+    }
+    pub(super) fn unwrap_remote(
+        _vault: Id,
+        _w: &Wrapped,
+        _aad: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        Err(Error::decrypt())
     }
     pub fn put(_vault: Id, _id: &Unlocked, _ttl: u64) -> Result<()> {
         Ok(())
@@ -54,7 +120,6 @@ mod imp {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::error::{Error, Result};
     use crate::memory::LockedSeed;
 
     /// A private directory of this user, short enough for a socket path (about 100 bytes):
@@ -99,26 +164,54 @@ mod imp {
         serde_json::from_str(&resp).ok()
     }
 
-    /// The identity cached for this vault, if any.
-    pub fn get(vault: Id) -> Option<Unlocked> {
-        let r = request(&json!({ "op": "get", "vault": vault.hex() }))?;
+    /// The identity cached for this vault in this terminal, if any (public keys only).
+    pub fn keys(vault: Id) -> Option<AgentKeys> {
+        let r = request(&json!({ "op": "info", "vault": vault.hex() }))?;
         if r["ok"] != true {
             return None;
         }
-        let seed = Zeroizing::new(b64().decode(r["seed"].as_str()?).ok()?);
+        let (kem, sig): (KemPublic, SigPublic) =
+            crate::format::from_cbor(&b64().decode(r["public"].as_str()?).ok()?).ok()?;
         let kind = if r["kind"] == "password" {
             IdentityKind::Password
         } else {
             IdentityKind::Local
         };
-        Some(Unlocked::from_seed(
-            LockedSeed::from_slice(&seed).ok()?,
-            r["name"].as_str()?,
+        Some(AgentKeys {
+            vault,
+            name: r["name"].as_str()?.to_string(),
             kind,
-        ))
+            kem,
+            sig,
+        })
     }
 
-    /// Caches an identity for `ttl` seconds, starting the agent when needed.
+    /// Asks the agent to unwrap a key wrapped for the cached identity of `vault`.
+    pub(super) fn unwrap_remote(vault: Id, w: &Wrapped, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let msg = json!({
+            "op": "unwrap",
+            "vault": vault.hex(),
+            "wrapped": b64().encode(crate::format::to_cbor(w)),
+            "aad": b64().encode(aad),
+        });
+        let r = request(&msg).ok_or_else(|| {
+            Error::new(
+                Code::PasswordRequired,
+                "the nepomuk agent no longer holds the identity; run the command again",
+            )
+        })?;
+        if r["ok"] != true {
+            return Err(Error::decrypt());
+        }
+        let plain = r["plain"].as_str().ok_or_else(Error::decrypt)?;
+        b64()
+            .decode(plain)
+            .map(Zeroizing::new)
+            .map_err(|_| Error::decrypt())
+    }
+
+    /// Caches an identity for `ttl` seconds for the caller's terminal, starting the agent when
+    /// needed. Fails when the caller has no terminal.
     pub fn put(vault: Id, id: &Unlocked, ttl: u64) -> Result<()> {
         if request(&json!({ "op": "ping" })).is_none() {
             start()?;
@@ -132,13 +225,15 @@ mod imp {
         let msg = json!({ "op": "put", "vault": vault.hex(), "name": id.name, "kind": kind, "seed": seed.as_str(), "ttl": ttl });
         match request(&msg) {
             Some(r) if r["ok"] == true => Ok(()),
+            Some(r) if r["error"] == "no-terminal" => Err(Error::general(
+                "it is remembered only for programs in a terminal",
+            )),
             _ => Err(Error::general(
                 "the nepomuk agent did not accept the identity",
             )),
         }
     }
 
-    /// Forgets one vault, or everything.
     pub fn forget(vault: Option<Id>) -> bool {
         let msg = match vault {
             Some(v) => json!({ "op": "forget", "vault": v.hex() }),
@@ -176,11 +271,13 @@ mod imp {
     struct Entry {
         name: String,
         kind: String,
-        seed: LockedSeed,
+        kem: crate::crypto::KemSecret,
+        public: String,
         expires: Instant,
     }
 
-    type Store = Arc<Mutex<HashMap<String, Entry>>>;
+    /// Entries by vault and terminal session.
+    type Store = Arc<Mutex<HashMap<(String, String), Entry>>>;
 
     fn peer_is_me(s: &UnixStream) -> bool {
         use std::os::unix::io::AsRawFd;
@@ -222,10 +319,142 @@ mod imp {
         }
     }
 
+    /// The terminal session of the peer, from the kernel: `<tty device>:<session id>:<start time
+    /// of the session leader>`. The start time keeps a recycled session id from matching. None
+    /// for a peer without a controlling terminal, or when it cannot be determined reliably.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn peer_terminal(s: &UnixStream) -> Option<String> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // A pidfd pins the peer process: if it exits while we look it up, its pid could be
+        // reused by another process, and the pidfd then reports it as gone.
+        let mut raw: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ok = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                &mut raw as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        } == 0;
+        if !ok || raw < 0 {
+            return None; // older kernel: no caching rather than a racy lookup
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let pid = pidfd_pid(&pidfd)?;
+        let (sid, tty, _) = proc_stat(pid)?;
+        if tty == 0 || sid <= 0 {
+            return None;
+        }
+        let (_, _, leader_start) = proc_stat(sid)?;
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let exited = unsafe { libc::poll(&mut pfd, 1, 0) } != 0;
+        if exited {
+            return None;
+        }
+        Some(format!("{tty}:{sid}:{leader_start}"))
+    }
+
+    /// The pid a pidfd refers to (`Pid:` in `/proc/self/fdinfo`).
+    #[cfg(target_os = "linux")]
+    fn pidfd_pid(fd: &std::os::fd::OwnedFd) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+        info.lines()
+            .find_map(|l| l.strip_prefix("Pid:"))
+            .and_then(|p| p.trim().parse().ok())
+            .filter(|p: &i32| *p > 0)
+    }
+
+    /// Session id, controlling tty and start time of a process (`/proc/<pid>/stat`).
+    #[cfg(target_os = "linux")]
+    fn proc_stat(pid: i32) -> Option<(i32, i64, u64)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name may contain spaces and parentheses: fields follow the last ')'.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        // f[0] is field 3 (state): session = field 6, tty_nr = 7, starttime = 22.
+        let sid = f.get(3)?.parse().ok()?;
+        let tty = f.get(4)?.parse().ok()?;
+        let start = f.get(19)?.parse().ok()?;
+        Some((sid, tty, start))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn peer_terminal(s: &UnixStream) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let ok = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        } == 0;
+        if !ok || pid <= 0 {
+            return None;
+        }
+        let before = bsd_info(pid)?;
+        // NODEV: no controlling terminal.
+        if before.e_tdev == u32::MAX || before.e_tdev == 0 {
+            return None;
+        }
+        let sid = unsafe { libc::getsid(pid) };
+        if sid <= 0 {
+            return None;
+        }
+        let leader = bsd_info(sid)?;
+        // The peer must still be the same process (not a recycled pid).
+        let after = bsd_info(pid)?;
+        if (after.pbi_start_tvsec, after.pbi_start_tvusec, after.e_tdev)
+            != (
+                before.pbi_start_tvsec,
+                before.pbi_start_tvusec,
+                before.e_tdev,
+            )
+        {
+            return None;
+        }
+        Some(format!(
+            "{}:{sid}:{}.{}",
+            before.e_tdev, leader.pbi_start_tvsec, leader.pbi_start_tvusec
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size).then_some(info)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn peer_terminal(_s: &UnixStream) -> Option<String> {
+        None
+    }
+
     fn handle(store: &Store, s: UnixStream) {
         if !peer_is_me(&s) {
             return;
         }
+        let terminal = peer_terminal(&s);
         let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
         let mut reader = BufReader::new(&s);
         let mut line = Zeroizing::new(String::new());
@@ -238,35 +467,68 @@ mod imp {
         let mut st = store.lock().unwrap();
         let now = Instant::now();
         st.retain(|_, e| e.expires > now);
+        let key = |msg: &Value| -> Option<(String, String)> {
+            Some((msg["vault"].as_str()?.to_string(), terminal.clone()?))
+        };
         let reply = match msg["op"].as_str() {
             Some("ping") => json!({ "ok": true }),
-            Some("get") => match msg["vault"].as_str().and_then(|v| st.get(v)) {
+            Some("info") => match key(&msg).and_then(|k| st.get(&k)) {
                 Some(e) => {
-                    json!({ "ok": true, "name": e.name, "kind": e.kind, "seed": b64().encode(e.seed.as_ref()) })
+                    json!({ "ok": true, "name": e.name, "kind": e.kind, "public": e.public })
                 }
                 None => json!({ "ok": false }),
             },
+            Some("unwrap") => {
+                let vault = msg["vault"].as_str().and_then(Id::parse);
+                let plain = key(&msg).and_then(|k| st.get(&k)).and_then(|e| {
+                    let vault = vault?;
+                    let aad = b64().decode(msg["aad"].as_str()?).ok()?;
+                    // Only keys of the vault the identity was cached for.
+                    if !aad.starts_with(&vault.0) {
+                        return None;
+                    }
+                    let w: Wrapped =
+                        crate::format::from_cbor(&b64().decode(msg["wrapped"].as_str()?).ok()?)
+                            .ok()?;
+                    crate::crypto::unwrap(&e.kem, &w, &aad).ok()
+                });
+                match plain {
+                    Some(p) => json!({ "ok": true, "plain": b64().encode(p.as_slice()) }),
+                    None => json!({ "ok": false }),
+                }
+            }
             Some("put") => {
                 let seed = msg["seed"]
                     .as_str()
                     .and_then(|s| b64().decode(s).ok())
                     .map(Zeroizing::new);
                 match (
+                    terminal.as_ref(),
                     msg["vault"].as_str(),
                     msg["name"].as_str(),
                     seed.and_then(|s| LockedSeed::from_slice(&s).ok()),
                 ) {
-                    (Some(v), Some(name), Some(seed)) => {
+                    (None, ..) => json!({ "ok": false, "error": "no-terminal" }),
+                    (Some(t), Some(v), Some(name), Some(seed)) => {
                         let ttl = msg["ttl"]
                             .as_u64()
                             .unwrap_or(DEFAULT_TIMEOUT)
                             .min(24 * 3600);
+                        // Keep only what unwrapping needs: the KEM key pair, not the seed
+                        // (which also derives the signing key).
+                        let kem = crate::crypto::KemSecret::from_seed(seed.as_ref(), "identity");
+                        let sig = crate::crypto::SigSecret::from_seed(seed.as_ref(), "identity");
+                        let public =
+                            b64().encode(crate::format::to_cbor(&(kem.public(), sig.public())));
+                        drop(sig);
+                        drop(seed);
                         st.insert(
-                            v.to_string(),
+                            (v.to_string(), t.clone()),
                             Entry {
                                 name: name.to_string(),
                                 kind: msg["kind"].as_str().unwrap_or("local").to_string(),
-                                seed,
+                                kem,
+                                public,
                                 expires: now + Duration::from_secs(ttl),
                             },
                         );
@@ -276,19 +538,23 @@ mod imp {
                 }
             }
             Some("forget") => {
+                // Forgetting only takes access away, so it works from any program.
                 match msg["vault"].as_str() {
-                    Some(v) => {
-                        st.remove(v);
-                    }
+                    Some(v) => st.retain(|(vault, _), _| vault != v),
                     None => st.clear(),
                 }
                 json!({ "ok": true })
             }
             Some("status") => json!({
                 "ok": true,
-                "vaults": st.iter().map(|(v, e)| json!({
-                    "vault": v, "identity": e.name, "expires_in": e.expires.saturating_duration_since(now).as_secs(),
-                })).collect::<Vec<_>>(),
+                "terminal": terminal.is_some(),
+                "vaults": st.iter()
+                    .filter(|((_, t), _)| Some(t) == terminal.as_ref())
+                    .map(|((v, _), e)| json!({
+                        "vault": v, "identity": e.name, "expires_in": e.expires.saturating_duration_since(now).as_secs(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "cached_elsewhere": st.keys().filter(|(_, t)| Some(t) != terminal.as_ref()).count(),
             }),
             _ => json!({ "ok": false }),
         };
@@ -338,8 +604,11 @@ mod imp {
             }
         });
 
+        // One thread per connection: a client that connects and stays silent must not stall
+        // the others.
         for s in listener.incoming().flatten() {
-            handle(&store, s);
+            let store = store.clone();
+            std::thread::spawn(move || handle(&store, s));
         }
         0
     }
