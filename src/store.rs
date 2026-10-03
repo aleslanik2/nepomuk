@@ -52,11 +52,39 @@ impl From<Error> for SaveError {
     }
 }
 
+/// Every git invocation goes through here. The vault path comes from `.nepomuk.toml`, i.e. from
+/// whoever controls the project repository, so git must never pick up a repository (and its
+/// `config`) that arrived as files in a clone:
+/// - `safe.bareRepository=explicit` stops git from discovering a bare repository committed into
+///   the project (git ≥ 2.38; older versions ignore it, [`Location::detect`] checks again);
+/// - `core.fsmonitor` and the `ext::` transport would run commands from that config.
 fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
+    c.args([
+        "-c",
+        "safe.bareRepository=explicit",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.ext.allow=never",
+    ]);
     c.arg("-C").arg(dir);
     c.env("GIT_TERMINAL_PROMPT", "0");
     c
+}
+
+/// A work tree whose top level has no `.git` is not one a user created with `git init` or
+/// `git clone`: it comes from a bare repository carried inside another repository (with
+/// `core.worktree` pointing at its parent). Its config is attacker-controlled; never run git
+/// commands that read it.
+fn check_top(top: &Path) -> Result<()> {
+    if top.join(".git").exists() {
+        return Ok(());
+    }
+    Err(Error::git(format!(
+        "refusing to use the git repository at {}: it has no .git (an embedded repository from a clone?)",
+        top.display()
+    )))
 }
 
 fn run(mut c: Command) -> Result<String> {
@@ -118,9 +146,17 @@ impl Location {
         c.args(["rev-parse", "--show-toplevel"]);
         let top = match run(c) {
             Ok(t) if !t.is_empty() => PathBuf::from(t),
+            Err(e) if e.message.contains("safe.bareRepository") => {
+                return Err(Error::git(format!(
+                    "refusing to use the bare git repository around {}: {}",
+                    dir.display(),
+                    e.message
+                )));
+            }
             _ => return Ok(Location { path, git: None }),
         };
         let top = top.canonicalize().unwrap_or(top);
+        check_top(&top)?;
         let canon_dir = dir.canonicalize().unwrap_or(dir);
         let rel_dir = canon_dir
             .strip_prefix(&top)

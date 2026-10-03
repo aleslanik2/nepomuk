@@ -136,7 +136,14 @@ pub enum Cmd {
     /// Rename or move a folder or secret
     Mv { src: String, dst: String },
     /// Remove a folder (recursively) or secret
-    Rm { path: String },
+    Rm {
+        #[arg(required_unless_present = "node", conflicts_with = "node")]
+        path: Option<String>,
+        /// Remove by node id instead of path (e.g. a node that cannot be decrypted, as named
+        /// in a warning of `rekey`, `revoke` or `user offboard`)
+        #[arg(long, value_name = "ID")]
+        node: Option<String>,
+    },
     /// Replace the keys of a subtree (admin on the parent)
     Rekey { path: String },
     /// Secrets pending rotation at the source
@@ -892,12 +899,16 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
                 dst: ctx.path(&dst),
             },
         ),
-        Cmd::Rm { path } => intent(
-            ctx,
-            Intent::Rm {
-                path: ctx.path(&path),
-            },
-        ),
+        Cmd::Rm { path, node } => match (path, node) {
+            (_, Some(node)) => intent(ctx, Intent::RmNode { node }),
+            (Some(path), None) => intent(
+                ctx,
+                Intent::Rm {
+                    path: ctx.path(&path),
+                },
+            ),
+            (None, None) => Err(Error::usage("rm needs a path or --node")),
+        },
         Cmd::Rekey { path } => intent(
             ctx,
             Intent::Rekey {

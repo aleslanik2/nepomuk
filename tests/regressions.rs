@@ -719,3 +719,206 @@ fn unreadable_granted_node_does_not_block_mv() {
     assert!(!t.tasks.is_empty());
     t.commit().unwrap();
 }
+
+/// A vault where Eve has `write` on /team and her own client has added a node nobody can open
+/// with the folder's key (`junk`), plus a real secret of Alice's next to it.
+fn vault_with_junk() -> (Unlocked, Unlocked, Verified, Id) {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let eve = Unlocked::generate("eve", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&eve, None)).unwrap();
+    t.mkdir("/team/sub", true).unwrap();
+    t.put("/team/sub/key", Content::Text { value: "k".into() }, None)
+        .unwrap();
+    let e = t.user_named("eve").unwrap();
+    t.grant(Principal::User(e), Right::Write, "/team").unwrap();
+    let (mut file, v, _, _) = t.commit().unwrap();
+
+    // Eve's client: a child of /team whose key is wrapped under a key only she knows.
+    let acc = Access::build(&v.state, e, &eve);
+    let team = acc.resolve("/team").unwrap();
+    let (vid, junk) = (v.state.vault_id, Id::random());
+    let (own, nk) = (crypto::random_key(), crypto::random_key());
+    let name = keyring::seal_name(vid, junk, &nk, "junk");
+    let node = Node {
+        id: junk,
+        parent: Some(team),
+        wrapped_key: Some(keyring::seal_node_key(vid, junk, &own, &nk)),
+        name: name.sealed,
+        name_commit: name.commit,
+        content: keyring::seal_content(
+            vid,
+            junk,
+            &nk,
+            &NodeContent {
+                content: Content::Folder,
+                meta: Meta {
+                    created: 0,
+                    updated: 0,
+                    not_after: None,
+                },
+            },
+        ),
+    };
+    let seq = v.seq + 1;
+    sign_commit(&mut file, &eve, e, seq, vec![Op::CreateNode { node }]);
+    // Every client accepts it: Eve may write there, and nobody can check what she sealed.
+    let v = verify_file(file, &master.fingerprint()).unwrap();
+    (master, eve, v, junk)
+}
+
+/// Audit finding 2: a node the admin cannot read must not block rekey or offboarding.
+#[test]
+fn unreadable_node_does_not_block_offboarding() {
+    let (master, _eve, v, junk) = vault_with_junk();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let e = t.user_named("eve").unwrap();
+    t.offboard(e).unwrap();
+    assert!(
+        t.warnings.iter().any(|w| w.contains(&junk.hex())),
+        "{:?}",
+        t.warnings
+    );
+    assert!(t.tasks.is_empty(), "{:?}", t.tasks);
+    let (file, v2, _, _) = t.commit().unwrap();
+    verify_file(file, &master.fingerprint()).unwrap();
+    assert!(!v2.state.nodes.contains_key(&junk));
+    assert!(!v2.state.active(e));
+    let acc = Access::build(&v2.state, v2.state.master, &master);
+    assert_eq!(text(&acc, &v2, "/team/sub/key"), "k");
+}
+
+#[test]
+fn unreadable_node_does_not_block_rekey_of_ancestors() {
+    let (master, _eve, v, junk) = vault_with_junk();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let root = t.state.root;
+    t.rekey(root).unwrap();
+    let (_, v2, _, _) = t.commit().unwrap();
+    assert!(!v2.state.nodes.contains_key(&junk));
+    let acc = Access::build(&v2.state, v2.state.master, &master);
+    assert_eq!(text(&acc, &v2, "/team/sub/key"), "k");
+}
+
+/// A readable folder whose content Eve replaced with garbage: rekey keeps it (and the secret
+/// below it) instead of failing or deleting someone else's data.
+#[test]
+fn folder_with_garbled_content_is_resealed_by_rekey() {
+    let (master, eve, v, _) = vault_with_junk();
+    let e = v.state.user_by_name("eve").unwrap().id;
+    let acc = Access::build(&v.state, e, &eve);
+    let sub = acc.resolve("/team/sub").unwrap();
+    let mut file = v.file.clone();
+    let garbage = keyring::seal_content(
+        v.state.vault_id,
+        sub,
+        &crypto::random_key(),
+        &NodeContent {
+            content: Content::Folder,
+            meta: Meta {
+                created: 0,
+                updated: 0,
+                not_after: None,
+            },
+        },
+    );
+    sign_commit(
+        &mut file,
+        &eve,
+        e,
+        v.seq + 1,
+        vec![Op::UpdateNode {
+            id: sub,
+            content: garbage,
+        }],
+    );
+    let v = verify_file(file, &master.fingerprint()).unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let team = t.resolve("/team").unwrap();
+    t.rekey(team).unwrap();
+    let (_, v2, _, _) = t.commit().unwrap();
+    let acc = Access::build(&v2.state, v2.state.master, &master);
+    assert_eq!(text(&acc, &v2, "/team/sub/key"), "k");
+    let sub = acc.resolve("/team/sub").unwrap();
+    assert!(matches!(
+        acc.content(&v2.state, sub).unwrap().content,
+        Content::Folder
+    ));
+}
+
+#[test]
+fn unreadable_node_can_be_removed_by_id() {
+    let (master, _eve, v, junk) = vault_with_junk();
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rm_node(junk).unwrap();
+    let (_, v2, _, _) = t.commit().unwrap();
+    assert!(!v2.state.nodes.contains_key(&junk));
+}
+
+/// Audit finding 1: a bare repository committed into a project, with a config that runs
+/// commands, must never be used by git on nepomuk's behalf.
+#[test]
+fn embedded_bare_repository_is_refused() {
+    use nepomuk::store::Location;
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!(
+        "nepomuk-embedded-{}-{}",
+        std::process::id(),
+        tx::now()
+    ));
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?}"
+        )
+    };
+    let proj = dir.join("proj");
+    let repo = proj.join("evil/repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&["init", "-q", proj.to_str().unwrap()]);
+    git(&["init", "-q", "--bare", repo.to_str().unwrap()]);
+    let pwned = dir.join("PWNED");
+    let cfg = |k: &str, v: &str| git(&["-C", repo.to_str().unwrap(), "config", k, v]);
+    cfg("core.bare", "false");
+    cfg("core.worktree", "..");
+    cfg("protocol.ext.allow", "always");
+    cfg(
+        "remote.origin.url",
+        &format!("ext::sh -c touch% {}", pwned.display()),
+    );
+    cfg(
+        "core.fsmonitor",
+        &format!("touch {}; false", pwned.display()),
+    );
+    let res = Location::detect(&repo.join("vault.npk"), None);
+    if let Ok(loc) = res {
+        let _ = loc.load(true);
+        panic!("embedded repository accepted: git = {:?}", loc.git);
+    }
+    assert!(
+        !pwned.exists(),
+        "git ran a command from the embedded config"
+    );
+
+    // A vault in an ordinary repository with a remote still uses git.
+    let ok = dir.join("ok");
+    git(&["init", "-q", ok.to_str().unwrap()]);
+    git(&[
+        "-C",
+        ok.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        "/nonexistent",
+    ]);
+    std::fs::create_dir_all(ok.join("sub")).unwrap();
+    let loc = Location::detect(&ok.join("sub/vault.npk"), None).unwrap();
+    assert!(loc.is_git());
+    let _ = std::fs::remove_dir_all(&dir);
+}

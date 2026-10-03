@@ -698,6 +698,10 @@ pub enum Intent {
     Rm {
         path: String,
     },
+    /// Removal by node id (for nodes whose name cannot be decrypted).
+    RmNode {
+        node: String,
+    },
     Mv {
         src: String,
         dst: String,
@@ -840,6 +844,7 @@ impl Intent {
         match self {
             Intent::Put { path, .. } | Intent::Rm { path } => tx.resolve(path).ok(),
             Intent::Mv { src, .. } => tx.resolve(src).ok(),
+            Intent::RmNode { node } => crate::model::Id::parse(node),
             _ => None,
         }
     }
@@ -875,6 +880,12 @@ impl Intent {
             Intent::Mkdir { path, parents } => {
                 tx.mkdir(path, *parents)?;
                 json!({ "path": tx::normalize_path(path)? })
+            }
+            Intent::RmNode { node } => {
+                let id = crate::model::Id::parse(node)
+                    .ok_or_else(|| Error::usage(format!("invalid node id: {node}")))?;
+                tx.rm_node(id)?;
+                json!({ "node": id.hex() })
             }
             Intent::Put {
                 path,
@@ -1201,6 +1212,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::Mkdir { path, .. } => format!("mkdir {path}"),
         Intent::Put { path, .. } => format!("put {path}"),
         Intent::Rm { path } => format!("rm {path}"),
+        Intent::RmNode { node } => format!("rm --node {node}"),
         Intent::Mv { src, dst } => format!("mv {src} {dst}"),
         Intent::Rekey { path } => format!("rekey {path}"),
         Intent::Grant { who, right, path } => format!("grant {who} {} {path}", right.as_str()),
