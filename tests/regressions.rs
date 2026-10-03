@@ -757,6 +757,7 @@ fn vault_with_junk() -> (Unlocked, Unlocked, Verified, Id) {
                     created: 0,
                     updated: 0,
                     not_after: None,
+                    description: None,
                 },
             },
         ),
@@ -820,6 +821,7 @@ fn folder_with_garbled_content_is_resealed_by_rekey() {
                 created: 0,
                 updated: 0,
                 not_after: None,
+                description: None,
             },
         },
     );

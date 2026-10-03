@@ -239,6 +239,7 @@ button.twisty:hover { color: var(--text); }
 .crumbs { font-family: var(--mono); font-size: var(--step--1); color: var(--muted); word-break: break-all; }
 .facts { display: flex; flex-wrap: wrap; gap: 0.4rem 1.25rem; font-size: var(--step--1); color: var(--muted); }
 .facts strong { color: var(--text); font-weight: 600; }
+.description { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 65ch; }
 .notice { border-radius: var(--radius-s); padding: 0.6rem 0.85rem; font-size: var(--step--1); }
 .notice.warn { background: var(--warn-soft); color: var(--warn); }
 .notice.seal { background: var(--seal-soft); color: var(--seal-deep); }

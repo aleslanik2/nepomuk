@@ -36,6 +36,9 @@ fn entry(state: &State, acc: &Access, id: Id) -> Value {
     });
     if let Some(c) = &c {
         e["updated"] = json!(iso(c.meta.updated));
+        if let Some(d) = &c.meta.description {
+            e["description"] = json!(d);
+        }
         match &c.content {
             Content::Record { template, fields } => {
                 e["template"] = json!(template);
@@ -136,6 +139,14 @@ pub fn ls(ctx: &Ctx, o: &Opened, path: Option<&str>, recursive: bool) -> Result<
     } else {
         "/".to_string()
     };
+    // The listed folder is not among the entries; its description goes next to its path.
+    let list_description = if single_root_folder {
+        acc.content(state, roots[0])
+            .ok()
+            .and_then(|c| c.meta.description.clone())
+    } else {
+        None
+    };
     let mut stack: Vec<Id> = if single_root_folder {
         sort(
             state
@@ -162,7 +173,11 @@ pub fn ls(ctx: &Ctx, o: &Opened, path: Option<&str>, recursive: bool) -> Result<
             stack.extend(kids);
         }
     }
-    Ok(json!({ "path": list_path, "entries": entries }))
+    let mut out = json!({ "path": list_path, "entries": entries });
+    if let Some(d) = list_description {
+        out["description"] = json!(d);
+    }
+    Ok(out)
 }
 
 pub fn missing(acc: &Access, path: &str) -> Error {

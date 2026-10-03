@@ -775,11 +775,21 @@ pub enum Intent {
     Mkdir {
         path: String,
         parents: bool,
+        #[serde(default)]
+        description: Option<String>,
     },
     Put {
         path: String,
         content: Content,
         not_after: Option<i64>,
+        /// `None` keeps the current description.
+        #[serde(default)]
+        description: Option<String>,
+    },
+    /// Sets (or with `None` clears) the description of a folder or secret.
+    Describe {
+        path: String,
+        description: Option<String>,
     },
     Rm {
         path: String,
@@ -938,7 +948,9 @@ impl Intent {
     /// The node this intent modifies, for conflict detection.
     fn target(&self, tx: &mut Tx) -> Option<crate::model::Id> {
         match self {
-            Intent::Put { path, .. } | Intent::Rm { path } => tx.resolve(path).ok(),
+            Intent::Put { path, .. } | Intent::Describe { path, .. } | Intent::Rm { path } => {
+                tx.resolve(path).ok()
+            }
             Intent::Mv { src, .. } => tx.resolve(src).ok(),
             Intent::RmNode { node } => crate::model::Id::parse(node),
             _ => None,
@@ -973,8 +985,12 @@ impl Intent {
                 }
                 json!({ "folders": folders, "secrets": secrets })
             }
-            Intent::Mkdir { path, parents } => {
-                tx.mkdir(path, *parents)?;
+            Intent::Mkdir {
+                path,
+                parents,
+                description,
+            } => {
+                tx.mkdir_with(path, *parents, description.as_deref())?;
                 json!({ "path": tx::normalize_path(path)? })
             }
             Intent::RmNode { node } => {
@@ -987,9 +1003,14 @@ impl Intent {
                 path,
                 content,
                 not_after,
+                description,
             } => {
-                tx.put(path, content.clone(), *not_after)?;
+                tx.put_with(path, content.clone(), *not_after, description.as_deref())?;
                 json!({ "path": tx::normalize_path(path)?, "type": content.type_name() })
+            }
+            Intent::Describe { path, description } => {
+                tx.set_description(path, description.as_deref())?;
+                json!({ "path": tx::normalize_path(path)?, "description": tx::normalize_description(description.as_deref())? })
             }
             Intent::Rm { path } => {
                 tx.rm(path)?;
@@ -1332,6 +1353,7 @@ pub fn describe(i: &Intent) -> String {
     match i {
         Intent::Mkdir { path, .. } => format!("mkdir {path}"),
         Intent::Put { path, .. } => format!("put {path}"),
+        Intent::Describe { path, .. } => format!("describe {path}"),
         Intent::Rm { path } => format!("rm {path}"),
         Intent::RmNode { node } => format!("rm --node {node}"),
         Intent::Mv { src, dst } => format!("mv {src} {dst}"),

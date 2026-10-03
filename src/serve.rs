@@ -202,6 +202,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                     path: tp(ctx, p, "path")?,
                     content,
                     not_after,
+                    description: p_opt(p, "description"),
                 },
             )
         }
@@ -210,6 +211,14 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             Intent::Mkdir {
                 path: tp(ctx, p, "path")?,
                 parents: p_bool(p, "parents"),
+                description: p_opt(p, "description"),
+            },
+        ),
+        "node.describe" => intent(
+            ctx,
+            Intent::Describe {
+                path: tp(ctx, p, "path")?,
+                description: p_opt(p, "description"),
             },
         ),
         "node.rm" => intent(

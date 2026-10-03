@@ -129,6 +129,19 @@ pub enum Cmd {
         /// Create parent folders as needed
         #[arg(short, long)]
         parents: bool,
+        /// What the folder is for (not secret; readable by whoever can read the folder)
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Set or clear the description of a folder or secret
+    Describe {
+        path: String,
+        /// The new description
+        #[arg(required_unless_present = "clear")]
+        description: Option<String>,
+        /// Remove the description
+        #[arg(long, conflicts_with = "description")]
+        clear: bool,
     },
     /// Store a secret: value from a hidden prompt, stdin (-), a file (@path) or record fields
     Put(PutArgs),
@@ -207,8 +220,9 @@ pub enum Cmd {
     },
     /// Version of the CLI, JSON API, file format and crypto suites
     Version,
-    /// Copy folders and secrets from a vault in an older file format, read by the older nepomuk
-    /// binary (e.g. `nepomuk-0.2.7`); users, groups and grants are not copied
+    /// Obsolete: copy folders and secrets from a 0.2.x vault, read by the older nepomuk binary
+    /// (e.g. `nepomuk-0.2.7`); users, groups and grants are not copied
+    #[command(hide = true)]
     Migrate {
         /// The older nepomuk binary that can read the old vault
         #[arg(long, value_name = "BINARY")]
@@ -384,6 +398,9 @@ pub struct PutArgs {
     /// MIME type of a binary secret
     #[arg(long)]
     pub mime: Option<String>,
+    /// What the secret is for (not secret; kept when the value is replaced without it)
+    #[arg(long)]
+    pub description: Option<String>,
 }
 
 // ---------------------------------------------------------------- Output
@@ -734,16 +751,19 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             from_identity,
             from_email,
             dry_run,
-        } => Ok(Out::data(crate::migrate::run(
-            ctx,
-            &crate::migrate::Source {
-                cli: from_cli,
-                vault: from_vault,
-                identity: from_identity,
-                email: from_email,
-            },
-            dry_run,
-        )?)),
+        } => {
+            ctx.warn("`nepomuk migrate` is obsolete and will be removed in a future release");
+            Ok(Out::data(crate::migrate::run(
+                ctx,
+                &crate::migrate::Source {
+                    cli: from_cli,
+                    vault: from_vault,
+                    identity: from_identity,
+                    email: from_email,
+                },
+                dry_run,
+            )?))
+        }
         Cmd::Sync { resolve } => {
             let r = match resolve.as_deref() {
                 Some("ours") => Resolve::Ours,
@@ -875,6 +895,11 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             let o = app::open_vault(ctx, true)?;
             let d = queries::ls(ctx, &o, path.as_deref(), recursive)?;
             let mut h = String::new();
+            if let Some(about) = d["description"].as_str() {
+                for l in about.lines() {
+                    h.push_str(&format!("# {l}\n"));
+                }
+            }
             for e in d["entries"].as_array().unwrap() {
                 let t = e["type"].as_str().unwrap_or("");
                 let mut flags = Vec::new();
@@ -893,8 +918,13 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
                 } else {
                     path.to_string()
                 };
+                let about = e["description"]
+                    .as_str()
+                    .and_then(|d| d.lines().next())
+                    .map(|d| format!("  # {d}"))
+                    .unwrap_or_default();
                 h.push_str(&format!(
-                    "{:<7} {shown}{}\n",
+                    "{:<7} {shown}{}{about}\n",
                     t,
                     if flags.is_empty() {
                         String::new()
@@ -905,11 +935,27 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             }
             Ok(Out::human(d, h))
         }
-        Cmd::Mkdir { path, parents } => intent(
+        Cmd::Mkdir {
+            path,
+            parents,
+            description,
+        } => intent(
             ctx,
             Intent::Mkdir {
                 path: ctx.path(&path),
                 parents,
+                description,
+            },
+        ),
+        Cmd::Describe {
+            path,
+            description,
+            clear,
+        } => intent(
+            ctx,
+            Intent::Describe {
+                path: ctx.path(&path),
+                description: if clear { None } else { description },
             },
         ),
         Cmd::Put(a) => put(ctx, a),
@@ -1511,6 +1557,7 @@ fn put(ctx: &Ctx, a: PutArgs) -> Result<Out> {
             path,
             content,
             not_after,
+            description: a.description,
         },
     )
 }

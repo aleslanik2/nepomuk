@@ -48,6 +48,24 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub const MAX_DESCRIPTION: usize = 2000;
+
+/// Trims a description; an empty one means none.
+pub fn normalize_description(d: Option<&str>) -> Result<Option<String>> {
+    let Some(d) = d.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    if d.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(Error::usage("invalid description: control characters"));
+    }
+    if d.chars().count() > MAX_DESCRIPTION {
+        return Err(Error::usage(format!(
+            "description too long (at most {MAX_DESCRIPTION} characters)"
+        )));
+    }
+    Ok(Some(d.to_string()))
+}
+
 pub fn split_parent(path: &str) -> Result<(String, String)> {
     let path = normalize_path(path)?;
     if path == "/" {
@@ -107,6 +125,7 @@ pub fn genesis(master: &Unlocked) -> Result<VaultFile> {
             created: now(),
             updated: now(),
             not_after: None,
+            description: None,
         },
     };
     let name = keyring::seal_name(vault_id, root, &nk, "");
@@ -339,6 +358,7 @@ impl<'a> Tx<'a> {
         name: &str,
         content: Content,
         not_after: Option<i64>,
+        description: Option<String>,
     ) -> Result<Id> {
         validate_name(name)?;
         let parent_path = self.path_of(parent);
@@ -362,6 +382,7 @@ impl<'a> Tx<'a> {
                 created: now(),
                 updated: now(),
                 not_after,
+                description,
             },
         };
         let sealed_name = keyring::seal_name(vault, id, &nk, name);
@@ -378,9 +399,23 @@ impl<'a> Tx<'a> {
     }
 
     pub fn mkdir(&mut self, path: &str, parents: bool) -> Result<Id> {
+        self.mkdir_with(path, parents, None)
+    }
+
+    /// Creates a folder with a description; with `parents`, an existing folder gets it.
+    pub fn mkdir_with(
+        &mut self,
+        path: &str,
+        parents: bool,
+        description: Option<&str>,
+    ) -> Result<Id> {
         let path = normalize_path(path)?;
+        let description = normalize_description(description)?;
         if let Some(id) = self.access().resolve(&path) {
             if parents && self.is_folder(id)? {
+                if description.is_some() {
+                    self.set_description(&path, description.as_deref())?;
+                }
                 return Ok(id);
             }
             return Err(
@@ -394,12 +429,27 @@ impl<'a> Tx<'a> {
             None if parents => self.mkdir(&parent, true)?,
             None => return Err(missing(self.access(), &parent)),
         };
-        self.create_node(pid, &name, Content::Folder, None)
+        self.create_node(pid, &name, Content::Folder, None, description)
     }
 
     /// Creates or replaces a secret.
     pub fn put(&mut self, path: &str, content: Content, not_after: Option<i64>) -> Result<Id> {
+        self.put_with(path, content, not_after, None)
+    }
+
+    /// Creates or replaces a secret; `description: None` keeps the current one.
+    pub fn put_with(
+        &mut self,
+        path: &str,
+        content: Content,
+        not_after: Option<i64>,
+        description: Option<&str>,
+    ) -> Result<Id> {
         let path = normalize_path(path)?;
+        let new_description = match description {
+            Some(d) => Some(normalize_description(Some(d))?),
+            None => None,
+        };
         if let Some(id) = self.access().resolve(&path) {
             let acc = Access::build(&self.state, self.me, self.id);
             let old = acc.content(&self.state, id)?;
@@ -412,6 +462,7 @@ impl<'a> Tx<'a> {
                     created: old.meta.created,
                     updated: now(),
                     not_after,
+                    description: new_description.unwrap_or_else(|| old.meta.description.clone()),
                 },
             };
             let nk = self.key(id)?;
@@ -424,7 +475,32 @@ impl<'a> Tx<'a> {
         }
         let (parent, name) = split_parent(&path)?;
         let pid = self.resolve(&parent)?;
-        self.create_node(pid, &name, content, not_after)
+        self.create_node(pid, &name, content, not_after, new_description.flatten())
+    }
+
+    /// Sets or clears the description of a folder or secret (`write` on the node).
+    pub fn set_description(&mut self, path: &str, description: Option<&str>) -> Result<()> {
+        let path = normalize_path(path)?;
+        let description = normalize_description(description)?;
+        let id = self.resolve(&path)?;
+        let acc = Access::build(&self.state, self.me, self.id);
+        let old = acc.content(&self.state, id)?;
+        if old.meta.description == description {
+            return Ok(());
+        }
+        let c = NodeContent {
+            content: old.content.clone(),
+            meta: Meta {
+                description,
+                ..old.meta.clone()
+            },
+        };
+        let nk = self.key(id)?;
+        let sealed = keyring::seal_content(self.vault(), id, &nk, &c);
+        self.push(Op::UpdateNode {
+            id,
+            content: sealed,
+        })
     }
 
     pub fn rm(&mut self, path: &str) -> Result<()> {
@@ -651,6 +727,7 @@ impl<'a> Tx<'a> {
                             created: now(),
                             updated: now(),
                             not_after: None,
+                            description: None,
                         },
                     }
                 }
