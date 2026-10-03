@@ -9,6 +9,23 @@
 
 nepomuk stores passwords, certificates and binary files (keystores, `.p12`, `.pem`, …) in a folder tree inside one encrypted file that you commit to a git repository. Every user can read only what they hold a key for, and every change must be signed by someone who is allowed to make it. The design and source code are public by intent – knowing how nepomuk works does not help an attacker.
 
+## Why nepomuk
+
+A company's secrets – database passwords, API tokens, TLS certificates, the keystore that signs the Android app – tend to end up in `.env` files, chat messages, personal password managers and CI settings, with nobody sure who can see what. The usual fixes each give something up:
+
+- **A secrets server** (HashiCorp Vault, cloud secret managers) enforces permissions well, but it is one more service to run, secure, back up and keep available – and its operators can, in the end, get at every secret in it.
+- **Encrypted files in git** (SOPS, git-crypt, pass/gopass) need no server, but encryption only controls *reading*. Anyone who can push to the repository can replace a secret or add a recipient, and nothing tells the readers.
+
+nepomuk keeps the "no server, just git" approach and closes that gap:
+
+- **Writes are enforced too.** Every change is signed, and every client replays the whole history and rejects any change its author was not allowed to make. A colleague with push access but no rights on `signing/` cannot swap the release keystore – the vault would refuse to open.
+- **Permissions like a file system.** Folders, inheritance, groups and delegated administration (`read`, `write`, `share`, `admin`), so a team lead can manage their project's secrets without anyone handing out keys by hand.
+- **Built for CI.** `nepomuk exec` hands a build exactly the secrets its narrow identity may read, only for the duration of one command, so a pipeline can sign a release without any developer ever seeing the keys.
+- **Made for a public history.** Git keeps every old version forever, so nepomuk uses hybrid post-quantum cryptography: a file copied today must stay unreadable when quantum computers arrive.
+- **Leaving people behind.** Offboarding removes a person everywhere, rotates the keys and lists the secrets that must be changed at the source.
+
+nepomuk is not the right tool if you want to know who *read* a secret (reads happen offline and cannot be audited), if you keep secrets only for yourself (a personal password manager is simpler), or if you already run a secrets server that does the job.
+
 ## Features
 
 - **One file, one company vault** – kept in its own git repository and shared into projects as a submodule.
