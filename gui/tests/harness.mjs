@@ -332,6 +332,12 @@ step("users", async () => {
   await waitFor(hasText("What jane@example.com can access"), "user access dialog");
   await shot("08-user-access");
   await click("Close", "dialog button");
+  await js(`[...[...document.querySelectorAll("tr")].find(r => r.innerText.includes("jane@example.com")).querySelectorAll("button")].find(b => b.innerText === "System rights").click()`);
+  await waitFor(hasText("System rights of jane@example.com"), "system rights dialog");
+  // The delegate checkbox sits next to its label, not stretched across the dialog.
+  await waitFor(`(() => { const c = document.querySelector('dialog input[type=checkbox]'); const l = c.closest('label'); return c.getBoundingClientRect().width < 40 && l.getBoundingClientRect().height < 60; })()`, "compact delegate checkbox");
+  await shot("08b-system-rights");
+  await click("Close", "dialog button");
 });
 step("groups", async () => {
   await click("Groups", "nav button");

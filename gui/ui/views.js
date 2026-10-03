@@ -506,7 +506,7 @@ async function usersView(target, ctx) {
             ctx.show("users");
           }) }, "Revoke"))))) : null,
         h("label", "Right", right),
-        h("label", { class: "field-row" }, delegate, h("span", "May grant this right to others")),
+        h("label", { class: "check" }, delegate, h("span", "May grant this right to others")),
         h("div", { class: "actions end" }, h("button", { type: "button", class: "quiet", onClick: () => close() }, "Close"), grant));
     });
   };
