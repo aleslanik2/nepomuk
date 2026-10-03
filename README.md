@@ -69,14 +69,18 @@ nepomuk group add android-release jane@example.com
 ### Store and read secrets
 
 ```bash
-nepomuk mkdir /infra/db
+nepomuk mkdir /infra/db --description "Production PostgreSQL"
 nepomuk put /infra/db/prod-password            # value read from a hidden prompt
 nepomuk put /infra/tls/wildcard.p12 --template pkcs12-cert \
   --field bundle=@wildcard.p12 --field-prompt password
 
+nepomuk describe /infra/db/prod-password "Password of the app user, rotated yearly"
+
 nepomuk ls -r /infra
 nepomuk get /infra/db/prod-password
 ```
+
+A description says what a folder or secret is for. It is not secret, but only those who can read the item see it; `ls` shows its first line, `describe <path> --clear` removes it.
 
 ### Grant and revoke access
 

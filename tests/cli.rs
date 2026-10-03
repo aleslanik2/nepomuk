@@ -1233,3 +1233,114 @@ fn migrate_resolves_relative_from_cli() {
     assert_ne!(r.err_code(), "NOT_FOUND", "{out}");
     assert!(out.contains("exited unexpectedly"), "{out}");
 }
+
+#[test]
+fn descriptions_on_folders_and_secrets() {
+    let e = Env::new("describe");
+    e.add_password_user("bob@example.com");
+    let entry = |path: &str| {
+        let ls = e.m(&["ls", "-r"]).data();
+        ls["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["path"] == path)
+            .cloned()
+            .unwrap()
+    };
+
+    e.m(&[
+        "mkdir",
+        "-p",
+        "/infra/db",
+        "--description",
+        "  Production database  ",
+    ])
+    .ok();
+    assert_eq!(entry("/infra/db")["description"], "Production database");
+    assert!(entry("/infra").get("description").is_none());
+    assert_eq!(
+        e.m(&["ls", "/infra/db"]).data()["description"],
+        "Production database"
+    );
+
+    e.m_in(
+        &[
+            "put",
+            "/infra/db/pw",
+            "--description",
+            "Password of the app user",
+        ],
+        b"one",
+    )
+    .ok();
+    let got = e.m(&["get", "/infra/db/pw"]).data();
+    assert_eq!(got["description"], "Password of the app user");
+    assert_eq!(got["value"], "one");
+
+    // Replacing the value without --description keeps it; with one replaces it.
+    e.m_in(&["put", "/infra/db/pw"], b"two").ok();
+    assert_eq!(
+        entry("/infra/db/pw")["description"],
+        "Password of the app user"
+    );
+    e.m_in(
+        &["put", "/infra/db/pw", "--description", "App user"],
+        b"three",
+    )
+    .ok();
+    assert_eq!(entry("/infra/db/pw")["description"], "App user");
+
+    // describe changes only the description, on folders and secrets.
+    e.m(&["describe", "/infra", "Servers and databases\nsecond line"])
+        .ok();
+    assert_eq!(
+        entry("/infra")["description"],
+        "Servers and databases\nsecond line"
+    );
+    e.m(&["describe", "/infra/db/pw", "--clear"]).ok();
+    assert!(entry("/infra/db/pw").get("description").is_none());
+    assert_eq!(e.m(&["get", "/infra/db/pw"]).data()["value"], "three");
+    e.m(&["describe", "/infra/db/pw", "Back again"]).ok();
+
+    // Moves and rekeys keep it.
+    e.m(&["mv", "/infra/db", "/infra/database"]).ok();
+    assert_eq!(
+        entry("/infra/database")["description"],
+        "Production database"
+    );
+    e.m(&["grant", "user:bob@example.com", "read", "/infra/database"])
+        .ok();
+    assert_eq!(
+        e.u("bob@example.com", &["get", "/infra/database/pw"])
+            .data()["description"],
+        "Back again"
+    );
+    e.m(&["revoke", "user:bob@example.com", "/infra/database"])
+        .ok();
+    assert_eq!(entry("/infra/database/pw")["description"], "Back again");
+    assert_eq!(
+        entry("/infra/database")["description"],
+        "Production database"
+    );
+
+    // A reader cannot change it.
+    e.m(&["grant", "user:bob@example.com", "read", "/infra/database"])
+        .ok();
+    assert_eq!(
+        e.u(
+            "bob@example.com",
+            &["describe", "/infra/database/pw", "mine"]
+        )
+        .err_code(),
+        "ACCESS_DENIED"
+    );
+
+    assert_eq!(
+        e.m(&["describe", "/infra", &"x".repeat(2001)]).err_code(),
+        "USAGE"
+    );
+    assert_eq!(e.m(&["describe", "/infra", "bad\u{7}"]).err_code(), "USAGE");
+    assert_eq!(e.m(&["describe", "/missing", "x"]).err_code(), "NOT_FOUND");
+    e.m(&["verify", "--full"]).ok();
+}

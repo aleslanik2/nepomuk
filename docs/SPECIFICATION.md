@@ -216,7 +216,7 @@ Alice and the CI identity only hold a grant on `signing`; from its key they deri
 
 **Keys derived from NK** (HKDF-SHA3-256):
 
-- `blob_key` – encrypts the node content: name, type, metadata and, for secrets, the data (text, binary content, record fields).
+- `blob_key` – encrypts the node content: name, type, metadata and, for secrets, the data (text, binary content, record fields). The metadata includes an optional description of what a folder or secret is for (plain text, at most 2000 characters). It is not treated as secret, but it is sealed with the rest of the node, so only those who can read the node see it.
 - `wrap_key` – wraps the keys of direct children; AAD = `vault_id || child_id`.
 
 **Grants**: a grant = the node key wrapped with the hybrid KEM for a recipient (user or group). The wrapped grant payload:
@@ -251,6 +251,7 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 - **Serialization**: deterministic CBOR (RFC 8949, core deterministic encoding). The stored bytes are signed, not a re-serialized structure.
 - **Chain**: `prev_hash` = SHA3-256("nepomuk/entry/v2" || body || signature, length-prefixed) of the previous commit or checkpoint – the signed bytes and the signature, not their envelope, so re-encoding an entry cannot change the chain. Envelopes must be canonical CBOR; anything else is rejected. The vault head = the last entry.
 - **Format version 2** (this document). Version 1 files are not readable; move their content with `scripts/migrate-v1.sh`.
+- **Optional fields**: fields added to the encrypted node content later (such as the description) are omitted when empty and ignored by older clients. An older client that rewrites a node (`put` of a new value, or a rekey after `revoke`, `offboard` or removing a group member) drops the fields it does not know.
 - **Append-only**: a new commit is only appended at the end, so git stores small deltas and the repository history does not grow by the whole file.
 - **Size estimate**: a user's public keys ≈ 3.6 KB, a grant ≈ 1.7 KB, a commit signature ≈ 3.4 KB. Single-digit MB for hundreds of users and secrets.
 
@@ -294,7 +295,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `CreateGroup` | master or `groups` |
 | `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |
 | `CreateNode` | `write` on the parent |
-| `UpdateNode` (content) | `write` on the node |
+| `UpdateNode` (content, including the description) | `write` on the node |
 | `RenameNode`, `DeleteNode` | `write` on the parent |
 | `Grant read/write` | `share` on the node, not above the own right |
 | `Grant share/admin`, `Revoke` | `admin` on the node |
@@ -397,7 +398,7 @@ History keeps all old versions of the vault and is not erased. That is why secre
 | Identity | `identity new`, `identity request`, `identity passwd`, `passgen` |
 | Users | `user add <request>`, `user list`, `user disable`, `user offboard`, `user replace` |
 | Groups | `group create`, `group add`, `group remove`, `group list` |
-| Tree | `ls [-r]`, `mkdir`, `put`, `get`, `mv`, `rm`, `rotation list`, `rotation done` |
+| Tree | `ls [-r]`, `mkdir`, `put`, `get`, `describe`, `mv`, `rm`, `rotation list`, `rotation done` |
 | Rights | `grant <who> <right> <path>`, `revoke`, `access <path>`, `whoami`, `sysgrant`, `sysrevoke` |
 | Running | `exec <profile> -- <command>` |
 | GUI | `serve --stdio`, `version --json` |
@@ -409,6 +410,7 @@ History keeps all old versions of the vault and is not erased. That is why secre
 - Password or passphrase: hidden from the TTY, `--password-fd N`, or `--password-stdin`. The variables `NEPOMUK_PASSWORD` / `NEPOMUK_PASSPHRASE` are for CI only, with a warning in the documentation.
 - Identity in CI: `NEPOMUK_IDENTITY` (identity file content, base64) or `--identity <file>`.
 - `put`: content from stdin, `@file` or `--field-prompt`. `get`: to stdout or `--out` with `0600` permissions.
+- Descriptions: `mkdir --description`, `put --description` (without it, replacing a value keeps the description), `describe <path> <text>` and `describe <path> --clear`. `ls` shows the first line after each item and the listed folder's description on top.
 
 ### 10.2 Configuration
 
@@ -509,6 +511,7 @@ A long-running process started by the GUI; JSON-RPC 2.0 over stdin and stdout, o
 - Methods correspond to CLI commands: `vault.status`, `node.list`, `node.get`, `node.put`, `grant.add`, `user.offboard`, `sync.run`, `session.unlock`, `session.lock` …
 - Asynchronous events (notifications): `sync.progress`, `vault.changed`, `session.expired`.
 - Returns secrets only on an explicit `node.get`; `node.list` returns metadata only.
+- Descriptions: `node.list` entries and `node.get` carry `description` when set, and `node.list` adds the listed folder's own `description`. `node.mkdir` and `node.put` take an optional `description` (`node.put` without it keeps the current one, `""` clears it); `node.describe {path, description}` sets it, `null` clears it.
 
 ### 12.3 Compatibility
 

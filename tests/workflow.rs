@@ -366,6 +366,35 @@ fn serve_stdio_session() {
         json!({ "path": "/infra/new", "type": "text", "value": "v" }),
     );
     assert!(r["result"]["seq"].is_number(), "{r}");
+    let r = call(
+        60,
+        "node.mkdir",
+        json!({ "path": "/apps", "description": "Mobile apps" }),
+    );
+    assert!(r["result"]["seq"].is_number(), "{r}");
+    let r = call(
+        61,
+        "node.describe",
+        json!({ "path": "/infra/new", "description": "Token for the build" }),
+    );
+    assert_eq!(r["result"]["description"], "Token for the build", "{r}");
+    // node.put without a description keeps it; "" clears it.
+    call(
+        62,
+        "node.put",
+        json!({ "path": "/infra/new", "type": "text", "value": "v2" }),
+    );
+    let r = call(63, "node.get", json!({ "path": "/infra/new" }));
+    assert_eq!(r["result"]["description"], "Token for the build");
+    let r = call(64, "node.list", json!({ "path": "/apps" }));
+    assert_eq!(r["result"]["description"], "Mobile apps");
+    call(
+        65,
+        "node.put",
+        json!({ "path": "/infra/new", "type": "text", "value": "v3", "description": "" }),
+    );
+    let r = call(66, "node.get", json!({ "path": "/infra/new" }));
+    assert!(r["result"].get("description").is_none(), "{r}");
     let r = call(7, "session.lock", json!({}));
     assert_eq!(r["result"]["locked"], true);
     let r = call(8, "node.get", json!({ "path": "/infra/pw" }));

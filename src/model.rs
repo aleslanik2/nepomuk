@@ -421,6 +421,9 @@ pub struct Meta {
     pub updated: i64,
     /// Certificate validity (templates), unix seconds.
     pub not_after: Option<i64>,
+    /// What the folder or secret is for; not secret, but sealed with the rest of the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

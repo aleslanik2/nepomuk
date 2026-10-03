@@ -87,6 +87,7 @@ function secretsView(target, ctx) {
         role: "treeitem",
         "aria-selected": selected === n.path,
         "aria-expanded": isFolder && kids.length ? (open ? "true" : "false") : false,
+        title: n.entry?.description || (n.path === data.path ? data.description : undefined),
         onClick: () => select(n.path),
         onKeydown: (ev) => {
           if (!isFolder || !kids.length) return;
@@ -118,7 +119,7 @@ function secretsView(target, ctx) {
     drawTree();
   };
 
-  const entryFor = (path) => data.entries.find((e) => e.path === path) || (path === data.path ? { path, name: path, type: "folder" } : null);
+  const entryFor = (path) => data.entries.find((e) => e.path === path) || (path === data.path ? { path, name: path, type: "folder", description: data.description } : null);
 
   const drawDetail = () => {
     if (!data.entries.length && !selected) {
@@ -136,6 +137,13 @@ function secretsView(target, ctx) {
     mount(detailEl, e.type === "folder" ? folderDetail(e) : secretDetail(e), accessBlock(e.path));
   };
 
+  // ---------------------------------------------------------- Description
+
+  // Not secret: shown as plain text to whoever can read the item.
+  const aboutBlock = (e) => (e.description ? h("p", { class: "description" }, e.description) : null);
+
+  const descriptionInput = (value = "") => h("textarea", { rows: 3, maxlength: 2000, value, placeholder: "What it is for (optional, not secret)" });
+
   // ---------------------------------------------------------- Folder
 
   const folderDetail = (e) => {
@@ -143,9 +151,11 @@ function secretsView(target, ctx) {
     return h("div", { class: "stack" },
       h("div", { class: "detail-head" }, h("div", { class: "crumbs" }, e.path), h("h2", e.name === "/" ? "Vault root" : e.name),
         h("div", { class: "facts" }, h("span", h("strong", children.length), " items"))),
+      aboutBlock(e),
       h("div", { class: "actions" },
         h("button", { class: "primary", onClick: () => newSecret(e.path) }, "New secret"),
         h("button", { onClick: () => newFolder(e.path) }, "New folder"),
+        h("button", { onClick: () => describe(e) }, e.description ? "Edit description" : "Add description"),
         e.path !== "/" && e.path !== data.path ? h("button", { onClick: () => move(e) }, "Rename or move") : null,
         e.path !== "/" ? h("button", { onClick: () => rekey(e) }, "Rekey") : null,
         e.path !== "/" && e.path !== data.path ? h("button", { class: "danger", onClick: () => remove(e) }, "Delete") : null));
@@ -199,12 +209,14 @@ function secretsView(target, ctx) {
     }
     return h("div", { class: "stack" },
       h("div", { class: "detail-head" }, h("div", { class: "crumbs" }, e.path), h("h2", e.name), h("div", { class: "facts" }, facts)),
+      aboutBlock(e),
       e.rotation_pending ? h("div", { class: "notice seal" }, "Someone who could read this secret lost access. Change it at its source, store the new value here and mark it rotated.") : null,
       e.expiring_soon ? h("div", { class: "notice warn" }, `The certificate expires ${when(e.expires)}.`) : null,
       h("section", { class: "block" }, h("div", { class: "values" }, rows)),
       h("div", { class: "actions" },
         h("button", { class: "primary", onClick: () => edit(e) }, "Replace value"),
         e.rotation_pending ? h("button", { onClick: () => markRotated(e) }, "Mark rotated") : null,
+        h("button", { onClick: () => describe(e) }, e.description ? "Edit description" : "Add description"),
         h("button", { onClick: () => move(e) }, "Rename or move"),
         h("button", { onClick: () => rekey(e) }, "Rekey"),
         h("button", { class: "danger", onClick: () => remove(e) }, "Delete")));
@@ -252,15 +264,18 @@ function secretsView(target, ctx) {
   const childPath = (folder, name) => (folder === "/" ? `/${name}` : `${folder}/${name}`);
 
   const newFolder = async (parent) => {
-    const name = await dialog("New folder", (close) => {
+    const got = await dialog("New folder", (close) => {
       const input = h("input", { required: true });
-      return h("form", { onSubmit: (ev) => { ev.preventDefault(); close(input.value.trim()); } },
+      const about = descriptionInput();
+      return h("form", { onSubmit: (ev) => { ev.preventDefault(); close({ name: input.value.trim(), description: about.value.trim() }); } },
         h("label", `Folder in ${parent}`, input),
+        h("label", "Description", about),
         h("div", { class: "actions end" }, h("button", { type: "button", class: "quiet", onClick: () => close() }, "Cancel"), h("button", { class: "primary" }, "Create folder")));
     });
-    if (!name) return;
+    if (!got?.name) return;
+    const name = got.name;
     try {
-      await ctx.write("node.mkdir", { path: childPath(parent, name) }, "Folder created.");
+      await ctx.write("node.mkdir", { path: childPath(parent, name), description: got.description || undefined }, "Folder created.");
       selected = childPath(parent, name);
       load();
     } catch (e) { showError(e); }
@@ -349,6 +364,7 @@ function secretsView(target, ctx) {
   const newSecret = async (parent) => {
     await dialog("New secret", (close) => {
       const name = h("input", { required: true });
+      const about = descriptionInput();
       const kind = h("select", h("option", { value: "text" }, "Text – a password or token"), h("option", { value: "binary" }, "File – keystore, certificate, key"),
         templates.map((t) => h("option", { value: `record:${t.name}` }, `Record – ${t.name}`)));
       const body = h("div");
@@ -365,12 +381,12 @@ function secretsView(target, ctx) {
         ev.preventDefault();
         busy(submit, async () => {
           const path = childPath(parent, name.value.trim());
-          await ctx.write("node.put", { path, ...form.params() }, "Secret stored.");
+          await ctx.write("node.put", { path, ...form.params(), description: about.value.trim() || undefined }, "Secret stored.");
           selected = path;
           close(true);
           load();
         });
-      } }, h("label", `Name in ${parent}`, name), h("label", "Kind", kind), body,
+      } }, h("label", `Name in ${parent}`, name), h("label", "Kind", kind), body, h("label", "Description", about),
         h("div", { class: "actions end" }, h("button", { type: "button", class: "quiet", onClick: () => close() }, "Cancel"), submit));
     });
   };
@@ -391,6 +407,23 @@ function secretsView(target, ctx) {
           load();
         });
       } }, form.el, h("div", { class: "actions end" }, h("button", { type: "button", class: "quiet", onClick: () => close() }, "Cancel"), submit));
+    });
+  };
+
+  const describe = async (e) => {
+    await dialog(`Description of ${e.name === "/" ? "the vault root" : e.name}`, (close) => {
+      const about = descriptionInput(e.description || "");
+      const submit = h("button", { class: "primary" }, "Save");
+      return h("form", { onSubmit: (ev) => {
+        ev.preventDefault();
+        busy(submit, async () => {
+          await ctx.write("node.describe", { path: e.path, description: about.value.trim() || null }, "Description saved.");
+          close(true);
+          load();
+        });
+      } }, h("label", "Description", about),
+        h("p", { class: "muted" }, "Not secret: anyone who can read this item sees it."),
+        h("div", { class: "actions end" }, h("button", { type: "button", class: "quiet", onClick: () => close() }, "Cancel"), submit));
     });
   };
 

@@ -324,6 +324,16 @@ step("create a secret", async () => {
   await waitFor(hasText("api-token"), "tree updated");
   await shot("06-created");
 });
+step("describe a secret", async () => {
+  await click("api-token", ".tree button");
+  await click("Add description");
+  await type("dialog textarea", "Token for the CI build\nRotate yearly");
+  await click("Save", "dialog button");
+  await waitFor(hasText("Description saved"), "description saved");
+  await waitFor(`document.querySelector('.detail .description')?.innerText.includes("Rotate yearly")`, "description shown");
+  await waitFor(`!!document.querySelector('.tree button[title^="Token for the CI build"]')`, "tree tooltip");
+  await shot("06b-description");
+});
 step("users", async () => {
   await click("Users", "nav button");
   await waitFor(hasText("jane@example.com"), "users");
