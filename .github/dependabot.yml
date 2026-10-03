@@ -1,0 +1,35 @@
+# Weekly dependency update pull requests. Security updates (enabled in
+# Settings → Code security) arrive immediately, outside this schedule.
+version: 2
+updates:
+  # CLI crate
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  # GUI backend (Tauri)
+  - package-ecosystem: cargo
+    directory: /gui/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      gui-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  # Actions are pinned by commit SHA; Dependabot keeps the SHA and the version comment up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
