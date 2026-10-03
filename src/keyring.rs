@@ -121,7 +121,14 @@ pub fn check_path(state: &State, node: Id, path: &str, salts: &[[u8; 32]]) -> bo
         return false;
     }
     let comps = components(path);
-    if path != "/" && !path.starts_with('/') {
+    // Only the canonical spelling: "/" or "/a/b" with valid names, so that a proven path is
+    // exactly what `resolve` and path arithmetic expect.
+    let canonical = if comps.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", comps.join("/"))
+    };
+    if path != canonical || comps.iter().any(|c| crate::tx::validate_name(c).is_err()) {
         return false;
     }
     if comps.len() + 1 != chain.len() || salts.len() != comps.len() {

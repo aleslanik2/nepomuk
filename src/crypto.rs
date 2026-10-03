@@ -205,8 +205,8 @@ impl KdfParams {
 /// 64 MiB, t = 2: the floor accepted from a vault (the default is 256 MiB, t = 3).
 pub const KDF_MIN_M_COST: u32 = 64 * 1024;
 pub const KDF_MIN_T_COST: u32 = 2;
-/// 4 GiB, t = 64, p = 16: the ceiling accepted from a vault.
-pub const KDF_MAX_M_COST: u32 = 4 * 1024 * 1024;
+/// 2 GiB, t = 64, p = 16: the ceiling accepted from a vault.
+pub const KDF_MAX_M_COST: u32 = 2 * 1024 * 1024;
 pub const KDF_MAX_T_COST: u32 = 64;
 pub const KDF_MAX_P_COST: u32 = 16;
 pub const KDF_SALT_LEN: usize = 16;

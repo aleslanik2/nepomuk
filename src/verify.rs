@@ -226,7 +226,9 @@ pub fn verify_file(file: VaultFile, pinned_fp: &str) -> Result<Verified> {
 /// been compacted yet); the master after replaying the log must be the pinned one.
 ///
 /// The root of trust is the signer of the checkpoint: a file signed by anyone else is rejected
-/// whatever its log claims, including a `TransferMaster` to the pinned key (§5, §7.1).
+/// whatever its log claims, including a `TransferMaster` to the pinned key (§5, §7.1). A caller
+/// passing `former` must also check that the file continues the history it saw before, since
+/// a former master can sign a checkpoint of any content.
 pub fn verify_file_with(file: VaultFile, pinned_fp: &str, former: &[String]) -> Result<Verified> {
     let cp_entry = &file.entries[0];
     let cp: CheckpointBody = from_cbor(&cp_entry.envelope.body)?;
@@ -459,14 +461,17 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(!s.is_master(*user), "use master transfer for the master")?;
             let u = s.users.get(user).ok_or_else(|| deny("unknown user"))?;
-            require(
-                !u.disabled,
-                "a disabled user cannot be replaced; add a new user",
-            )?;
             check_identity(&u.name, *kind, kem, sig, credential.as_ref(), proof)?;
+            require(
+                !s.users
+                    .values()
+                    .any(|o| o.id != *user && (o.kem == *kem || o.sig == *sig)),
+                "these keys already belong to a user",
+            )?;
             // Everything wrapped for the old keys becomes useless and is removed. System
             // rights are removed too: whoever approves the new keys must not inherit rights
-            // they could not grant themselves; they are granted again explicitly.
+            // they could not grant themselves; they are granted again explicitly. With nothing
+            // left, re-enabling a disabled user (a returning employee) grants nothing.
             let uid = *user;
             s.remove_grants_where(|g| g.to == Principal::User(uid));
             for g in s.groups.values_mut() {
@@ -479,6 +484,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             u.sig = sig.clone();
             u.credential = credential.clone();
             u.proof = proof.clone();
+            u.disabled = false;
         }
         Op::UpdateOwnCredential { credential } => {
             let u = s

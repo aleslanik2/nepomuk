@@ -6,7 +6,7 @@
 //! (they are bound to the old vault's keys); they are listed so they can be set up again.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
@@ -39,7 +39,10 @@ impl OldCli {
         let vault = std::fs::canonicalize(&src.vault).map_err(|e| {
             Error::not_found(&src.vault.display().to_string()).with("reason", e.to_string())
         })?;
-        let dir = vault.parent().unwrap_or(Path::new("/")).to_path_buf();
+        // Run it away from any project: an older release pins a `root_fp` from a .nepomuk.toml it
+        // finds in or above its working directory, so start it in nepomuk's own config folder.
+        let dir = crate::config::config_dir();
+        std::fs::create_dir_all(&dir)?;
         let mut cmd = Command::new(&src.cli);
         cmd.arg("--vault").arg(&vault);
         if let Some(i) = &src.identity {
@@ -116,6 +119,10 @@ impl Drop for OldCli {
 
 /// Reads everything the old identity can see and writes it into the current vault.
 pub fn run(ctx: &Ctx, src: &Source, dry_run: bool) -> Result<Value> {
+    if ctx.opts.offline {
+        // Offline writes are queued on disk, which would store the copied secrets there.
+        return Err(Error::usage("migrate cannot run with --offline"));
+    }
     let mut old = OldCli::start(src)?;
     let version = old.call("version", json!({}))?;
     let password = ctx.secret(

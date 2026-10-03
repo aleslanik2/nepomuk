@@ -601,6 +601,7 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     let pin = pin_for(ctx, vault, &mem, &file)?;
     let v = verify_file_with(file, &pin, &mem.former)?;
     check_memory(&v, &mem)?;
+    check_former_signer(&v, &mut mem, &pin)?;
     if ctx.ci() {
         check_submodule_pin(&loc, &v)?;
     }
@@ -619,6 +620,38 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     remember(&mut mem, &v);
     mem.save(vault)?;
     Ok(Opened { loc, loaded, v })
+}
+
+/// A checkpoint signed by a former master is accepted only as the continuation of the version
+/// seen before the transfer – never as a fresh history, which a former master (who may have
+/// left or been compromised) could otherwise forge. Once the pinned master has signed the
+/// checkpoint (after `compact`), former masters are forgotten.
+pub fn check_former_signer(v: &Verified, mem: &mut VaultMemory, pin: &str) -> Result<()> {
+    let signer = crate::verify::checkpoint_master_fp(&v.file).unwrap_or_default();
+    if signer == pin {
+        mem.former.clear();
+        return Ok(());
+    }
+    if contains_seen(v, mem) {
+        return Ok(());
+    }
+    Err(Error::new(
+        Code::UntrustedRoot,
+        "the vault is signed by a former master and does not continue the version seen before; ask the current master to run `nepomuk compact`",
+    )
+    .with("signer", signer))
+}
+
+/// Whether the remembered head is one of the file's commits. A commit's hash chains back to the
+/// exact checkpoint entry, so this proves the file continues the history seen here; a matching
+/// `folded_head` would not, since whoever signs a checkpoint can claim any folded head.
+fn contains_seen(v: &Verified, mem: &VaultMemory) -> bool {
+    let (Some(seq), Some(head)) = (mem.seq, mem.head.as_deref()) else {
+        return false;
+    };
+    v.commits
+        .iter()
+        .any(|c| c.seq == seq && hex::encode(c.hash) == head)
 }
 
 fn remember(mem: &mut VaultMemory, v: &Verified) {
@@ -1276,7 +1309,21 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
             e
         }
     })?;
-    let previous = mem.repin(fp);
+    if signer != fp && !contains_seen(&v, &mem) {
+        return Err(Error::new(
+            Code::UntrustedRoot,
+            "the vault is signed by a former master and does not continue the version seen before; ask the current master to run `nepomuk compact`",
+        )
+        .with("signer", signer));
+    }
+    // Keep the former master only while the vault still needs it (its checkpoint is signed by
+    // it); re-pinning for any other reason must not leave the old key trusted.
+    let previous = mem.pin.replace(fp.to_string());
+    if signer == fp {
+        mem.former.clear();
+    } else if previous.as_deref() == Some(signer.as_str()) && !mem.former.contains(&signer) {
+        mem.former.push(signer.clone());
+    }
     remember(&mut mem, &v);
     mem.save(vault)?;
     Ok(json!({ "vault_id": vault.hex(), "pinned": fp, "previous": previous, "seq": v.seq }))

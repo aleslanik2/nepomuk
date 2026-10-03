@@ -352,12 +352,21 @@ fn replace_identity_does_not_hand_over_system_rights() {
     let (_, v, _, _) = t.commit().unwrap();
     assert_eq!(v.state.sys_right(b, SysRight::Groups), None);
 
+    // Keys of another user cannot be taken over.
+    let mut t = Tx::new(&v, &it).unwrap();
+    assert!(t.user_replace(b, &Request::new(&it, None)).is_err());
+
+    // A disabled user comes back with nothing: no grants, groups or system rights.
     let mut t = Tx::new(&v, &master).unwrap();
     t.user_disable(b).unwrap();
     let (_, v, _, _) = t.commit().unwrap();
     let again = Unlocked::generate("bob", IdentityKind::Local);
     let mut t = Tx::new(&v, &it).unwrap();
-    assert!(t.user_replace(b, &Request::new(&again, None)).is_err());
+    t.user_replace(b, &Request::new(&again, None)).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.active(b));
+    assert!(v.state.sysrights.get(&b).is_none_or(|m| m.is_empty()));
+    assert!(!v.state.grants.values().any(|g| g.to == Principal::User(b)));
 }
 
 /// Format v2: an entry with trailing bytes (same signature, different encoding) is rejected.
@@ -462,4 +471,159 @@ fn exec_cleanup_does_not_follow_symlinks() {
     assert!(!private.exists());
     assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A former master cannot use its old key to forge the vault for clients that remember it: a
+/// checkpoint signed by a former master is accepted only when it continues the seen history.
+#[test]
+fn former_master_cannot_forge_after_transfer() {
+    use nepomuk::config::VaultMemory;
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let (a_fp, b_fp) = (alice.fingerprint(), bob.fingerprint());
+    let v = new_vault(&alice);
+    let mut t = Tx::new(&v, &alice).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    let b = t.user_named("bob").unwrap();
+    t.transfer_master(b).unwrap();
+    let (file, seen, _, _) = t.commit().unwrap();
+    let mut mem = VaultMemory {
+        pin: Some(b_fp.clone()),
+        former: vec![a_fp.clone()],
+        seq: Some(seen.seq),
+        head: Some(hex::encode(seen.head)),
+        ..Default::default()
+    };
+
+    // The real continuation (still Alice's checkpoint) is accepted.
+    let mut t = Tx::new(&seen, &bob).unwrap();
+    t.mkdir("/x", false).unwrap();
+    let (next, _, _, _) = t.commit().unwrap();
+    let v2 = verify_file_with(next, &b_fp, &mem.former).unwrap();
+    nepomuk::app::check_former_signer(&v2, &mut mem, &b_fp).unwrap();
+
+    // Alice forges a fresh history ending with a transfer to Bob.
+    let g = tx::genesis(&alice).unwrap();
+    let mut cp: CheckpointBody = from_cbor(&g.entries[0].envelope.body).unwrap();
+    let vid = file.vault_id;
+    let root = cp.state.root;
+    let nk = crypto::random_key();
+    cp.vault_id = vid;
+    cp.state.vault_id = vid;
+    cp.seq = 1_000;
+    cp.folded_head = Some(seen.head);
+    cp.state.grants.clear();
+    let name = keyring::seal_name(vid, root, &nk, "");
+    let rn = cp.state.nodes.get_mut(&root).unwrap();
+    rn.name = name.sealed;
+    rn.name_commit = name.commit;
+    let bob_rec = seen.state.users[&b].clone();
+    cp.state.users.insert(b, bob_rec);
+    let body = to_cbor(&cp);
+    let sig = alice.sig.sign("checkpoint", &body);
+    let mut forged = VaultFile {
+        vault_id: vid,
+        entries: vec![RawEntry::from_envelope(Envelope { body, sig })],
+    };
+    let a = cp.state.master;
+    sign_commit(
+        &mut forged,
+        &alice,
+        a,
+        1_001,
+        vec![Op::TransferMaster { user: b }],
+    );
+    let fv = verify_file_with(forged, &b_fp, &mem.former).unwrap();
+    let err = nepomuk::app::check_former_signer(&fv, &mut mem, &b_fp).unwrap_err();
+    assert_eq!(err.code, Code::UntrustedRoot);
+
+    // After Bob compacts, Alice is no longer trusted at all.
+    let compacted = tx::compact(&v2, &bob).unwrap();
+    let v3 = verify_file_with(compacted, &b_fp, &mem.former).unwrap();
+    nepomuk::app::check_former_signer(&v3, &mut mem, &b_fp).unwrap();
+    assert!(mem.former.is_empty());
+}
+
+/// Proven paths must be canonical; anything else is ignored.
+#[test]
+fn non_canonical_grant_path_is_not_proven() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let ci = Unlocked::generate("ci", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&ci, None)).unwrap();
+    t.mkdir("/a/b", true).unwrap();
+    let c = t.user_named("ci").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let n = t.resolve("/a/b").unwrap();
+    let nk = t.access().key(n).unwrap().clone();
+    let mut proof = t.access().proof(n).unwrap();
+    for bad in ["//a/b", "/a//b", "/a/b/"] {
+        proof.path = bad.into();
+        let g = keyring::make_grant(
+            &v.state,
+            Id::random(),
+            n,
+            Principal::User(c),
+            Right::Read,
+            &nk,
+            &proof,
+        )
+        .unwrap();
+        assert!(!keyring::check_path(&v.state, n, bad, &proof.salts));
+        let _ = g;
+    }
+    assert!(keyring::check_path(&v.state, n, "/a/b", &proof.salts));
+}
+
+/// `mv` into a folder that already holds that name is refused instead of creating a duplicate,
+/// and a node the author cannot read does not block moving its ancestors.
+#[test]
+fn mv_refuses_duplicates_and_ignores_unreadable_nodes() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let eve = Unlocked::generate("eve", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&eve, None)).unwrap();
+    t.mkdir("/x/a", true).unwrap();
+    t.mkdir("/y/a", true).unwrap();
+    t.mkdir("/w/e", true).unwrap();
+    let e = t.user_named("eve").unwrap();
+    t.grant(Principal::User(e), Right::Write, "/w/e").unwrap();
+    let (mut f, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    assert_eq!(t.mv("/x/a", "/y").unwrap_err().code, Code::AlreadyExists);
+
+    // Eve plants a node with a commitment that does not match its name.
+    let eacc = Access::build(&v.state, e, &eve);
+    let parent = eacc.resolve("/w/e").unwrap();
+    let pk = eacc.key(parent).unwrap().clone();
+    let id = Id::random();
+    let nk = crypto::random_key();
+    let vid = v.state.vault_id;
+    let node = Node {
+        id,
+        parent: Some(parent),
+        wrapped_key: Some(keyring::seal_node_key(vid, id, &pk, &nk)),
+        name: keyring::seal_name(vid, id, &nk, "junk").sealed,
+        name_commit: [0u8; 32],
+        content: keyring::seal_content(
+            vid,
+            id,
+            &nk,
+            &NodeContent {
+                content: Content::Folder,
+                meta: Meta::default(),
+            },
+        ),
+    };
+    sign_commit(&mut f, &eve, e, v.seq + 1, vec![Op::CreateNode { node }]);
+    let v = verify_file(f, &master.fingerprint()).unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mv("/w", "/v").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let eacc = Access::build(&v.state, e, &eve);
+    assert!(eacc.unproven.is_empty());
+    assert!(eacc.resolve("/v/e").is_some());
 }

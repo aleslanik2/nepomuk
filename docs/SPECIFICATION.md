@@ -126,7 +126,7 @@ Every user has a nepomuk identity: a hybrid key pair for encryption (ML-KEM-1024
 - **Blocklist**: a built-in list of the most common breached passwords + context-specific words (the email and its parts, the name, "nepomuk", the vault name). Optional check against Have I Been Pwned (k-anonymity), off by default.
 - Passwords are never truncated; no hints or security questions; pasting from password managers is allowed.
 - No mandatory periodic change; a change can be forced with a flag on suspected compromise.
-- **Deviation from NIST**: rate limiting of attempts is impossible because the file can be attacked offline. It is replaced by an expensive Argon2id (parameters stored per user, automatically strengthened on next login; every client rejects parameters below m = 64 MiB, t = 2 or above m = 4 GiB, t = 64, p = 16, and salts other than 16 bytes) and by a passphrase generator `nepomuk passgen` (6 words, ~77 bits).
+- **Deviation from NIST**: rate limiting of attempts is impossible because the file can be attacked offline. It is replaced by an expensive Argon2id (parameters stored per user, automatically strengthened on next login; every client rejects parameters below m = 64 MiB, t = 2 or above m = 2 GiB, t = 64, p = 16, and salts other than 16 bytes) and by a passphrase generator `nepomuk passgen` (6 words, ~77 bits).
 - Password strength estimation (zxcvbn) only as a warning, not a block.
 
 ### 4.2 PQ SSH identity
@@ -259,7 +259,7 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 - The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override.
 - `root_fp` in `.nepomuk.toml` is only a hint: it is shown next to the fingerprint the file claims, but never pinned automatically, because whoever controls the project repository could ship a vault of their own with a matching fingerprint. A pin that differs from it produces a warning.
 - Without a pin nepomuk does not open the file.
-- **The checkpoint is the anchor**: it must be signed by the pinned master (or, until the next `compact`, by a master pinned earlier on this machine and replaced after a `TransferMaster`). A log that ends with a transfer to the pinned master proves nothing on its own – a forged checkpoint could contain it.
+- **The checkpoint is the anchor**: it must be signed by the pinned master, or, until the next `compact`, by a master pinned earlier on this machine and replaced after a `TransferMaster` – and then only if the file contains, as a commit, the head this machine saw before (a former master can sign a checkpoint of any content). Former masters are forgotten once a checkpoint signed by the pinned master is seen. A log that ends with a transfer to the pinned master proves nothing on its own – a forged checkpoint could contain it.
 - After a master transfer the new master should run `compact`; until then, clients that never pinned the former master cannot open the vault.
 - The local state (pins, `seq`, head) fails closed: an unreadable or corrupt state file is an error.
 
@@ -285,7 +285,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 
 | Operation | Required right of the author |
 | --- | --- |
-| `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all system rights of the user (re-granted only by holders with `+delegate`) and cannot re-enable a disabled user |
+| `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all grants, memberships and system rights of the user (re-granted only by holders of the rights, with `+delegate` for system rights), so re-enabling a disabled user grants nothing |
 | `UpdateOwnCredential` (password change, Argon2id parameters) | the user themselves |
 | `CreateGroup` | master or `groups` |
 | `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |

@@ -480,6 +480,12 @@ impl<'a> Tx<'a> {
             }
             None => dst,
         };
+        if self.access().exists(&dst) {
+            return Err(Error::new(
+                Code::AlreadyExists,
+                format!("already exists: {dst}"),
+            ));
+        }
         let (parent, name) = split_parent(&dst)?;
         validate_name(&name)?;
         let pid = self.resolve(&parent)?;
@@ -492,18 +498,23 @@ impl<'a> Tx<'a> {
         // The node's proven path at its destination; the subtree keeps its salts below it.
         let moved = self.proof(pid)?.child(&name, keyring::name_salt(&nk));
         let sub = self.state.subtree(id);
+        // New proofs for the nodes that carry grants: the moved node's new location followed by
+        // the unchanged levels below it. Other nodes need none, so a node in the subtree this
+        // author cannot read does not block the move.
+        let granted: BTreeSet<Id> = self.state.grants_on(&sub).iter().map(|g| g.node).collect();
         let mut proofs = BTreeMap::new();
-        for n in &sub {
-            let p = self.proof(*n)?;
-            let mut salts = moved.salts.clone();
-            salts.extend_from_slice(&p.salts[old.salts.len()..]);
-            proofs.insert(
-                *n,
-                keyring::PathProof {
-                    path: format!("{}{}", dst, &p.path[old.path.len()..]),
-                    salts,
-                },
-            );
+        for n in granted {
+            let p = self.proof(n)?;
+            let depth = old.salts.len();
+            let comps = keyring::components(&p.path);
+            if p.salts.len() < depth || comps.len() != p.salts.len() {
+                return Err(Error::access_denied(&p.path));
+            }
+            let mut np = moved.clone();
+            for (c, salt) in comps[depth..].iter().zip(&p.salts[depth..]) {
+                np = np.child(c, *salt);
+            }
+            proofs.insert(n, np);
         }
         let grants = self.rewrapped_grants(&sub, &proofs)?;
         let vault = self.vault();
