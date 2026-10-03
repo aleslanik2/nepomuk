@@ -173,7 +173,43 @@ impl KdfParams {
     pub fn weaker_than(&self, other: &KdfParams) -> bool {
         self.m_cost < other.m_cost || self.t_cost < other.t_cost
     }
+
+    /// Bounds every client enforces on parameters read from a vault or identity file: a floor
+    /// so that a crafted or buggy client cannot enroll a cheaply crackable credential, and a
+    /// ceiling so that a crafted file cannot make the client allocate unbounded memory.
+    pub fn check(&self) -> Result<()> {
+        let (min_m, min_t) = if insecure_test_kdf() {
+            (64, 1)
+        } else {
+            (KDF_MIN_M_COST, KDF_MIN_T_COST)
+        };
+        if self.m_cost < min_m || self.t_cost < min_t {
+            return Err(Error::new(
+                crate::error::Code::WeakPassword,
+                format!(
+                    "Argon2id parameters are too weak (m = {} KiB, t = {}; minimum m = {min_m} KiB, t = {min_t})",
+                    self.m_cost, self.t_cost
+                ),
+            ));
+        }
+        if self.m_cost > KDF_MAX_M_COST
+            || self.t_cost > KDF_MAX_T_COST
+            || !(1..=KDF_MAX_P_COST).contains(&self.p_cost)
+        {
+            return Err(Error::format("Argon2id parameters are out of range"));
+        }
+        Ok(())
+    }
 }
+
+/// 64 MiB, t = 2: the floor accepted from a vault (the default is 256 MiB, t = 3).
+pub const KDF_MIN_M_COST: u32 = 64 * 1024;
+pub const KDF_MIN_T_COST: u32 = 2;
+/// 2 GiB, t = 64, p = 16: the ceiling accepted from a vault.
+pub const KDF_MAX_M_COST: u32 = 2 * 1024 * 1024;
+pub const KDF_MAX_T_COST: u32 = 64;
+pub const KDF_MAX_P_COST: u32 = 16;
+pub const KDF_SALT_LEN: usize = 16;
 
 /// Cheap Argon2 parameters for the test suite; honoured only in debug builds.
 fn insecure_test_kdf() -> bool {
@@ -210,11 +246,23 @@ pub fn password_seal(password: &[u8], secret: &[u8], aad: &[u8]) -> Result<Passw
     })
 }
 
+impl PasswordSealed {
+    /// Checks the KDF parameters and salt length (see [`KdfParams::check`]).
+    pub fn check(&self) -> Result<()> {
+        self.kdf.check()?;
+        if self.salt.len() != KDF_SALT_LEN {
+            return Err(Error::format("Argon2id salt must be 16 bytes"));
+        }
+        Ok(())
+    }
+}
+
 pub fn password_open(
     password: &[u8],
     ps: &PasswordSealed,
     aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
+    ps.check()?;
     let key = argon2id(password, &ps.salt, &ps.kdf)?;
     open(&key, &ps.sealed, aad).map_err(|_| Error::bad_credentials())
 }
@@ -411,10 +459,38 @@ pub fn unwrap(me: &KemSecret, w: &Wrapped, aad: &[u8]) -> Result<Zeroizing<Vec<u
 
 // ---------------------------------------------------------------- Fingerprints
 
-/// `npk1…` fingerprint (bech32 of SHA3-256 over the public keys).
+/// `npk1…` fingerprint (bech32 of SHA3-256 over the length-prefixed public keys).
 pub fn fingerprint(kem: &KemPublic, sig: &SigPublic) -> String {
-    let digest = sha3(&[b"nepomuk/fp", &kem.pq, &kem.ec, &sig.pq, &sig.ec]);
+    let digest = sha3(&[
+        b"nepomuk/fp/v2",
+        &framed(&[&kem.pq, &kem.ec, &sig.pq, &sig.ec]),
+    ]);
     bech32::encode::<bech32::Bech32m>(bech32::Hrp::parse("npk").unwrap(), &digest).unwrap()
+}
+
+/// Concatenation with a 4-byte big-endian length before each part (unambiguous encoding).
+pub fn framed(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Checks the lengths of a hybrid KEM public key and that its ML-KEM part is well formed.
+pub fn check_kem_public(k: &KemPublic) -> Result<()> {
+    let pq: [u8; MLKEM_PK_LEN] =
+        k.pq.as_slice()
+            .try_into()
+            .map_err(|_| Error::format("bad ML-KEM public key"))?;
+    if !mlkem1024::validate_public_key(&mlkem1024::MlKem1024PublicKey::from(pq)) {
+        return Err(Error::format("invalid ML-KEM public key"));
+    }
+    if k.ec.len() != 32 {
+        return Err(Error::format("bad X25519 public key"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -156,13 +156,16 @@ pub fn user_fp(u: &User) -> String {
     crypto::fingerprint(&u.kem, &u.sig)
 }
 
+/// What a proof of possession signs: the whole request, including the password credential, so
+/// that whoever relays a request cannot swap the credential.
 pub fn proof_data(
     name: &str,
     kind: IdentityKind,
     kem: &crypto::KemPublic,
     sig: &crypto::SigPublic,
+    credential: Option<&crypto::PasswordSealed>,
 ) -> Vec<u8> {
-    crate::format::to_cbor(&(name, kind, kem, sig))
+    crate::format::to_cbor(&(name, kind, kem, sig, credential))
 }
 
 fn verify_proof(
@@ -170,9 +173,43 @@ fn verify_proof(
     kind: IdentityKind,
     kem: &crypto::KemPublic,
     sig: &crypto::SigPublic,
+    credential: Option<&crypto::PasswordSealed>,
     proof: &[u8],
 ) -> bool {
-    crypto::verify(sig, "request", &proof_data(name, kind, kem, sig), proof)
+    crypto::verify(
+        sig,
+        "request",
+        &proof_data(name, kind, kem, sig, credential),
+        proof,
+    )
+}
+
+/// Checks a new identity's keys and credential (AddUser, ReplaceIdentity).
+fn check_identity(
+    name: &str,
+    kind: IdentityKind,
+    kem: &crypto::KemPublic,
+    sig: &crypto::SigPublic,
+    credential: Option<&crypto::PasswordSealed>,
+    proof: &[u8],
+) -> Result<()> {
+    crypto::check_kem_public(kem).map_err(|e| deny(e.message))?;
+    require(
+        verify_proof(name, kind, kem, sig, credential, proof),
+        "invalid proof of possession",
+    )?;
+    match (kind, credential) {
+        (IdentityKind::Password, Some(c)) => c.check().map_err(|e| deny(e.message)),
+        (IdentityKind::Password, None) => Err(deny("missing credential")),
+        (IdentityKind::Local, None) => Ok(()),
+        (IdentityKind::Local, Some(_)) => Err(deny("a local identity has no credential")),
+    }
+}
+
+/// Fingerprint of the master that signed the checkpoint (entry 0) of a file, unverified.
+pub fn checkpoint_master_fp(file: &VaultFile) -> Option<String> {
+    let cp: CheckpointBody = from_cbor(&file.entries[0].envelope.body).ok()?;
+    cp.state.users.get(&cp.state.master).map(user_fp)
 }
 
 fn sig_err(m: impl Into<String>) -> Error {
@@ -181,6 +218,18 @@ fn sig_err(m: impl Into<String>) -> Error {
 
 /// Verifies a whole vault file against the pinned master fingerprint.
 pub fn verify_file(file: VaultFile, pinned_fp: &str) -> Result<Verified> {
+    verify_file_with(file, pinned_fp, &[])
+}
+
+/// Verifies a whole vault file. The checkpoint must be signed by the pinned master or by one of
+/// `former` (masters pinned earlier on this machine, before a `TransferMaster` that has not
+/// been compacted yet); the master after replaying the log must be the pinned one.
+///
+/// The root of trust is the signer of the checkpoint: a file signed by anyone else is rejected
+/// whatever its log claims, including a `TransferMaster` to the pinned key (§5, §7.1). A caller
+/// passing `former` must also check that the file continues the history it saw before, since
+/// a former master can sign a checkpoint of any content.
+pub fn verify_file_with(file: VaultFile, pinned_fp: &str, former: &[String]) -> Result<Verified> {
     let cp_entry = &file.entries[0];
     let cp: CheckpointBody = from_cbor(&cp_entry.envelope.body)?;
     if cp.vault_id != file.vault_id || cp.state.vault_id != file.vault_id {
@@ -191,7 +240,16 @@ pub fn verify_file(file: VaultFile, pinned_fp: &str) -> Result<Verified> {
         .users
         .get(&cp.state.master)
         .ok_or_else(|| Error::format("checkpoint without master"))?;
-    let mut masters = vec![user_fp(master)];
+    let signer = user_fp(master);
+    if signer != pinned_fp && !former.contains(&signer) {
+        return Err(Error::new(
+            Code::UntrustedRoot,
+            "the vault's checkpoint is not signed by the pinned master",
+        )
+        .with("pinned", pinned_fp)
+        .with("found", signer));
+    }
+    let mut masters = vec![signer];
     if !crypto::verify(
         &master.sig,
         "checkpoint",
@@ -364,13 +422,19 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "user name already exists",
             )?;
             require(!user.disabled, "new user must be enabled")?;
-            require(
-                verify_proof(&user.name, user.kind, &user.kem, &user.sig, &user.proof),
-                "invalid proof of possession",
+            check_identity(
+                &user.name,
+                user.kind,
+                &user.kem,
+                &user.sig,
+                user.credential.as_ref(),
+                &user.proof,
             )?;
             require(
-                user.kind == IdentityKind::Local || user.credential.is_some(),
-                "missing credential",
+                !s.users
+                    .values()
+                    .any(|u| u.kem == user.kem || u.sig == user.sig),
+                "these keys already belong to a user",
             )?;
             s.users.insert(user.id, user.clone());
         }
@@ -397,23 +461,23 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(!s.is_master(*user), "use master transfer for the master")?;
             let u = s.users.get(user).ok_or_else(|| deny("unknown user"))?;
+            check_identity(&u.name, *kind, kem, sig, credential.as_ref(), proof)?;
             require(
-                verify_proof(&u.name, *kind, kem, sig, proof),
-                "invalid proof of possession",
+                !s.users
+                    .values()
+                    .any(|o| o.id != *user && (o.kem == *kem || o.sig == *sig)),
+                "these keys already belong to a user",
             )?;
-            require(
-                *kind == IdentityKind::Local || credential.is_some(),
-                "missing credential",
-            )?;
-            // Everything wrapped for the old keys becomes useless and is removed.
+            // Everything wrapped for the old keys becomes useless and is removed. System
+            // rights are removed too: whoever approves the new keys must not inherit rights
+            // they could not grant themselves; they are granted again explicitly. With nothing
+            // left, re-enabling a disabled user (a returning employee) grants nothing.
             let uid = *user;
             s.remove_grants_where(|g| g.to == Principal::User(uid));
             for g in s.groups.values_mut() {
                 g.members.remove(&uid);
             }
-            if let Some(m) = s.sysrights.get_mut(&uid) {
-                m.retain(|r, _| !matches!(r, SysRight::GroupAdmin(_)));
-            }
+            s.sysrights.remove(&uid);
             let u = s.users.get_mut(user).unwrap();
             u.kind = *kind;
             u.kem = kem.clone();
@@ -431,6 +495,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 u.kind == IdentityKind::Password,
                 "only password identities store a credential",
             )?;
+            credential.check().map_err(|e| deny(e.message))?;
             u.credential = Some(credential.clone());
         }
         Op::CreateGroup { group } => {
@@ -462,6 +527,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             require(
                 s.sys_right(author, SysRight::GroupAdmin(*group)).is_some(),
                 "requires `group-admin` of the group",
+            )?;
+            require(
+                s.is_master(author) || g.members.contains_key(&author),
+                "only a member of the group can add members",
             )?;
             require(s.active(*user), "unknown or disabled user")?;
             require(!g.members.contains_key(user), "already a member")?;
@@ -535,14 +604,21 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             s.nodes.get_mut(id).unwrap().content = content.clone();
         }
-        Op::RenameNode { id, name, grants } => {
+        Op::RenameNode {
+            id,
+            name,
+            name_commit,
+            grants,
+        } => {
             let parent = parent_of(s, *id)?;
             require(
                 s.has_right(author, parent, Right::Write),
                 "requires `write` on the parent",
             )?;
             check_rewrapped(s, grants, &s.subtree(*id))?;
-            s.nodes.get_mut(id).unwrap().name = name.clone();
+            let n = s.nodes.get_mut(id).unwrap();
+            n.name = name.clone();
+            n.name_commit = *name_commit;
             for g in grants {
                 s.grants.insert(g.id, g.clone());
             }
@@ -552,6 +628,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             parent,
             wrapped_key,
             name,
+            name_commit,
             grants,
         } => {
             let old_parent = parent_of(s, *id)?;
@@ -573,6 +650,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             n.parent = Some(*parent);
             n.wrapped_key = Some(wrapped_key.clone());
             n.name = name.clone();
+            n.name_commit = *name_commit;
             for g in grants {
                 s.grants.insert(g.id, g.clone());
             }
@@ -663,6 +741,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 )?;
                 n.wrapped_key = rn.wrapped_key.clone();
                 n.name = rn.name.clone();
+                n.name_commit = rn.name_commit;
                 n.content = rn.content.clone();
             }
             for g in grants {

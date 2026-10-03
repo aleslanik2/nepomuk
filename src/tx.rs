@@ -10,7 +10,7 @@ use crate::identity::{Request, Unlocked};
 use crate::keyring::{self, Access};
 use crate::memory::LockedSeed;
 use crate::model::*;
-use crate::verify::{Verified, apply_op, verify_file};
+use crate::verify::{Verified, apply_op, verify_file_with};
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -65,6 +65,13 @@ pub fn split_parent(path: &str) -> Result<(String, String)> {
 /// Names are encrypted: "not found" can only be told apart from "no access" when the reader can
 /// see an existing ancestor folder.
 pub fn missing(acc: &Access, path: &str) -> Error {
+    if acc.ambiguous(path) {
+        return Error::new(
+            Code::Conflict,
+            format!("ambiguous path: more than one item is named {path}"),
+        )
+        .with("path", path.to_string());
+    }
     let mut p = path.to_string();
     while let Ok((parent, _)) = split_parent(&p) {
         if acc.resolve(&parent).is_some() {
@@ -91,7 +98,7 @@ pub fn genesis(master: &Unlocked) -> Result<VaultFile> {
         kem: master.kem.public().clone(),
         sig: master.sig.public().clone(),
         credential: None,
-        proof: master.proof(IdentityKind::Local),
+        proof: master.proof(IdentityKind::Local, None),
         disabled: false,
     };
     let content = NodeContent {
@@ -102,11 +109,13 @@ pub fn genesis(master: &Unlocked) -> Result<VaultFile> {
             not_after: None,
         },
     };
+    let name = keyring::seal_name(vault_id, root, &nk, "");
     let node = Node {
         id: root,
         parent: None,
         wrapped_key: None,
-        name: keyring::seal_name(vault_id, root, &nk, ""),
+        name: name.sealed,
+        name_commit: name.commit,
         content: keyring::seal_content(vault_id, root, &nk, &content),
     };
     let mut state = State {
@@ -124,7 +133,7 @@ pub fn genesis(master: &Unlocked) -> Result<VaultFile> {
         Principal::User(master_id),
         Right::Admin,
         &nk,
-        "/",
+        &keyring::PathProof::root(),
     )?;
     state.grants.insert(grant.id, grant);
     let body = to_cbor(&CheckpointBody {
@@ -248,8 +257,12 @@ impl<'a> Tx<'a> {
         let mut file = self.base.file.clone();
         file.entries
             .push(RawEntry::from_envelope(Envelope { body, sig }));
+        // The base was verified against the pin; the new file must verify from the same root.
         let master_fp = crate::verify::user_fp(&self.state.users[&self.state.master]);
-        let verified = verify_file(file.clone(), &master_fp)?;
+        let signer: Vec<String> = crate::verify::checkpoint_master_fp(&file)
+            .into_iter()
+            .collect();
+        let verified = verify_file_with(file.clone(), &master_fp, &signer)?;
         Ok((file, verified, self.warnings, self.tasks))
     }
 
@@ -266,6 +279,13 @@ impl<'a> Tx<'a> {
         self.access()
             .key(node)
             .cloned()
+            .ok_or_else(|| Error::access_denied(&path))
+    }
+
+    fn proof(&mut self, node: Id) -> Result<keyring::PathProof> {
+        let path = node.hex();
+        self.access()
+            .proof(node)
             .ok_or_else(|| Error::access_denied(&path))
     }
 
@@ -326,7 +346,7 @@ impl<'a> Tx<'a> {
             return Err(Error::usage(format!("{parent_path} is not a folder")));
         }
         let target = keyring::join(&parent_path, name);
-        if self.access().resolve(&target).is_some() {
+        if self.access().exists(&target) {
             return Err(
                 Error::new(Code::AlreadyExists, format!("already exists: {target}"))
                     .with("path", target),
@@ -344,11 +364,13 @@ impl<'a> Tx<'a> {
                 not_after,
             },
         };
+        let sealed_name = keyring::seal_name(vault, id, &nk, name);
         let node = Node {
             id,
             parent: Some(parent),
             wrapped_key: Some(keyring::seal_node_key(vault, id, &pk, &nk)),
-            name: keyring::seal_name(vault, id, &nk, name),
+            name: sealed_name.sealed,
+            name_commit: sealed_name.commit,
             content: keyring::seal_content(vault, id, &nk, &c),
         };
         self.push(Op::CreateNode { node })?;
@@ -414,15 +436,18 @@ impl<'a> Tx<'a> {
     }
 
     /// Re-wraps all grants in a subtree after its paths changed.
-    fn rewrapped_grants(&mut self, sub: &[Id], paths: &BTreeMap<Id, String>) -> Result<Vec<Grant>> {
+    fn rewrapped_grants(
+        &mut self,
+        sub: &[Id],
+        proofs: &BTreeMap<Id, keyring::PathProof>,
+    ) -> Result<Vec<Grant>> {
         let grants: Vec<Grant> = self.state.grants_on(sub).into_iter().cloned().collect();
         let mut out = Vec::new();
         for g in grants {
+            let Some(proof) = proofs.get(&g.node).cloned() else {
+                continue;
+            };
             let nk = self.key(g.node)?;
-            let path = paths
-                .get(&g.node)
-                .cloned()
-                .unwrap_or_else(|| self.path_of(g.node));
             out.push(keyring::make_grant(
                 &self.state,
                 g.id,
@@ -430,7 +455,7 @@ impl<'a> Tx<'a> {
                 g.to,
                 g.right,
                 &nk,
-                &path,
+                &proof,
             )?);
         }
         Ok(out)
@@ -454,6 +479,12 @@ impl<'a> Tx<'a> {
             }
             None => dst,
         };
+        if self.access().exists(&dst) {
+            return Err(Error::new(
+                Code::AlreadyExists,
+                format!("already exists: {dst}"),
+            ));
+        }
         let (parent, name) = split_parent(&dst)?;
         validate_name(&name)?;
         let pid = self.resolve(&parent)?;
@@ -461,20 +492,46 @@ impl<'a> Tx<'a> {
             return Err(Error::usage(format!("{parent} is not a folder")));
         }
         let old_path = self.path_of(id);
-        let sub = self.state.subtree(id);
-        let mut paths = BTreeMap::new();
-        for n in &sub {
-            let p = self.path_of(*n);
-            paths.insert(*n, format!("{}{}", dst, &p[old_path.len()..]));
-        }
-        let grants = self.rewrapped_grants(&sub, &paths)?;
+        let old = self.proof(id)?;
         let nk = self.key(id)?;
+        // The node's proven path at its destination; the subtree keeps its salts below it.
+        let moved = self.proof(pid)?.child(&name, keyring::name_salt(&nk));
+        let sub = self.state.subtree(id);
+        // New proofs for the nodes that carry grants: the moved node's new location followed by
+        // the unchanged levels below it. Other nodes need none, so a node in the subtree this
+        // author cannot read does not block the move.
+        let granted: BTreeSet<Id> = self.state.grants_on(&sub).iter().map(|g| g.node).collect();
+        let mut proofs = BTreeMap::new();
+        for n in granted {
+            let Some(p) = self.access().proof(n) else {
+                // A grant on a node this author cannot read (e.g. one whose name commitment
+                // does not match) cannot be re-issued; its holder will see it as unproven.
+                let what = self.path_of(n);
+                self.tasks.push(format!(
+                    "re-issue the grants on {what} (node {}) after the move – this author cannot read it",
+                    n.hex()
+                ));
+                continue;
+            };
+            let depth = old.salts.len();
+            let comps = keyring::components(&p.path);
+            if p.salts.len() < depth || comps.len() != p.salts.len() {
+                return Err(Error::access_denied(&p.path));
+            }
+            let mut np = moved.clone();
+            for (c, salt) in comps[depth..].iter().zip(&p.salts[depth..]) {
+                np = np.child(c, *salt);
+            }
+            proofs.insert(n, np);
+        }
+        let grants = self.rewrapped_grants(&sub, &proofs)?;
         let vault = self.vault();
         let sealed_name = keyring::seal_name(vault, id, &nk, &name);
         if Some(pid) == self.state.nodes[&id].parent {
             self.push(Op::RenameNode {
                 id,
-                name: sealed_name,
+                name: sealed_name.sealed,
+                name_commit: sealed_name.commit,
                 grants,
             })
         } else {
@@ -484,7 +541,8 @@ impl<'a> Tx<'a> {
                 id,
                 parent: pid,
                 wrapped_key,
-                name: sealed_name,
+                name: sealed_name.sealed,
+                name_commit: sealed_name.commit,
                 grants,
             })?;
             self.warnings.push(format!(
@@ -531,18 +589,44 @@ impl<'a> Tx<'a> {
                     Some(keyring::seal_node_key(vault, *n, pk, &nk))
                 }
             };
+            let name = keyring::seal_name(vault, *n, &nk, &v.name);
             nodes.push(RekeyedNode {
                 id: *n,
                 wrapped_key,
-                name: keyring::seal_name(vault, *n, &nk, &v.name),
+                name: name.sealed,
+                name_commit: name.commit,
                 content: keyring::seal_content(vault, *n, &nk, &content),
             });
             new_keys.insert(*n, nk);
         }
+        // New node keys mean new name salts for the whole subtree; the levels above keep theirs.
+        let top = acc
+            .proof(node)
+            .ok_or_else(|| Error::access_denied(acc.path(node).unwrap_or("?")))?;
+        let above = top.salts.len().saturating_sub(1);
         let old: Vec<Grant> = self.state.grants_on(&sub).into_iter().cloned().collect();
         let mut grants = Vec::new();
         for g in old {
-            let path = acc.path(g.node).unwrap_or("?").to_string();
+            let p = acc
+                .proof(g.node)
+                .ok_or_else(|| Error::access_denied(&g.node.hex()))?;
+            let mut salts = p.salts[..above].to_vec();
+            if node != self.state.root {
+                let mut chain: Vec<Id> = self
+                    .state
+                    .ancestors(g.node)
+                    .into_iter()
+                    .take_while(|x| *x != node)
+                    .collect();
+                chain.push(node);
+                chain.reverse();
+                salts.extend(chain.iter().map(|x| keyring::name_salt(&new_keys[x])));
+            } else {
+                let mut chain = self.state.ancestors(g.node);
+                chain.pop(); // the root has no path component
+                chain.reverse();
+                salts.extend(chain.iter().map(|x| keyring::name_salt(&new_keys[x])));
+            }
             grants.push(keyring::make_grant(
                 &self.state,
                 g.id,
@@ -550,7 +634,10 @@ impl<'a> Tx<'a> {
                 g.to,
                 g.right,
                 &new_keys[&g.node],
-                &path,
+                &keyring::PathProof {
+                    path: p.path,
+                    salts,
+                },
             )?);
         }
         self.push(Op::Rekey {
@@ -625,7 +712,7 @@ impl<'a> Tx<'a> {
 
     pub fn grant(&mut self, to: Principal, right: Right, path: &str) -> Result<()> {
         let node = self.resolve(path)?;
-        let path = self.path_of(node);
+        let proof = self.proof(node)?;
         if let Some(existing) = self
             .state
             .grants
@@ -640,7 +727,7 @@ impl<'a> Tx<'a> {
             self.push(Op::Revoke { grant: existing.id })?;
         }
         let nk = self.key(node)?;
-        let g = keyring::make_grant(&self.state, Id::random(), node, to, right, &nk, &path)?;
+        let g = keyring::make_grant(&self.state, Id::random(), node, to, right, &nk, &proof)?;
         self.push(Op::Grant { grant: g })
     }
 
@@ -803,7 +890,14 @@ impl<'a> Tx<'a> {
             .filter(|g| g.to == Principal::User(user))
             .cloned()
             .collect();
-        let old_groups = self.state.user_groups(user);
+        // A disabled user comes back with nothing: their old grants are not re-issued.
+        let was_disabled = !self.state.active(user);
+        let old_grants: Vec<Grant> = if was_disabled { Vec::new() } else { old_grants };
+        let old_groups = if was_disabled {
+            Vec::new()
+        } else {
+            self.state.user_groups(user)
+        };
         let old_group_admin: Vec<(Id, bool)> = self
             .state
             .sysrights
@@ -820,6 +914,22 @@ impl<'a> Tx<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        let old_sysrights: Vec<(SysRight, bool)> = self
+            .state
+            .sysrights
+            .get(&user)
+            .map(|m| {
+                m.iter()
+                    .filter(|(r, _)| !matches!(r, SysRight::GroupAdmin(_)))
+                    .map(|(r, d)| (*r, *d))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let old_sysrights = if was_disabled {
+            Vec::new()
+        } else {
+            old_sysrights
+        };
         self.push(Op::ReplaceIdentity {
             user,
             kind: req.kind,
@@ -828,6 +938,21 @@ impl<'a> Tx<'a> {
             credential: req.credential.clone(),
             proof: req.proof.clone(),
         })?;
+        // System rights are removed with the old keys; re-grant what the author may delegate.
+        for (right, delegate) in old_sysrights {
+            if self.state.sys_right(self.me, right) == Some(true) {
+                self.push(Op::GrantSystemRight {
+                    user,
+                    right,
+                    delegate,
+                })?;
+            } else {
+                self.tasks.push(format!(
+                    "grant the system right `{}` to {old_name} again",
+                    crate::app::sysright_name(&self.state, right)
+                ));
+            }
+        }
         for g in old_groups {
             if self
                 .state
@@ -865,6 +990,7 @@ impl<'a> Tx<'a> {
             let path = self.path_of(g.node);
             if can && self.access().key(g.node).is_some() {
                 let nk = self.key(g.node)?;
+                let proof = self.proof(g.node)?;
                 let ng = keyring::make_grant(
                     &self.state,
                     Id::random(),
@@ -872,7 +998,7 @@ impl<'a> Tx<'a> {
                     g.to,
                     g.right,
                     &nk,
-                    &path,
+                    &proof,
                 )?;
                 self.push(Op::Grant { grant: ng })?;
             } else {
@@ -906,7 +1032,7 @@ impl<'a> Tx<'a> {
                 Principal::User(user),
                 Right::Admin,
                 &nk,
-                "/",
+                &keyring::PathProof::root(),
             )?;
             // Replace a weaker grant on the root, if any.
             if let Some(old) = self
@@ -1014,9 +1140,9 @@ impl<'a> Tx<'a> {
         let mut nodes = BTreeSet::new();
         for x in old {
             let nk = self.key(x.node)?;
-            let path = self.path_of(x.node);
+            let proof = self.proof(x.node)?;
             grants.push(keyring::make_grant(
-                &tmp, x.id, x.node, x.to, x.right, &nk, &path,
+                &tmp, x.id, x.node, x.to, x.right, &nk, &proof,
             )?);
             nodes.insert(x.node);
         }

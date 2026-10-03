@@ -52,14 +52,52 @@ pub fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Overwrites every file with zeros and deletes the directory.
+/// Whether `dir` is a real directory (not a symlink) that only the current user can use. The
+/// temporary directory is shared with other users: anything else there may be a trap.
+fn is_own_private_dir(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Opens a regular file for writing without following a symlink in its last component.
+fn open_no_follow(p: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(p)
+}
+
+/// Overwrites every file with zeros and deletes the directory. Only a private directory of the
+/// current user is touched, and only regular files in it are overwritten (never symlinks).
 pub fn remove_dir(dir: &Path) {
+    if !is_own_private_dir(dir) {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if let Ok(meta) = std::fs::metadata(&p)
-                && meta.is_file()
-                && let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&p)
+            if let Ok(meta) = std::fs::symlink_metadata(&p)
+                && meta.file_type().is_file()
+                && let Ok(mut f) = open_no_follow(&p)
+                && f.metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() == meta.len())
             {
                 let zeros = vec![0u8; meta.len() as usize];
                 let _ = f.write_all(&zeros);

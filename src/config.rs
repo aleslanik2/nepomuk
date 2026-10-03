@@ -180,9 +180,17 @@ pub fn resolve_path(prefix: Option<&str>, path: &str) -> String {
 pub struct VaultMemory {
     /// Pinned master fingerprint.
     pub pin: Option<String>,
+    /// Masters pinned earlier, replaced after a master transfer; until the new master compacts
+    /// the vault, its checkpoint is still signed by one of them.
+    #[serde(default)]
+    pub former: Vec<String>,
     /// Highest seen `seq` and its head hash (rollback / fork detection, §7.2).
     pub seq: Option<u64>,
     pub head: Option<String>,
+    /// Hash of the checkpoint entry of the version seen last (it covers the signed body and the
+    /// signature, so nobody can produce another checkpoint with the same hash).
+    #[serde(default)]
+    pub checkpoint: Option<String>,
     /// Last time the remote was fetched successfully (unix seconds).
     pub fetched_at: Option<i64>,
 }
@@ -194,11 +202,40 @@ fn memory_path(vault: Id) -> PathBuf {
 }
 
 impl VaultMemory {
-    pub fn load(vault: Id) -> VaultMemory {
-        std::fs::read(memory_path(vault))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    /// Loads the memory of a vault; a missing file is an empty memory, but an unreadable or
+    /// corrupt one is an error, so that rollback protection and the pin never fail open.
+    pub fn load(vault: Id) -> Result<VaultMemory> {
+        let path = memory_path(vault);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(VaultMemory::default());
+            }
+            Err(e) => {
+                return Err(Error::general(format!(
+                    "cannot read the local state {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        serde_json::from_slice(&bytes).map_err(|e| {
+            Error::general(format!(
+                "the local state {} is corrupt ({e}); it holds the pinned master and rollback protection, so check it before removing it",
+                path.display()
+            ))
+        })
+    }
+
+    /// Pins a new master fingerprint, remembering the previous one.
+    pub fn repin(&mut self, fp: &str) -> Option<String> {
+        let previous = self.pin.replace(fp.to_string());
+        if let Some(p) = &previous
+            && p != fp
+            && !self.former.contains(p)
+        {
+            self.former.push(p.clone());
+        }
+        previous
     }
 
     pub fn save(&self, vault: Id) -> Result<()> {

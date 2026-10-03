@@ -13,12 +13,12 @@ use zeroize::Zeroizing;
 use crate::config::{self, ProjectConfig, UserConfig, VaultMemory};
 use crate::crypto;
 use crate::error::{Code, Error, Result};
-use crate::format::{CheckpointBody, VaultFile, from_cbor, to_cbor};
+use crate::format::{VaultFile, from_cbor, to_cbor};
 use crate::identity::{self, IdentityFile, Request, Unlocked};
 use crate::model::*;
 use crate::store::{self, Loaded, Location, SaveError};
 use crate::tx::{self, Tx};
-use crate::verify::{Verified, verify_file};
+use crate::verify::{Verified, verify_file_with};
 
 const MAX_PUSH_ATTEMPTS: usize = 5;
 
@@ -464,41 +464,55 @@ pub struct Opened {
 fn pin_for(
     ctx: &Ctx,
     vault: crate::model::Id,
-    mem: &mut VaultMemory,
+    mem: &VaultMemory,
     file: &VaultFile,
 ) -> Result<String> {
+    let project_fp = ctx.project.as_ref().and_then(|p| p.root_fp.clone());
     if let Ok(fp) = std::env::var("NEPOMUK_ROOT_FP")
         && !fp.is_empty()
     {
+        // The environment is meant for CI, which has no local pin. On a machine that has
+        // one, a different value (e.g. from a project's .envrc) must not silently replace it.
+        if let Some(p) = &mem.pin
+            && *p != fp
+        {
+            return Err(Error::new(
+                Code::UntrustedRoot,
+                "NEPOMUK_ROOT_FP differs from the master fingerprint pinned on this machine",
+            )
+            .with("pinned", p.clone())
+            .with("environment", fp));
+        }
         return Ok(fp);
     }
     if let Some(p) = &mem.pin {
+        if let Some(fp) = project_fp
+            && fp != *p
+        {
+            ctx.warn(format!(
+                ".nepomuk.toml names the master {fp}, but {p} is pinned on this machine; the pin is used"
+            ));
+        }
         return Ok(p.clone());
     }
-    if let Some(fp) = ctx.project.as_ref().and_then(|p| p.root_fp.clone()) {
-        mem.pin = Some(fp.clone());
-        mem.save(vault)?;
-        ctx.warn(format!(
-            "pinned the master fingerprint {fp} from .nepomuk.toml"
-        ));
-        return Ok(fp);
-    }
+    // A fingerprint from .nepomuk.toml is never pinned automatically: whoever controls the
+    // project repository could ship a vault of their own together with a matching fingerprint.
     let found = claimed_master_fp(file).unwrap_or_default();
-    Err(Error::new(
+    let mut err = Error::new(
         Code::UntrustedRoot,
         "no pinned master fingerprint for this vault; verify it out of band and run `nepomuk trust <fingerprint>`",
     )
     .with("vault_id", vault.hex())
-    .with("claimed_fingerprint", found))
+    .with("claimed_fingerprint", found);
+    if let Some(fp) = project_fp {
+        err = err.with("project_fingerprint", fp);
+    }
+    Err(err)
 }
 
 /// The master fingerprint the file claims (unverified; for display only).
 pub fn claimed_master_fp(file: &VaultFile) -> Option<String> {
-    let cp: CheckpointBody = from_cbor(&file.entries[0].envelope.body).ok()?;
-    cp.state
-        .users
-        .get(&cp.state.master)
-        .map(crate::verify::user_fp)
+    crate::verify::checkpoint_master_fp(file)
 }
 
 /// Rollback and fork detection against the local memory (§7.2).
@@ -536,9 +550,15 @@ fn check_submodule_pin(loc: &Location, v: &Verified) -> Result<()> {
     let Some(bytes) = loc.load_pinned() else {
         return Ok(());
     };
-    let Ok(pinned) = VaultFile::parse(&bytes) else {
-        return Ok(());
-    };
+    let pinned = VaultFile::parse(&bytes).map_err(|e| {
+        Error::new(
+            Code::StaleBelowPin,
+            format!(
+                "the vault pinned by the submodule cannot be read: {}",
+                e.message
+            ),
+        )
+    })?;
     if pinned.vault_id != v.file.vault_id {
         return Err(Error::new(
             Code::StaleBelowPin,
@@ -577,10 +597,11 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     let loaded = loc.load(fetch && !ctx.opts.offline)?;
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
-    let mut mem = VaultMemory::load(vault);
-    let pin = pin_for(ctx, vault, &mut mem, &file)?;
-    let v = verify_file(file, &pin)?;
+    let mut mem = VaultMemory::load(vault)?;
+    let pin = pin_for(ctx, vault, &mem, &file)?;
+    let v = verify_file_with(file, &pin, &mem.former)?;
     check_memory(&v, &mem)?;
+    check_former_signer(&v, &mut mem, &pin)?;
     if ctx.ci() {
         check_submodule_pin(&loc, &v)?;
     }
@@ -601,10 +622,51 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     Ok(Opened { loc, loaded, v })
 }
 
+/// A checkpoint signed by a former master is accepted only as the continuation of the version
+/// seen before the transfer – never as a fresh history, which a former master (who may have
+/// left or been compromised) could otherwise forge. Once the pinned master has signed the
+/// checkpoint (after `compact`), former masters are forgotten.
+pub fn check_former_signer(v: &Verified, mem: &mut VaultMemory, pin: &str) -> Result<()> {
+    let signer = crate::verify::checkpoint_master_fp(&v.file).unwrap_or_default();
+    if signer == pin {
+        mem.former.clear();
+        return Ok(());
+    }
+    if contains_seen(v, mem) {
+        return Ok(());
+    }
+    Err(Error::new(
+        Code::UntrustedRoot,
+        "the vault is signed by a former master and does not continue the version seen before; ask the current master to run `nepomuk compact`",
+    )
+    .with("signer", signer))
+}
+
+/// Whether the file continues the history seen on this machine: its checkpoint entry is the one
+/// seen before, or the remembered head is one of its commits (a commit's hash chains back to the
+/// exact checkpoint entry). A matching `folded_head` alone proves nothing, since whoever signs a
+/// checkpoint can claim any folded head.
+fn contains_seen(v: &Verified, mem: &VaultMemory) -> bool {
+    if mem
+        .checkpoint
+        .as_deref()
+        .is_some_and(|c| hex::encode(v.file.entries[0].hash()) == c)
+    {
+        return true;
+    }
+    let (Some(seq), Some(head)) = (mem.seq, mem.head.as_deref()) else {
+        return false;
+    };
+    v.commits
+        .iter()
+        .any(|c| c.seq == seq && hex::encode(c.hash) == head)
+}
+
 fn remember(mem: &mut VaultMemory, v: &Verified) {
     if mem.seq.is_none_or(|s| v.seq >= s) {
         mem.seq = Some(v.seq);
         mem.head = Some(hex::encode(v.head));
+        mem.checkpoint = Some(hex::encode(v.file.entries[0].hash()));
     }
 }
 
@@ -695,25 +757,46 @@ pub enum Intent {
     MasterTransfer {
         user: String,
     },
+    /// Folders and secrets copied from another vault (`nepomuk migrate`), in one commit.
+    Import {
+        entries: Vec<ImportEntry>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportEntry {
+    pub path: String,
+    pub content: Content,
+    pub not_after: Option<i64>,
+}
+
+fn zeroize_content(content: &mut Content) {
+    use zeroize::Zeroize;
+    match content {
+        Content::Text { value } => value.zeroize(),
+        Content::Binary { data, .. } => data.zeroize(),
+        Content::Record { fields, .. } => {
+            for f in fields.values_mut() {
+                match f {
+                    Field::Text { value } => value.zeroize(),
+                    Field::Binary { data, .. } => data.zeroize(),
+                }
+            }
+        }
+        Content::Folder => {}
+    }
 }
 
 impl Drop for Intent {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
-        if let Intent::Put { content, .. } = self {
-            match content {
-                Content::Text { value } => value.zeroize(),
-                Content::Binary { data, .. } => data.zeroize(),
-                Content::Record { fields, .. } => {
-                    for f in fields.values_mut() {
-                        match f {
-                            Field::Text { value } => value.zeroize(),
-                            Field::Binary { data, .. } => data.zeroize(),
-                        }
-                    }
+        match self {
+            Intent::Put { content, .. } => zeroize_content(content),
+            Intent::Import { entries } => {
+                for e in entries {
+                    zeroize_content(&mut e.content);
                 }
-                Content::Folder => {}
             }
+            _ => {}
         }
     }
 }
@@ -763,6 +846,32 @@ impl Intent {
 
     fn apply(&self, tx: &mut Tx) -> Result<Value> {
         Ok(match self {
+            Intent::Import { entries } => {
+                let (mut folders, mut secrets) = (0, 0);
+                for e in entries {
+                    if matches!(e.content, Content::Folder) {
+                        if e.path != "/" {
+                            tx.mkdir(&e.path, true)?;
+                        }
+                        folders += 1;
+                    } else {
+                        let (parent, _) = tx::split_parent(&e.path)?;
+                        if parent != "/" {
+                            tx.mkdir(&parent, true)?;
+                        }
+                        if tx.access().exists(&tx::normalize_path(&e.path)?) {
+                            return Err(Error::new(
+                                Code::AlreadyExists,
+                                format!("already exists in this vault: {}", e.path),
+                            )
+                            .with("path", e.path.clone()));
+                        }
+                        tx.put(&e.path, e.content.clone(), e.not_after)?;
+                        secrets += 1;
+                    }
+                }
+                json!({ "folders": folders, "secrets": secrets })
+            }
             Intent::Mkdir { path, parents } => {
                 tx.mkdir(path, *parents)?;
                 json!({ "path": tx::normalize_path(path)? })
@@ -925,10 +1034,10 @@ pub fn execute(
         let msg = store::commit_message(verified.seq, &me_name, ops);
         match opened.loc.save(&opened.loaded, &file.serialize(), &msg) {
             Ok(()) => {
-                let mut mem = VaultMemory::load(verified.file.vault_id);
+                let mut mem = VaultMemory::load(verified.file.vault_id)?;
                 if verified.master_fp != opened.v.master_fp && mem.pin.is_some() {
                     // This client signed the transfer itself.
-                    mem.pin = Some(verified.master_fp.clone());
+                    mem.repin(&verified.master_fp);
                 }
                 remember(&mut mem, &verified);
                 mem.save(verified.file.vault_id)?;
@@ -1108,6 +1217,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::RotationDone { path } => format!("rotation done {path}"),
         Intent::Passwd { .. } => "identity passwd".into(),
         Intent::MasterTransfer { user } => format!("master transfer {user}"),
+        Intent::Import { entries } => format!("import of {} items", entries.len()),
     }
 }
 
@@ -1128,7 +1238,7 @@ pub fn status(ctx: &Ctx) -> Result<Value> {
     } else {
         "up-to-date"
     };
-    let mem = VaultMemory::load(vault);
+    let mem = VaultMemory::load(vault)?;
     let mut out = json!({
         "state": state,
         "seq": opened.v.seq,
@@ -1170,10 +1280,11 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
         }
     };
     let fp = master.fingerprint();
-    let mut mem = VaultMemory::load(file.vault_id);
+    let mut mem = VaultMemory::load(file.vault_id)?;
     mem.pin = Some(fp.clone());
     mem.seq = Some(0);
     mem.head = Some(hex::encode(file.head_hash()));
+    mem.checkpoint = Some(hex::encode(file.head_hash()));
     mem.save(file.vault_id)?;
     Ok(json!({
         "vault": loc.path.display().to_string(),
@@ -1192,10 +1303,37 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
     let loaded = loc.load(!ctx.opts.offline)?;
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
-    // Verify before pinning: the fingerprint must be the vault's current master.
-    let v = verify_file(file, fp)?;
-    let mut mem = VaultMemory::load(vault);
+    // Verify before pinning: the fingerprint must be the vault's current master, and the
+    // checkpoint must be signed by it or by a master pinned here before.
+    let mut mem = VaultMemory::load(vault)?;
+    let mut trusted = mem.former.clone();
+    trusted.extend(mem.pin.clone());
+    let signer = claimed_master_fp(&file).unwrap_or_default();
+    let v = verify_file_with(file, fp, &trusted).map_err(|e| {
+        if e.code == Code::UntrustedRoot && signer != fp && !trusted.contains(&signer) {
+            e.with(
+                "hint",
+                "the vault was handed over to this master but not compacted since; ask the master to run `nepomuk compact`, or pin the former master first",
+            )
+        } else {
+            e
+        }
+    })?;
+    if signer != fp && !contains_seen(&v, &mem) {
+        return Err(Error::new(
+            Code::UntrustedRoot,
+            "the vault is signed by a former master and does not continue the version seen before; ask the current master to run `nepomuk compact`",
+        )
+        .with("signer", signer));
+    }
+    // Keep the former master only while the vault still needs it (its checkpoint is signed by
+    // it); re-pinning for any other reason must not leave the old key trusted.
     let previous = mem.pin.replace(fp.to_string());
+    if signer == fp {
+        mem.former.clear();
+    } else if previous.as_deref() == Some(signer.as_str()) && !mem.former.contains(&signer) {
+        mem.former.push(signer.clone());
+    }
     remember(&mut mem, &v);
     mem.save(vault)?;
     Ok(json!({ "vault_id": vault.hex(), "pinned": fp, "previous": previous, "seq": v.seq }))

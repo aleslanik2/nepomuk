@@ -126,7 +126,7 @@ Every user has a nepomuk identity: a hybrid key pair for encryption (ML-KEM-1024
 - **Blocklist**: a built-in list of the most common breached passwords + context-specific words (the email and its parts, the name, "nepomuk", the vault name). Optional check against Have I Been Pwned (k-anonymity), off by default.
 - Passwords are never truncated; no hints or security questions; pasting from password managers is allowed.
 - No mandatory periodic change; a change can be forced with a flag on suspected compromise.
-- **Deviation from NIST**: rate limiting of attempts is impossible because the file can be attacked offline. It is replaced by an expensive Argon2id (parameters stored per user, automatically strengthened on next login) and by a passphrase generator `nepomuk passgen` (6 words, ~77 bits).
+- **Deviation from NIST**: rate limiting of attempts is impossible because the file can be attacked offline. It is replaced by an expensive Argon2id (parameters stored per user, automatically strengthened on next login; every client rejects parameters below m = 64 MiB, t = 2 or above m = 2 GiB, t = 64, p = 16, and salts other than 16 bytes) and by a passphrase generator `nepomuk passgen` (6 words, ~77 bits).
 - Password strength estimation (zxcvbn) only as a warning, not a block.
 
 ### 4.2 PQ SSH identity
@@ -221,10 +221,12 @@ Alice and the CI identity only hold a grant on `signing`; from its key they deri
 **Grants**: a grant = the node key wrapped with the hybrid KEM for a recipient (user or group). The wrapped grant payload:
 
 ```
-{ node_key, path: "/projects/eshop-android/signing", right: "read" }
+{ node_key, path: "/projects/eshop-android/signing", salts: [s1, s2, s3], right: "read" }
 ```
 
-The path is stored encrypted inside the grant so that a user with a right only on a deep node knows where it lives without being able to decrypt the names of the parent folders. When an ancestor is renamed, grants in the subtree are re-wrapped.
+The path is stored encrypted inside the grant so that a user with a right only on a deep node knows where it lives without being able to decrypt the names of the parent folders. When an ancestor is renamed, moved or rekeyed, grants in the subtree are re-wrapped.
+
+**Name commitments**: the path in a grant is chosen by whoever issues it, so it is proven against the tree. Every node carries a public `name_commit = SHA3-256("nepomuk/name" || vault_id || node_id || name_salt || name)` (fields length-prefixed), where `name_salt = HKDF(NK, "name-salt")`. The grant payload carries the salt of every path component; the recipient accepts the grant only if the path has exactly one component per level between the root and the node (public parent links) and each component matches the commitment of the node at that level. Commitments are set only by those allowed to create, rename or move that node, so nobody can claim a location for a node other than its real one. A grant whose path does not prove is ignored, and a path shared by two visible nodes is reported as ambiguous instead of being resolved.
 
 **Groups**: a grant for a group is wrapped with the group's public KEM key; a member first decrypts the group key (wrapped for them), then the grant.
 
@@ -246,15 +248,20 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 ```
 
 - **Serialization**: deterministic CBOR (RFC 8949, core deterministic encoding). The stored bytes are signed, not a re-serialized structure.
-- **Chain**: `prev_hash` = SHA3-256 of the previous commit or checkpoint. The vault head = the last entry.
+- **Chain**: `prev_hash` = SHA3-256("nepomuk/entry/v2" || body || signature, length-prefixed) of the previous commit or checkpoint – the signed bytes and the signature, not their envelope, so re-encoding an entry cannot change the chain. Envelopes must be canonical CBOR; anything else is rejected. The vault head = the last entry.
+- **Format version 2** (this document). Version 1 files are not readable; move their content with `scripts/migrate-v1.sh`.
 - **Append-only**: a new commit is only appended at the end, so git stores small deltas and the repository history does not grow by the whole file.
 - **Size estimate**: a user's public keys ≈ 3.6 KB, a grant ≈ 1.7 KB, a commit signature ≈ 3.4 KB. Single-digit MB for hundreds of users and secrets.
 
 ### 7.1 Root of trust
 
-- Master key fingerprint = SHA3-256 of its public keys, displayed as `npk1…` (bech32).
-- The client knows it from a local pin (`nepomuk trust`, automatic on `init`), from the `NEPOMUK_ROOT_FP` variable (CI), or as a default from `.nepomuk.toml`, which it pins on first use and rejects any later change.
+- Master key fingerprint = SHA3-256 of its length-prefixed public keys, displayed as `npk1…` (bech32).
+- The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override.
+- `root_fp` in `.nepomuk.toml` is only a hint: it is shown next to the fingerprint the file claims, but never pinned automatically, because whoever controls the project repository could ship a vault of their own with a matching fingerprint. A pin that differs from it produces a warning.
 - Without a pin nepomuk does not open the file.
+- **The checkpoint is the anchor**: it must be signed by the pinned master, or, until the next `compact`, by a master pinned earlier on this machine and replaced after a `TransferMaster` – and then only if the file contains, as a commit, the head this machine saw before (a former master can sign a checkpoint of any content). Former masters are forgotten once a checkpoint signed by the pinned master is seen. A log that ends with a transfer to the pinned master proves nothing on its own – a forged checkpoint could contain it.
+- After a master transfer the new master should run `compact`; until then, clients that never pinned the former master cannot open the vault.
+- The local state (pins, `seq`, head) fails closed: an unreadable or corrupt state file is an error.
 
 ### 7.2 Rollback protection
 
@@ -265,7 +272,7 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 ### 7.3 Compact
 
 - `nepomuk compact` (master only) folds the log into a new checkpoint with the same `seq` as the last commit.
-- A client accepts a checkpoint with `seq` ≥ the remembered one if it is signed by the master.
+- A client accepts a checkpoint with `seq` ≥ the remembered one if it is signed by the pinned master.
 - Compact does not erase git history; old versions of the file remain in the repository.
 
 ### 7.4 Verification cache
@@ -278,10 +285,10 @@ Each commit carries one or more operations applied atomically. The client verifi
 
 | Operation | Required right of the author |
 | --- | --- |
-| `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users` |
+| `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all grants, memberships and system rights of the user (re-granted only by holders of the rights, with `+delegate` for system rights), so re-enabling a disabled user grants nothing |
 | `UpdateOwnCredential` (password change, Argon2id parameters) | the user themselves |
 | `CreateGroup` | master or `groups` |
-| `AddMember`, `RemoveMember` | master or `group-admin` of the group |
+| `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |
 | `CreateNode` | `write` on the parent |
 | `UpdateNode` (content) | `write` on the node |
 | `RenameNode`, `DeleteNode` | `write` on the parent |
@@ -394,7 +401,7 @@ History keeps all old versions of the vault and is not erased. That is why secre
 vault      = "secrets/vault.nepomuk"   # file in the submodule
 remote_ref = "origin/main"
 prefix     = "/projects/eshop-android" # relative paths
-root_fp    = "npk1…"                   # default only; the local pin takes precedence
+root_fp    = "npk1…"                   # hint only; pin it with `nepomuk trust` after checking it
 
 [exec.android-release]
 # see §11

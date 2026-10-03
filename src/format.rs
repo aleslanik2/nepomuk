@@ -7,7 +7,9 @@ use crate::error::{Error, Result};
 use crate::model::{Id, Op, State};
 
 pub const MAGIC: &[u8; 8] = b"NEPOMUK\0";
-pub const FORMAT_VERSION: u16 = 1;
+/// Version 2: entry hashes cover the signed body and the signature (not the envelope encoding),
+/// envelopes must be canonical, and nodes carry name commitments.
+pub const FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 8 + 2 + 8 + 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,8 +49,13 @@ pub struct RawEntry {
 }
 
 impl RawEntry {
+    /// Hash of the entry over exactly what is signed and the signature, so that re-encoding an
+    /// envelope cannot change the hash chain.
     pub fn hash(&self) -> [u8; 32] {
-        crypto::sha3(&[b"nepomuk/entry", &self.bytes])
+        crypto::sha3(&[
+            b"nepomuk/entry/v2",
+            &crypto::framed(&[&self.envelope.body, &self.envelope.sig]),
+        ])
     }
 
     pub fn from_envelope(envelope: Envelope) -> Self {
@@ -83,9 +90,13 @@ impl VaultFile {
         }
         let version = u16::from_be_bytes([data[8], data[9]]);
         if version != FORMAT_VERSION {
-            return Err(Error::format(format!(
-                "unsupported format version {version}"
-            )));
+            return Err(Error::format(if version < FORMAT_VERSION {
+                format!(
+                    "unsupported format version {version}; copy its content into a new vault with `nepomuk migrate` and the nepomuk release that created it"
+                )
+            } else {
+                format!("unsupported format version {version}; upgrade nepomuk")
+            }));
         }
         let suite = &data[10..18];
         if suite
@@ -112,6 +123,9 @@ impl VaultFile {
             let bytes = data[pos..pos + len].to_vec();
             pos += len;
             let envelope: Envelope = from_cbor(&bytes)?;
+            if to_cbor(&envelope) != bytes {
+                return Err(Error::format("non-canonical entry encoding"));
+            }
             entries.push(RawEntry { bytes, envelope });
         }
         if entries.is_empty() {

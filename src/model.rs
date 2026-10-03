@@ -153,6 +153,9 @@ pub struct Node {
     pub wrapped_key: Option<Sealed>,
     /// Encrypted name (`blob_key`).
     pub name: Sealed,
+    /// Commitment to the name, `SHA3(vault, node, name_salt, name)`: lets the holder of a grant
+    /// deep in the tree check the path it was given without the ancestors' keys (§6).
+    pub name_commit: [u8; 32],
     /// Encrypted, padded content (`blob_key`).
     pub content: Sealed,
 }
@@ -198,6 +201,7 @@ pub struct RekeyedNode {
     pub id: Id,
     pub wrapped_key: Option<Sealed>,
     pub name: Sealed,
+    pub name_commit: [u8; 32],
     pub content: Sealed,
 }
 
@@ -247,6 +251,7 @@ pub enum Op {
     RenameNode {
         id: Id,
         name: Sealed,
+        name_commit: [u8; 32],
         grants: Vec<Grant>,
     },
     MoveNode {
@@ -254,6 +259,7 @@ pub enum Op {
         parent: Id,
         wrapped_key: Sealed,
         name: Sealed,
+        name_commit: [u8; 32],
         grants: Vec<Grant>,
     },
     DeleteNode {
@@ -325,6 +331,9 @@ pub struct GrantPayload {
     #[serde(with = "serde_bytes")]
     pub node_key: Vec<u8>,
     pub path: String,
+    /// Name salts of the nodes on the path below the root (outermost first, ending with the
+    /// granted node): with the public name commitments they prove `path` (§6).
+    pub salts: Vec<serde_bytes::ByteBuf>,
     pub right: Right,
 }
 

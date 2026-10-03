@@ -12,6 +12,7 @@ pub mod format;
 pub mod identity;
 pub mod keyring;
 pub mod memory;
+pub mod migrate;
 pub mod model;
 pub mod password;
 pub mod queries;

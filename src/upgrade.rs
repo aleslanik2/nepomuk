@@ -359,8 +359,23 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
             "this nepomuk is part of the desktop app; upgrade the command line installation instead",
         ));
     }
-    let work = std::env::temp_dir().join(format!("nepomuk-upgrade-{}", std::process::id()));
-    std::fs::create_dir_all(&work)?;
+    // A fresh directory only this user can enter: the release key, the signed sums and the
+    // installer that is run must not be replaceable by other users of a shared temp dir.
+    let work = std::env::temp_dir().join(format!(
+        "nepomuk-upgrade-{}-{}",
+        std::process::id(),
+        crate::model::Id::random().hex()
+    ));
+    {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(&work)?;
+    }
     let result = (|| {
         let installer = if cfg!(windows) {
             "install.ps1"
