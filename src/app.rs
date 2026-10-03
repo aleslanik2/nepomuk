@@ -715,6 +715,17 @@ pub fn human_age(secs: i64) -> String {
 
 // ---------------------------------------------------------------- Write intents
 
+/// Public keys for `identity passwd` (§4.4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RotatedKeys {
+    pub kem: crypto::KemPublic,
+    pub sig: crypto::SigPublic,
+    #[serde(with = "serde_bytes")]
+    pub proof: Vec<u8>,
+    /// The new password over the current seed, used instead when the user is the master.
+    pub master_credential: Option<crypto::PasswordSealed>,
+}
+
 /// A write expressed as intent ("store X", "give Bob read") so that it can be replayed on top of
 /// a newer vault after a rejected push or during `sync` (§9.3).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -791,9 +802,17 @@ pub enum Intent {
     },
     Passwd {
         credential: crypto::PasswordSealed,
+        /// New keys (§4.4): the credential seals a new seed, so the old password (still in the
+        /// git history) no longer unlocks the identity. Public parts only; no secret is stored
+        /// in the intent.
+        #[serde(default)]
+        rotate: Option<RotatedKeys>,
     },
     MasterTransfer {
         user: String,
+        /// The former master keeps its grant on the root (§8.3).
+        #[serde(default)]
+        keep_access: bool,
     },
     /// Folders and secrets copied from another vault (`nepomuk migrate`), in one commit.
     Import {
@@ -1016,13 +1035,34 @@ impl Intent {
                 tx.clear_rotation(path)?;
                 json!({ "path": path })
             }
-            Intent::Passwd { credential } => {
-                tx.update_own_credential(credential.clone())?;
-                json!({ "updated": true })
-            }
-            Intent::MasterTransfer { user } => {
+            Intent::Passwd { credential, rotate } => match rotate {
+                Some(k) if !tx.state.is_master(tx.me) => {
+                    tx.rotate_own_keys(
+                        k.kem.clone(),
+                        k.sig.clone(),
+                        Some(credential.clone()),
+                        k.proof.clone(),
+                    )?;
+                    json!({ "updated": true, "rotated": true })
+                }
+                _ => {
+                    // Only the credential of the master changes: its keys are pinned everywhere.
+                    let cred = match rotate {
+                        Some(k) => k.master_credential.clone().ok_or_else(|| {
+                            Error::general("missing credential for the current keys")
+                        })?,
+                        None => credential.clone(),
+                    };
+                    tx.update_own_credential(cred)?;
+                    tx.warnings.push(
+                        "the master's keys are pinned everywhere and stay the same: whoever knows the old password and has the git history can still unlock it; if it leaked, transfer the master role to a new identity".into(),
+                    );
+                    json!({ "updated": true, "rotated": false })
+                }
+            },
+            Intent::MasterTransfer { user, keep_access } => {
                 let u = tx.user_named(user)?;
-                tx.transfer_master(u)?;
+                tx.transfer_master(u, *keep_access)?;
                 let fp = crate::verify::user_fp(&tx.state.users[&u]);
                 json!({ "user": user, "new_fingerprint": fp })
             }
@@ -1262,7 +1302,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::SysRevoke { user, right } => format!("sysrevoke {user} {right}"),
         Intent::RotationDone { path } => format!("rotation done {path}"),
         Intent::Passwd { .. } => "identity passwd".into(),
-        Intent::MasterTransfer { user } => format!("master transfer {user}"),
+        Intent::MasterTransfer { user, .. } => format!("master transfer {user}"),
         Intent::Import { entries } => format!("import of {} items", entries.len()),
     }
 }

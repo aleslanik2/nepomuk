@@ -498,6 +498,65 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             credential.check().map_err(|e| deny(e.message))?;
             u.credential = Some(credential.clone());
         }
+        Op::RotateOwnKeys {
+            kem,
+            sig,
+            credential,
+            proof,
+            grants,
+            memberships,
+        } => {
+            // The master's keys are what every client pins; they change by `TransferMaster`.
+            require(!s.is_master(author), "the master cannot rotate its keys")?;
+            let u = s.users.get(&author).ok_or_else(|| deny("unknown user"))?;
+            check_identity(&u.name, u.kind, kem, sig, credential.as_ref(), proof)?;
+            require(
+                !s.users.values().any(|o| o.kem == *kem || o.sig == *sig),
+                "these keys already belong to a user",
+            )?;
+            let me = Principal::User(author);
+            let mut seen = BTreeSet::new();
+            for g in grants {
+                let old = s
+                    .grants
+                    .get(&g.id)
+                    .ok_or_else(|| deny("re-wrapped grant does not exist"))?;
+                require(old.to == me, "only one's own grants can be re-wrapped")?;
+                require(old.same_meta(g), "re-wrapped grant changes its metadata")?;
+                require(seen.insert(g.id), "duplicate grant")?;
+            }
+            for gid in memberships.keys() {
+                require(
+                    s.groups
+                        .get(gid)
+                        .is_some_and(|g| g.members.contains_key(&author)),
+                    "not a member of the group",
+                )?;
+            }
+            // Everything wrapped for the old keys is replaced or dropped.
+            s.remove_grants_where(|g| g.to == me && !seen.contains(&g.id));
+            for g in grants {
+                s.grants.insert(g.id, g.clone());
+            }
+            for (gid, group) in s.groups.iter_mut() {
+                if !group.members.contains_key(&author) {
+                    continue;
+                }
+                match memberships.get(gid) {
+                    Some(w) => {
+                        group.members.insert(author, w.clone());
+                    }
+                    None => {
+                        group.members.remove(&author);
+                    }
+                }
+            }
+            let u = s.users.get_mut(&author).unwrap();
+            u.kem = kem.clone();
+            u.sig = sig.clone();
+            u.credential = credential.clone();
+            u.proof = proof.clone();
+        }
         Op::CreateGroup { group } => {
             require(
                 s.sys_right(author, SysRight::Groups).is_some(),
@@ -747,6 +806,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for g in grants {
                 s.grants.insert(g.id, g.clone());
             }
+            if *node == s.root {
+                s.former_master = None;
+            }
         }
         Op::GrantSystemRight {
             user,
@@ -803,7 +865,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "only the master can transfer the master role",
             )?;
             require(s.active(*user), "unknown or disabled user")?;
-            s.master = *user;
+            if *user != author {
+                s.master = *user;
+                s.former_master = Some(author);
+            }
         }
     }
     Ok(())

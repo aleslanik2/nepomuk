@@ -146,7 +146,8 @@ Neither the master nor an administrator ever learns the user's password or priva
 
 ### 4.4 Recovery and change
 
-- **Changing a password or passphrase** re-encrypts only the seed; keys and grants stay the same.
+- **Changing a password** (`nepomuk identity passwd`) creates new keys: the old credential stays in the git history, so re-encrypting the same seed would leave the identity open to anyone who knows the old password. One `RotateOwnKeys` operation sets the new public keys and credential (with a proof of possession) and re-wraps the user's own grants and group memberships for the new keys; only the user's own grants and groups can be touched, anything left out is dropped, and the master cannot rotate (its keys are pinned; it changes only its credential, with a warning). Old keys can no longer sign or receive anything new, but whatever they could decrypt until then stays decryptable until it is rekeyed. Cached unlocks (agent, Touch ID) are cleared.
+- **Changing the passphrase of an identity file** re-encrypts the file only; keys and grants stay the same.
 - **Forgotten password / lost key**: users cannot recover anything themselves. They submit a new request, an administrator approves it as a replacement of the old identity (inheriting groups), and admins who hold the keys re-issue the grants. The old identity is revoked.
 
 ## 5. Permission model
@@ -289,6 +290,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 | --- | --- |
 | `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all grants, memberships and system rights of the user (re-granted only by holders of the rights, with `+delegate` for system rights), so re-enabling a disabled user grants nothing |
 | `UpdateOwnCredential` (password change, Argon2id parameters) | the user themselves |
+| `RotateOwnKeys` (password change, §4.4) | the user themselves, not the master; with a proof of possession of the new keys; may re-wrap only the user's own grants (metadata unchanged) and memberships |
 | `CreateGroup` | master or `groups` |
 | `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |
 | `CreateNode` | `write` on the parent |
@@ -299,7 +301,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `Rekey` (new NK for a subtree) | `admin` on the node's parent or master |
 | `GrantSystemRight` | the same right with `+delegate`, or master |
 | `MarkRotation`, `ClearRotation` | `write` on the node |
-| `TransferMaster`, `Checkpoint` | master |
+| `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
 ### 8.1 Revocation and rekey
 
@@ -323,6 +325,13 @@ Rekey protects only future content. Anything the revoked party has already seen 
 - marks secrets for rotation and lists them (the GUI turns them into a checklist).
 
 If the author does not hold keys to all affected nodes (e.g. has only `users`), offboarding disables the identity, removes the memberships and grants it is able to remove, and returns the rest (rekey) as tasks for the admins of the respective folders. A disabled identity cannot sign any further change, effective immediately.
+
+### 8.3 Master transfer
+
+`nepomuk master transfer <user>` gives the new master an `admin` grant on the root (if needed) and the master role. The former master held every node key, so:
+
+- unless `--keep-access`, the former master revokes its own grant on the root in the same commit;
+- the state records the former master (`former_master`) until the root is rekeyed; while it is set and the former master no longer has `admin` on the root, `info` (and the GUI) tells the master to run `nepomuk rekey /`. With `--keep-access` the former master stays an admin deliberately and nothing is reported.
 
 ## 9. Git integration
 

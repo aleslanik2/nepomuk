@@ -341,8 +341,14 @@ pub enum RotationCmd {
 
 #[derive(Subcommand)]
 pub enum MasterCmd {
-    /// Transfer the master role to another user
-    Transfer { user: String },
+    /// Transfer the master role to another user. You give up your admin grant on / unless
+    /// --keep-access; the new master should then run `nepomuk rekey /`
+    Transfer {
+        user: String,
+        /// Stay admin on / as a regular user
+        #[arg(long)]
+        keep_access: bool,
+    },
     /// Split the master seed into Shamir shares (not in this version)
     Backup {
         #[arg(long)]
@@ -1002,11 +1008,12 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             );
             Ok(Out::human(v, h))
         }
-        Cmd::Master(MasterCmd::Transfer { user }) => {
+        Cmd::Master(MasterCmd::Transfer { user, keep_access }) => {
             let d = app::execute(
                 ctx,
                 &Intent::MasterTransfer {
                     user: strip_user(&user),
+                    keep_access,
                 },
                 None,
                 Resolve::Ask,
@@ -1323,8 +1330,31 @@ fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
             }
             let pass = ctx.new_secret("New password", &[])?;
             crate::password::check(&pass, &[&id.name])?;
-            let cred = identity::password_credential(&id, &pass)?;
-            intent(ctx, Intent::Passwd { credential: cred })
+            // New keys: the old credential stays in the git history, and with it whatever the
+            // old password unlocks (§4.4).
+            let new = Unlocked::generate(&id.name, IdentityKind::Password);
+            let cred = identity::password_credential(&new, &pass)?;
+            let rotate = app::RotatedKeys {
+                kem: new.kem.public().clone(),
+                sig: new.sig.public().clone(),
+                proof: new.proof(IdentityKind::Password, Some(&cred)),
+                master_credential: Some(identity::password_credential(&id, &pass)?),
+            };
+            let vault = o.v.file.vault_id;
+            let out = intent(
+                ctx,
+                Intent::Passwd {
+                    credential: cred,
+                    rotate: Some(rotate),
+                },
+            )?;
+            // Cached unlocks belong to the old password or keys.
+            crate::agent::forget(Some(vault));
+            if crate::touchid::enabled_for(vault).is_some() {
+                crate::touchid::disable(vault);
+                ctx.warn("Touch ID was turned off for this vault; enable it again with `nepomuk identity touchid enable`");
+            }
+            Ok(out)
         }
         IdentityCmd::Show => {
             let path = ctx

@@ -341,9 +341,27 @@ pub fn whoami(ctx: &Ctx, o: &Opened) -> Result<Value> {
     }))
 }
 
+/// Things about the vault's state that its admins should act on.
+pub fn state_warnings(s: &State) -> Vec<String> {
+    let mut out = Vec::new();
+    // A former master who kept admin on / did so deliberately (`--keep-access`); one who gave
+    // it up still knows every node key until the root is rekeyed.
+    if let Some(f) = s.former_master.and_then(|f| s.users.get(&f))
+        && !(s.active(f.id) && s.has_right(f.id, s.root, Right::Admin))
+    {
+        out.push(format!(
+            "{} (the former master) held every key of the vault until the master role was transferred; the master should run `nepomuk rekey /`",
+            f.name
+        ));
+    }
+    out
+}
+
 pub fn info(o: &Opened) -> Value {
     let s = &o.v.state;
+    let warnings = state_warnings(s);
     json!({
+        "warnings": warnings,
         "vault": o.loc.path.display().to_string(),
         "vault_id": s.vault_id.hex(),
         "format_version": crate::format::FORMAT_VERSION,

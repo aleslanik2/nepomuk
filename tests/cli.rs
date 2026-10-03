@@ -276,6 +276,20 @@ fn wrong_password_and_weak_password() {
 fn password_change() {
     let e = Env::new("passwd");
     e.add_password_user("jane@example.com");
+    e.m(&["mkdir", "-p", "/team/core"]).ok();
+    e.m_in(&["put", "/team/doc"], b"direct").ok();
+    e.m_in(&["put", "/team/core/wifi"], b"via-group").ok();
+    e.m(&["grant", "user:jane@example.com", "read", "/team"])
+        .ok();
+    e.m(&["group", "create", "core"]).ok();
+    e.m(&["group", "add", "core", "jane@example.com"]).ok();
+    e.m(&["grant", "group:core", "read", "/team/core"]).ok();
+    e.m(&["revoke", "--no-rekey", "user:jane@example.com", "/team"])
+        .ok();
+    e.m(&["grant", "user:jane@example.com", "read", "/team"])
+        .ok();
+    // The vault as it is in the git history before the change.
+    let before = std::fs::read(&e.vault).unwrap();
     let old = password_for("jane@example.com");
     let new = "a-completely-new-long-password";
     let input = format!("{old}\n{new}\n");
@@ -301,6 +315,38 @@ fn password_change() {
         e.u("jane@example.com", &["whoami"]).err_code(),
         "BAD_CREDENTIALS"
     );
+    // Grants and group memberships follow the new keys.
+    let get = |path: &str| {
+        e.cmd(
+            &["--email", "jane@example.com", "get", path],
+            &[("NEPOMUK_PASSWORD", new)],
+            None,
+        )
+        .data()["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get("/team/doc"), "direct");
+    assert_eq!(get("/team/core/wifi"), "via-group");
+    e.m(&["verify"]).ok();
+
+    // Audit finding 3: the old password, with the old credential from the git history, no
+    // longer unlocks an identity of the vault.
+    use nepomuk::format::VaultFile;
+    // SAFETY: every test of this binary that reads it wants the same value.
+    unsafe { std::env::set_var("NEPOMUK_INSECURE_TEST_KDF", "1") };
+    let old_file = VaultFile::parse(&before).unwrap();
+    let fp = e.m(&["info"]).data()["master_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let old_state = nepomuk::verify::verify_file(old_file, &fp).unwrap().state;
+    let old_user = old_state.user_by_name("jane@example.com").unwrap();
+    let old_id = nepomuk::identity::unlock_password_user(old_user, &old).unwrap();
+    let now = VaultFile::parse(&std::fs::read(&e.vault).unwrap()).unwrap();
+    let now = nepomuk::verify::verify_file(now, &fp).unwrap();
+    assert!(nepomuk::tx::find_me(&now.state, &old_id).is_err());
 }
 
 #[test]
@@ -763,6 +809,25 @@ fn master_transfer() {
     assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
     assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
     trust("state-other", &["trust", "--replace", &new_fp]).data();
+
+    // Audit finding 5: the former master gave up / and the new master is told to rekey it.
+    let info = e.l(&new_master, "new-master", &["info"]).data();
+    assert!(
+        info["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("rekey /")),
+        "{info}"
+    );
+    assert_eq!(
+        e.m(&["ls", "/"]).json()["ok"],
+        false,
+        "the former master still reads /"
+    );
+    e.l(&new_master, "new-master", &["rekey", "/"]).data();
+    let info = e.l(&new_master, "new-master", &["info"]).data();
+    assert_eq!(info["warnings"], serde_json::json!([]));
 }
 
 #[test]

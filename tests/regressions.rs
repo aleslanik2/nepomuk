@@ -115,7 +115,7 @@ fn master_transfer_needs_former_pin_or_compact() {
     let mut t = Tx::new(&v, &master).unwrap();
     t.user_add(&Request::new(&heir, None)).unwrap();
     let h = t.user_named("heir").unwrap();
-    t.transfer_master(h).unwrap();
+    t.transfer_master(h, false).unwrap();
     let (file, _, _, _) = t.commit().unwrap();
 
     assert_eq!(
@@ -485,7 +485,7 @@ fn former_master_cannot_forge_after_transfer() {
     let mut t = Tx::new(&v, &alice).unwrap();
     t.user_add(&Request::new(&bob, None)).unwrap();
     let b = t.user_named("bob").unwrap();
-    t.transfer_master(b).unwrap();
+    t.transfer_master(b, false).unwrap();
     let (file, seen, _, _) = t.commit().unwrap();
     let mut mem = VaultMemory {
         pin: Some(b_fp.clone()),
@@ -650,7 +650,7 @@ fn transfer_right_after_compact_is_accepted() {
     };
     let mut t = Tx::new(&compacted, &alice).unwrap();
     let b = t.user_named("bob").unwrap();
-    t.transfer_master(b).unwrap();
+    t.transfer_master(b, false).unwrap();
     let (file, _, _, _) = t.commit().unwrap();
     mem.former = vec![alice.fingerprint()];
     mem.pin = Some(b_fp.clone());
@@ -921,4 +921,168 @@ fn embedded_bare_repository_is_refused() {
     let loc = Location::detect(&ok.join("sub/vault.npk"), None).unwrap();
     assert!(loc.is_git());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Audit finding 3: a key rotation may only touch the author's own grants and memberships.
+#[test]
+fn rotate_own_keys_rules() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let eve = Unlocked::generate("eve", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&eve, None)).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.mkdir("/x", false).unwrap();
+    t.put("/x/s", Content::Text { value: "v".into() }, None)
+        .unwrap();
+    let (e, b) = (t.user_named("eve").unwrap(), t.user_named("bob").unwrap());
+    t.grant(Principal::User(e), Right::Read, "/x").unwrap();
+    t.grant(Principal::User(b), Right::Read, "/x").unwrap();
+    let (file, v, _, _) = t.commit().unwrap();
+    let fp = master.fingerprint();
+    let bob_grant = v
+        .state
+        .grants
+        .values()
+        .find(|g| g.to == Principal::User(b))
+        .unwrap()
+        .clone();
+    let new = Unlocked::generate("eve", IdentityKind::Local);
+    let rotate = |grants: Vec<Grant>, kem: &crypto::KemPublic, sig: &crypto::SigPublic| {
+        let mut f = file.clone();
+        sign_commit(
+            &mut f,
+            &eve,
+            e,
+            v.seq + 1,
+            vec![Op::RotateOwnKeys {
+                kem: kem.clone(),
+                sig: sig.clone(),
+                credential: None,
+                proof: new.proof(IdentityKind::Local, None),
+                grants,
+                memberships: Default::default(),
+            }],
+        );
+        verify_file(f, &fp)
+    };
+    let (nk, ns) = (new.kem.public(), new.sig.public());
+    // Someone else's grant cannot be "re-wrapped".
+    assert_eq!(
+        rotate(vec![bob_grant], nk, ns).unwrap_err().code,
+        Code::UnauthorizedOperation
+    );
+    // Another user's keys cannot be taken over.
+    assert_eq!(
+        rotate(vec![], bob.kem.public(), bob.sig.public())
+            .unwrap_err()
+            .code,
+        Code::UnauthorizedOperation
+    );
+    // Without a matching proof of possession the keys are refused.
+    let other = Unlocked::generate("eve", IdentityKind::Local);
+    assert_eq!(
+        rotate(vec![], other.kem.public(), ns).unwrap_err().code,
+        Code::UnauthorizedOperation
+    );
+
+    // The real thing: Eve keeps her access under the new keys, the old keys are dead.
+    let mut t = Tx::new(&v, &eve).unwrap();
+    t.rotate_own_keys(
+        nk.clone(),
+        ns.clone(),
+        None,
+        new.proof(IdentityKind::Local, None),
+    )
+    .unwrap();
+    let (f2, _, _, _) = t.commit().unwrap();
+    let v2 = verify_file(f2.clone(), &fp).unwrap();
+    let acc = Access::build(&v2.state, e, &new);
+    assert_eq!(text(&acc, &v2, "/x/s"), "v");
+    assert!(tx::find_me(&v2.state, &eve).is_err());
+    // The old keys cannot sign any more.
+    let mut f3 = f2;
+    sign_commit(
+        &mut f3,
+        &eve,
+        e,
+        v2.seq + 1,
+        vec![Op::DeleteNode {
+            id: acc.resolve("/x/s").unwrap(),
+        }],
+    );
+    assert_eq!(
+        verify_file(f3, &fp).unwrap_err().code,
+        Code::SignatureInvalid
+    );
+
+    // The master's keys are pinned: no rotation.
+    let mut f4 = v2.file.clone();
+    let m2 = Unlocked::generate("master", IdentityKind::Local);
+    sign_commit(
+        &mut f4,
+        &master,
+        v2.state.master,
+        v2.seq + 1,
+        vec![Op::RotateOwnKeys {
+            kem: m2.kem.public().clone(),
+            sig: m2.sig.public().clone(),
+            credential: None,
+            proof: m2.proof(IdentityKind::Local, None),
+            grants: vec![],
+            memberships: Default::default(),
+        }],
+    );
+    assert_eq!(
+        verify_file(f4, &fp).unwrap_err().code,
+        Code::UnauthorizedOperation
+    );
+}
+
+/// Audit finding 5: the former master gives up its access, and the vault remembers that the
+/// root has to be rekeyed until the new master does it.
+#[test]
+fn master_transfer_steps_down_and_asks_for_root_rekey() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let heir = Unlocked::generate("heir", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&heir, None)).unwrap();
+    t.put("/s", Content::Text { value: "v".into() }, None)
+        .unwrap();
+    let h = t.user_named("heir").unwrap();
+    let old = t.me;
+    t.transfer_master(h, false).unwrap();
+    assert!(!t.tasks.is_empty());
+    let (_, v, _, _) = t.commit().unwrap();
+    assert_eq!(v.state.former_master, Some(old));
+    assert!(!v.state.has_right(old, v.state.root, Right::Admin));
+    assert!(
+        Access::build(&v.state, old, &master)
+            .resolve("/s")
+            .is_none()
+    );
+    let w = nepomuk::queries::state_warnings(&v.state);
+    assert!(w.iter().any(|w| w.contains("rekey /")), "{w:?}");
+
+    let mut t = Tx::new(&v, &heir).unwrap();
+    let root = t.state.root;
+    t.rekey(root).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert_eq!(v.state.former_master, None);
+    assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
+    let acc = Access::build(&v.state, h, &heir);
+    assert_eq!(text(&acc, &v, "/s"), "v");
+
+    // With --keep-access the former master stays admin and nothing nags.
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&heir, None)).unwrap();
+    let h = t.user_named("heir").unwrap();
+    let old = t.me;
+    t.transfer_master(h, true).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.has_right(old, v.state.root, Right::Admin));
+    assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
 }
