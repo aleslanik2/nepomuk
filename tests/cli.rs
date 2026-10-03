@@ -976,3 +976,21 @@ public class ToPkcs12 { public static void main(String[] a) throws Exception {
         "key-pass-BBB"
     );
 }
+
+/// The pseudo-terminal helper used by the Touch ID agent tests on macOS.
+#[cfg(unix)]
+#[test]
+fn commands_run_in_one_terminal() {
+    if !std::path::Path::new("/usr/bin/script").exists() {
+        eprintln!("skipped: script(1) is not installed");
+        return;
+    }
+    let e = Env::new("terminal");
+    let id = e.master_identity();
+    let args: &[&str] = &["--identity", id.to_str().unwrap(), "whoami"];
+    let env: &[(&str, &str)] = &[("NEPOMUK_PASSPHRASE", MASTER_PASS)];
+    let r = e.in_terminal(&[(args, env), (&["--version-of-nothing"], &[]), (args, env)]);
+    assert_eq!(r[0].data()["master"], true);
+    assert_ne!(r[1].code, 0);
+    assert_eq!(r[2].data()["master"], true);
+}

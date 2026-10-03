@@ -32,16 +32,33 @@ fn prompts(helper: &std::path::Path) -> usize {
         .count()
 }
 
-#[test]
-fn touch_id_once_per_timeout() {
-    let e = Env::new("agent");
+fn setup(e: &Env, timeout: u64) -> std::path::PathBuf {
     let helper = e.path("nepomuk-touchid");
     std::fs::write(&helper, FAKE_HELPER).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::fs::write(e.path("cfg/config.toml"), "agent_timeout = 3\n").unwrap();
+    std::fs::write(
+        e.path("cfg/config.toml"),
+        format!("agent_timeout = {timeout}\n"),
+    )
+    .unwrap();
+    helper
+}
+
+fn reasons(helper: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(helper.with_extension("reason"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn touch_id_once_per_timeout_in_one_terminal() {
+    let e = Env::new("agent");
+    let helper = setup(&e, 3);
     let tmp = std::env::temp_dir();
     let base: Vec<(&str, &str)> = vec![
         ("NEPOMUK_TOUCHID_HELPER", helper.to_str().unwrap()),
@@ -58,33 +75,59 @@ fn touch_id_once_per_timeout() {
         None,
     )
     .ok();
+
+    // Programs without a terminal are not remembered: each one asks.
     let touch = || e.cmd(&["--touchid", "whoami"], &base, None);
-
     assert_eq!(touch().data()["master"], true);
-    assert_eq!(prompts(&helper), 1);
-    // The prompt says who, for what and for how long – never paths of identities.
-    let reason = std::fs::read_to_string(helper.with_extension("reason")).unwrap();
-    assert_eq!(
-        reason.trim(),
-        "use master for vault.nepomuk for 3 seconds: nepomuk whoami"
-    );
-    // Within the timeout: no new prompt.
     assert_eq!(touch().data()["master"], true);
-    e.m(&["ls"]).ok();
-    assert_eq!(touch().data()["master"], true);
-    assert_eq!(prompts(&helper), 1, "the agent serves the identity");
-    let status = e.cmd(&["agent"], &base, None).data();
-    assert_eq!(status["vaults"].as_array().unwrap().len(), 1);
-
-    // `nepomuk lock` forgets it.
-    e.cmd(&["lock"], &base, None).ok();
-    touch().ok();
     assert_eq!(prompts(&helper), 2);
+    // The prompt says who and for what – never paths of identities – and, without a terminal,
+    // promises no caching.
+    assert_eq!(
+        reasons(&helper).last().unwrap(),
+        "use master for vault.nepomuk: nepomuk whoami"
+    );
+
+    // One terminal: asked once for reading; a change asks again; reading stays cached.
+    let whoami: &[&str] = &["--touchid", "whoami"];
+    let r = e.in_terminal(&[
+        (whoami, &base),
+        (whoami, &base),
+        (&["--touchid", "ls"], &base),
+        (&["--touchid", "mkdir", "/fresh"], &base),
+        (whoami, &base),
+        (&["agent"], &base),
+    ]);
+    assert_eq!(r[0].data()["master"], true);
+    assert_eq!(r[1].data()["master"], true);
+    r[2].data();
+    r[3].data();
+    assert_eq!(r[4].data()["master"], true);
+    assert_eq!(
+        prompts(&helper),
+        4,
+        "one prompt to read, one for the change"
+    );
+    assert_eq!(
+        reasons(&helper)[2],
+        "use master for vault.nepomuk for 3 seconds in this terminal: nepomuk whoami"
+    );
+    assert_eq!(r[5].data()["vaults"].as_array().unwrap().len(), 1);
+
+    // Another terminal does not get it.
+    e.in_terminal(&[(whoami, &base)])[0].data();
+    assert_eq!(prompts(&helper), 5);
+
+    // `nepomuk lock` forgets it, from anywhere.
+    e.cmd(&["lock"], &base, None).ok();
+    let r = e.in_terminal(&[(whoami, &base), (whoami, &base)]);
+    r[1].data();
+    assert_eq!(prompts(&helper), 6);
 
     // The timeout expires.
     std::thread::sleep(std::time::Duration::from_secs(4));
-    touch().ok();
-    assert_eq!(prompts(&helper), 3);
+    e.in_terminal(&[(whoami, &base)])[0].data();
+    assert_eq!(prompts(&helper), 7);
 
     // Disabling Touch ID forgets the cached identity too.
     e.cmd(&["identity", "touchid", "disable"], &base, None).ok();
