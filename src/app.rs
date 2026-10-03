@@ -310,7 +310,7 @@ impl Ctx {
         if let Some(u) = self.unlocked.borrow().as_ref() {
             return Ok(u.clone());
         }
-        if self.opts.session && self.password_override.borrow().is_none() {
+        if self.opts.session && !self.opts.touchid && self.password_override.borrow().is_none() {
             return Err(Error::new(
                 Code::PasswordRequired,
                 "the session is locked; call session.unlock",
@@ -754,6 +754,8 @@ pub enum Intent {
     Rekey {
         path: String,
     },
+    /// Rekeys what the vault records as pending (§8.1) as far as the author may.
+    RekeyPending,
     Grant {
         who: String,
         right: Right,
@@ -965,6 +967,10 @@ impl Intent {
                 }
                 tx.rekey(n)?;
                 json!({ "path": path })
+            }
+            Intent::RekeyPending => {
+                let done = tx.rekey_pending()?;
+                json!({ "rekeyed": done })
             }
             Intent::Grant { who, right, path } => {
                 let p = tx.principal(who)?;
@@ -1289,6 +1295,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::RmNode { node } => format!("rm --node {node}"),
         Intent::Mv { src, dst } => format!("mv {src} {dst}"),
         Intent::Rekey { path } => format!("rekey {path}"),
+        Intent::RekeyPending => "rekey --pending".into(),
         Intent::Grant { who, right, path } => format!("grant {who} {} {path}", right.as_str()),
         Intent::Revoke { who, path, .. } => format!("revoke {who} {path}"),
         Intent::UserAdd { .. } => "user add".into(),

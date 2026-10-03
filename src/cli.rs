@@ -151,7 +151,14 @@ pub enum Cmd {
         node: Option<String>,
     },
     /// Replace the keys of a subtree (admin on the parent)
-    Rekey { path: String },
+    Rekey {
+        #[arg(required_unless_present = "pending", conflicts_with = "pending")]
+        path: Option<String>,
+        /// Rekey everything the vault records as waiting for a rekey after a revocation that
+        /// you are allowed to (admin on the parent)
+        #[arg(long)]
+        pending: bool,
+    },
     /// Secrets pending rotation at the source
     #[command(subcommand)]
     Rotation(RotationCmd),
@@ -924,12 +931,16 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             ),
             (None, None) => Err(Error::usage("rm needs a path or --node")),
         },
-        Cmd::Rekey { path } => intent(
-            ctx,
-            Intent::Rekey {
-                path: ctx.path(&path),
-            },
-        ),
+        Cmd::Rekey { path, pending } => match (path, pending) {
+            (_, true) => intent(ctx, Intent::RekeyPending),
+            (Some(path), false) => intent(
+                ctx,
+                Intent::Rekey {
+                    path: ctx.path(&path),
+                },
+            ),
+            (None, false) => Err(Error::usage("rekey needs a path or --pending")),
+        },
         Cmd::Rotation(RotationCmd::List) => {
             let o = app::open_vault(ctx, true)?;
             Ok(Out::data(queries::rotation_list(ctx, &o)?))

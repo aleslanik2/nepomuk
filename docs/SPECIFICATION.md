@@ -301,6 +301,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `Rekey` (new NK for a subtree) | `admin` on the node's parent or master |
 | `GrantSystemRight` | the same right with `+delegate`, or master |
 | `MarkRotation`, `ClearRotation` | `write` on the node |
+| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1) |
 | `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
 ### 8.1 Revocation and rekey
@@ -311,6 +312,8 @@ Each commit carries one or more operations applied atomically. The client verifi
 4. nepomuk lists the secrets the revoked party had access to and marks them "pending rotation".
 
 Everything below a node decrypts with that node's key, so whoever rekeys can read the whole subtree. A node that does not decrypt (written by a broken or malicious client of someone with `write` there) would make the rekey impossible; the rekey removes it in the same commit, with a warning naming its id. This takes nothing from anyone with legitimate access and is no more than its writer could do with `rm`; the node stays in git history. A readable folder whose own content does not decrypt but which has readable children is sealed again as an empty folder instead. `nepomuk rm --node <id>` removes such a node directly. If a rekey still cannot be built, the revocation is committed without it, with a warning and a task.
+
+A rekey needs `admin` on the node's parent (the new key is wrapped under the parent's key). When the author of a revocation or of a group removal lacks it, the operation is committed and the state records the node with the principals that still know its key (`rekey_pending`); `DisableUser` records the nodes the disabled user could read in the same way. Every client derives this record from the log. It is cleared by a `Rekey` of the node or an ancestor, by deleting it, or for one principal by granting that principal access again. `info` (and the GUI) report pending rekeys, and `nepomuk rekey --pending` performs those the author may.
 
 Rekey protects only future content. Anything the revoked party has already seen must be changed at the source (new certificate, new database password, upload key reset in Google Play).
 
@@ -501,6 +504,7 @@ A long-running process started by the GUI; JSON-RPC 2.0 over stdin and stdout, o
 - Solves the unlock cost: Argon2id (~1 s, 256 MiB) runs once per session, not on every click.
 - Only this process holds the unlocked identity, in locked memory; the GUI forgets the password once it is handed over.
 - Forgets the identity after inactivity (default 10 min), on a `lock` request, and when the screen is locked (signal from the GUI).
+- A Touch ID unlock in the session never puts the identity into the Touch ID agent, and `session.lock` (the app's Lock button and screen lock) also clears every identity the agent holds for the command line, like `nepomuk lock`.
 - Opens no socket or port; exits when stdin is closed.
 - Methods correspond to CLI commands: `vault.status`, `node.list`, `node.get`, `node.put`, `grant.add`, `user.offboard`, `sync.run`, `session.unlock`, `session.lock` …
 - Asynchronous events (notifications): `sync.progress`, `vault.changed`, `session.expired`.
