@@ -1,0 +1,24 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/), used by
+# .github/workflows/security.yml for both the CLI and the GUI crate.
+# Run locally (the GUI crate finds this file in a parent directory):
+#   cargo deny check advisories sources
+#   cargo deny --manifest-path gui/src-tauri/Cargo.toml check advisories sources
+
+[advisories]
+# Fail on every RustSec advisory, including unmaintained and unsound crates.
+# A justified exception goes into `ignore` with the advisory ID and the reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # Unmaintained compile-time proc-macro helpers, pulled in transitively, no runtime code
+    # in the binaries. Revisit when the parent crates move away from them.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via libcrux (hax-lib-macros), no maintained alternative upstream yet" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error via the GTK stack of Tauri (Linux GUI), no maintained alternative upstream yet" },
+]
+
+[sources]
+# Dependencies may only come from crates.io: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
