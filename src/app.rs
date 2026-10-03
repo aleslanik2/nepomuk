@@ -642,10 +642,18 @@ pub fn check_former_signer(v: &Verified, mem: &mut VaultMemory, pin: &str) -> Re
     .with("signer", signer))
 }
 
-/// Whether the remembered head is one of the file's commits. A commit's hash chains back to the
-/// exact checkpoint entry, so this proves the file continues the history seen here; a matching
-/// `folded_head` would not, since whoever signs a checkpoint can claim any folded head.
+/// Whether the file continues the history seen on this machine: its checkpoint entry is the one
+/// seen before, or the remembered head is one of its commits (a commit's hash chains back to the
+/// exact checkpoint entry). A matching `folded_head` alone proves nothing, since whoever signs a
+/// checkpoint can claim any folded head.
 fn contains_seen(v: &Verified, mem: &VaultMemory) -> bool {
+    if mem
+        .checkpoint
+        .as_deref()
+        .is_some_and(|c| hex::encode(v.file.entries[0].hash()) == c)
+    {
+        return true;
+    }
     let (Some(seq), Some(head)) = (mem.seq, mem.head.as_deref()) else {
         return false;
     };
@@ -658,6 +666,7 @@ fn remember(mem: &mut VaultMemory, v: &Verified) {
     if mem.seq.is_none_or(|s| v.seq >= s) {
         mem.seq = Some(v.seq);
         mem.head = Some(hex::encode(v.head));
+        mem.checkpoint = Some(hex::encode(v.file.entries[0].hash()));
     }
 }
 
@@ -1275,6 +1284,7 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     mem.pin = Some(fp.clone());
     mem.seq = Some(0);
     mem.head = Some(hex::encode(file.head_hash()));
+    mem.checkpoint = Some(hex::encode(file.head_hash()));
     mem.save(file.vault_id)?;
     Ok(json!({
         "vault": loc.path.display().to_string(),

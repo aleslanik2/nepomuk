@@ -187,6 +187,10 @@ pub struct VaultMemory {
     /// Highest seen `seq` and its head hash (rollback / fork detection, §7.2).
     pub seq: Option<u64>,
     pub head: Option<String>,
+    /// Hash of the checkpoint entry of the version seen last (it covers the signed body and the
+    /// signature, so nobody can produce another checkpoint with the same hash).
+    #[serde(default)]
+    pub checkpoint: Option<String>,
     /// Last time the remote was fetched successfully (unix seconds).
     pub fetched_at: Option<i64>,
 }

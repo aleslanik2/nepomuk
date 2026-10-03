@@ -627,3 +627,95 @@ fn mv_refuses_duplicates_and_ignores_unreadable_nodes() {
     assert!(eacc.unproven.is_empty());
     assert!(eacc.resolve("/v/e").is_some());
 }
+
+/// A client that last saw the vault right after a compact (no commits yet) still accepts the
+/// former master's checkpoint followed by the transfer: it is the very checkpoint it saw.
+#[test]
+fn transfer_right_after_compact_is_accepted() {
+    use nepomuk::config::VaultMemory;
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let b_fp = bob.fingerprint();
+    let v = new_vault(&alice);
+    let mut t = Tx::new(&v, &alice).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let compacted = verify_file(tx::compact(&v, &alice).unwrap(), &alice.fingerprint()).unwrap();
+    let mut mem = VaultMemory {
+        pin: Some(alice.fingerprint()),
+        seq: Some(compacted.seq),
+        head: Some(hex::encode(compacted.head)),
+        checkpoint: Some(hex::encode(compacted.file.entries[0].hash())),
+        ..Default::default()
+    };
+    let mut t = Tx::new(&compacted, &alice).unwrap();
+    let b = t.user_named("bob").unwrap();
+    t.transfer_master(b).unwrap();
+    let (file, _, _, _) = t.commit().unwrap();
+    mem.former = vec![alice.fingerprint()];
+    mem.pin = Some(b_fp.clone());
+    let v = verify_file_with(file, &b_fp, &mem.former).unwrap();
+    nepomuk::app::check_former_signer(&v, &mut mem, &b_fp).unwrap();
+}
+
+/// A share-holder's grant on a node nobody else can read does not block moving its ancestors.
+#[test]
+fn unreadable_granted_node_does_not_block_mv() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let eve = Unlocked::generate("eve", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&eve, None)).unwrap();
+    t.mkdir("/a/w", true).unwrap();
+    let e = t.user_named("eve").unwrap();
+    t.grant(Principal::User(e), Right::Share, "/a/w").unwrap();
+    let (mut f, v, _, _) = t.commit().unwrap();
+    let eacc = Access::build(&v.state, e, &eve);
+    let parent = eacc.resolve("/a/w").unwrap();
+    let pk = eacc.key(parent).unwrap().clone();
+    let id = Id::random();
+    let nk = crypto::random_key();
+    let vid = v.state.vault_id;
+    let node = Node {
+        id,
+        parent: Some(parent),
+        wrapped_key: Some(keyring::seal_node_key(vid, id, &pk, &nk)),
+        name: keyring::seal_name(vid, id, &nk, "junk").sealed,
+        name_commit: [0u8; 32],
+        content: keyring::seal_content(
+            vid,
+            id,
+            &nk,
+            &NodeContent {
+                content: Content::Folder,
+                meta: Meta::default(),
+            },
+        ),
+    };
+    let mut st = v.state.clone();
+    st.nodes.insert(id, node.clone());
+    let mut proof = eacc.proof(parent).unwrap();
+    proof = proof.child("junk", keyring::name_salt(&nk));
+    let g = keyring::make_grant(
+        &st,
+        Id::random(),
+        id,
+        Principal::User(e),
+        Right::Write,
+        &nk,
+        &proof,
+    )
+    .unwrap();
+    sign_commit(
+        &mut f,
+        &eve,
+        e,
+        v.seq + 1,
+        vec![Op::CreateNode { node }, Op::Grant { grant: g }],
+    );
+    let v = verify_file(f, &master.fingerprint()).unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mv("/a", "/b").unwrap();
+    assert!(!t.tasks.is_empty());
+    t.commit().unwrap();
+}

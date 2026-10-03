@@ -444,11 +444,10 @@ impl<'a> Tx<'a> {
         let grants: Vec<Grant> = self.state.grants_on(sub).into_iter().cloned().collect();
         let mut out = Vec::new();
         for g in grants {
-            let nk = self.key(g.node)?;
-            let proof = match proofs.get(&g.node) {
-                Some(p) => p.clone(),
-                None => self.proof(g.node)?,
+            let Some(proof) = proofs.get(&g.node).cloned() else {
+                continue;
             };
+            let nk = self.key(g.node)?;
             out.push(keyring::make_grant(
                 &self.state,
                 g.id,
@@ -504,7 +503,16 @@ impl<'a> Tx<'a> {
         let granted: BTreeSet<Id> = self.state.grants_on(&sub).iter().map(|g| g.node).collect();
         let mut proofs = BTreeMap::new();
         for n in granted {
-            let p = self.proof(n)?;
+            let Some(p) = self.access().proof(n) else {
+                // A grant on a node this author cannot read (e.g. one whose name commitment
+                // does not match) cannot be re-issued; its holder will see it as unproven.
+                let what = self.path_of(n);
+                self.tasks.push(format!(
+                    "re-issue the grants on {what} (node {}) after the move – this author cannot read it",
+                    n.hex()
+                ));
+                continue;
+            };
             let depth = old.salts.len();
             let comps = keyring::components(&p.path);
             if p.salts.len() < depth || comps.len() != p.salts.len() {
@@ -882,7 +890,14 @@ impl<'a> Tx<'a> {
             .filter(|g| g.to == Principal::User(user))
             .cloned()
             .collect();
-        let old_groups = self.state.user_groups(user);
+        // A disabled user comes back with nothing: their old grants are not re-issued.
+        let was_disabled = !self.state.active(user);
+        let old_grants: Vec<Grant> = if was_disabled { Vec::new() } else { old_grants };
+        let old_groups = if was_disabled {
+            Vec::new()
+        } else {
+            self.state.user_groups(user)
+        };
         let old_group_admin: Vec<(Id, bool)> = self
             .state
             .sysrights
@@ -910,6 +925,11 @@ impl<'a> Tx<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        let old_sysrights = if was_disabled {
+            Vec::new()
+        } else {
+            old_sysrights
+        };
         self.push(Op::ReplaceIdentity {
             user,
             kind: req.kind,
