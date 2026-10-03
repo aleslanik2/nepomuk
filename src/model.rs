@@ -193,6 +193,15 @@ pub struct State {
     pub sysrights: BTreeMap<Id, BTreeMap<SysRight, bool>>,
     /// Nodes marked "pending rotation".
     pub rotation: BTreeSet<Id>,
+    /// The master before the last `TransferMaster`, until the root is rekeyed: they held every
+    /// node key at the time of the transfer (§8.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub former_master: Option<Id>,
+    /// Nodes whose keys are still known to principals that lost access to them (a `Revoke` or a
+    /// group removal without a `Rekey`, e.g. because its author lacked `admin` on the parent),
+    /// until the node is rekeyed or the principal gets access again (§8.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rekey_pending: BTreeMap<Id, BTreeSet<Principal>>,
 }
 
 /// A node rewritten by a `Rekey`.
@@ -225,6 +234,17 @@ pub enum Op {
     },
     UpdateOwnCredential {
         credential: PasswordSealed,
+    },
+    /// A user replaces their own keys (§4.4): their grants and group memberships are re-wrapped
+    /// for the new keys by themselves; whatever they leave out is dropped.
+    RotateOwnKeys {
+        kem: KemPublic,
+        sig: SigPublic,
+        credential: Option<PasswordSealed>,
+        #[serde(with = "serde_bytes")]
+        proof: Vec<u8>,
+        grants: Vec<Grant>,
+        memberships: BTreeMap<Id, Wrapped>,
     },
     CreateGroup {
         group: Group,
@@ -303,6 +323,7 @@ impl Op {
             Op::DisableUser { .. } => "DisableUser",
             Op::ReplaceIdentity { .. } => "ReplaceIdentity",
             Op::UpdateOwnCredential { .. } => "UpdateOwnCredential",
+            Op::RotateOwnKeys { .. } => "RotateOwnKeys",
             Op::CreateGroup { .. } => "CreateGroup",
             Op::AddMember { .. } => "AddMember",
             Op::RemoveMember { .. } => "RemoveMember",

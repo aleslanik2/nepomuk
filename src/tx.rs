@@ -765,9 +765,37 @@ impl<'a> Tx<'a> {
                     "rekey {p} (node {}) – requires admin on its parent",
                     n.hex()
                 ));
+                self.warnings.push(format!(
+                    "{p} is not rekeyed: whoever lost access can still decrypt new content there until an admin of its parent folder runs `nepomuk rekey --pending` (the vault keeps the request)"
+                ));
             }
         }
         Ok(())
+    }
+
+    /// Rekeys the nodes waiting for it (§8.1) that the author may rekey; returns their paths.
+    pub fn rekey_pending(&mut self) -> Result<Vec<String>> {
+        let pending: BTreeSet<Id> = self.state.rekey_pending.keys().copied().collect();
+        if pending.is_empty() {
+            return Err(Error::not_found("pending rekeys"));
+        }
+        let before = self.state.rekey_pending.len();
+        let paths: BTreeMap<Id, String> = pending.iter().map(|n| (*n, self.path_of(*n))).collect();
+        self.rekey_all(pending)?;
+        let done: Vec<String> = paths
+            .into_iter()
+            .filter(|(n, _)| !self.state.rekey_pending.contains_key(n))
+            .map(|(_, p)| p)
+            .collect();
+        if self.state.rekey_pending.len() == before {
+            return Err(Error::access_denied("pending rekeys").with(
+                "reason",
+                "none of the pending rekeys can be done by you: they need admin on the parent folder",
+            ));
+        }
+        // The tasks are kept in the vault; repeating them as warnings adds nothing.
+        self.warnings.retain(|w| !w.contains("rekey --pending"));
+        Ok(done)
     }
 
     /// Marks all secrets in the subtrees for rotation; returns their paths.
@@ -1115,7 +1143,96 @@ impl<'a> Tx<'a> {
         self.push(Op::UpdateOwnCredential { credential: cred })
     }
 
-    pub fn transfer_master(&mut self, user: Id) -> Result<()> {
+    /// Replaces the author's own keys (§4.4), re-wrapping their grants and group memberships for
+    /// the new public keys. Grants the author cannot read (unproven paths) are dropped.
+    pub fn rotate_own_keys(
+        &mut self,
+        kem: crypto::KemPublic,
+        sig: crypto::SigPublic,
+        credential: Option<crypto::PasswordSealed>,
+        proof: Vec<u8>,
+    ) -> Result<()> {
+        let me = self.me;
+        let vault = self.vault();
+        let mut tmp = self.state.clone();
+        tmp.users.get_mut(&me).unwrap().kem = kem.clone();
+        let mine: Vec<Grant> = self
+            .state
+            .grants
+            .values()
+            .filter(|g| g.to == Principal::User(me))
+            .cloned()
+            .collect();
+        let mut grants = Vec::new();
+        for g in mine {
+            let (Some(nk), Some(proof)) = (
+                self.access().key(g.node).cloned(),
+                self.access().proof(g.node),
+            ) else {
+                self.warnings.push(format!(
+                    "your grant on node {} was dropped: it cannot be read with your keys",
+                    g.node.hex()
+                ));
+                continue;
+            };
+            grants.push(keyring::make_grant(
+                &tmp, g.id, g.node, g.to, g.right, &nk, &proof,
+            )?);
+        }
+        let mut memberships = BTreeMap::new();
+        let groups: Vec<Id> = self
+            .state
+            .groups
+            .values()
+            .filter(|g| g.members.contains_key(&me))
+            .map(|g| g.id)
+            .collect();
+        for gid in groups {
+            let seed = match self.access().groups.get(&gid) {
+                Some((seed, _)) => LockedSeed::from_slice(seed.as_ref())?,
+                None => {
+                    let name = self.state.groups[&gid].name.clone();
+                    self.warnings.push(format!(
+                        "you left group {name}: its key cannot be read with your keys"
+                    ));
+                    continue;
+                }
+            };
+            memberships.insert(
+                gid,
+                crypto::wrap(&kem, seed.as_ref(), &keyring::aad_member(vault, gid, me))?,
+            );
+        }
+        self.push(Op::RotateOwnKeys {
+            kem,
+            sig,
+            credential,
+            proof,
+            grants,
+            memberships,
+        })?;
+        if self
+            .state
+            .grants
+            .values()
+            .any(|g| g.to == Principal::User(me))
+            || self
+                .state
+                .groups
+                .values()
+                .any(|g| g.members.contains_key(&me))
+        {
+            self.warnings.push(
+                "your old keys can no longer sign or receive anything new, but whoever has them (or the old password and the git history) can still read what you could read until it is rekeyed; if they leaked, ask an admin to rekey your folders".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Transfers the master role (§8.3). Unless `keep_access`, the former master gives up its
+    /// grants on the root in the same commit; either way the new master should rekey the root,
+    /// since the former master held every node key.
+    pub fn transfer_master(&mut self, user: Id, keep_access: bool) -> Result<()> {
         let root = self.state.root;
         if !self
             .state
@@ -1145,7 +1262,30 @@ impl<'a> Tx<'a> {
             }
             self.push(Op::Grant { grant: g })?;
         }
-        self.push(Op::TransferMaster { user })
+        self.push(Op::TransferMaster { user })?;
+        let new = self.state.users[&user].name.clone();
+        if keep_access || user == self.me {
+            self.warnings.push(format!(
+                "you keep admin on / as a regular user; {new} can revoke it (`nepomuk revoke user:{} /`)",
+                self.state.users[&self.me].name
+            ));
+            return Ok(());
+        }
+        let own: Vec<Id> = self
+            .state
+            .grants
+            .values()
+            .filter(|g| g.node == root && g.to == Principal::User(self.me))
+            .map(|g| g.id)
+            .collect();
+        for g in own {
+            self.push(Op::Revoke { grant: g })?;
+        }
+        self.warnings.push(format!(
+            "you no longer have access to /, but you held every key until now: {new} should run `nepomuk rekey /`"
+        ));
+        self.tasks.push(format!("{new}: run `nepomuk rekey /`"));
+        Ok(())
     }
 
     // ------------------------------------------------------------ Groups

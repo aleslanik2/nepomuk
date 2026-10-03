@@ -132,8 +132,9 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             if !use_touchid {
                 *ctx.password_override.borrow_mut() = Some(Zeroizing::new(p_str(p, "password")?));
             }
+            // The app keeps its own session: a Touch ID unlock here must not also leave the
+            // identity in the agent, where locking the app would not reach it.
             ctx.opts.touchid = use_touchid;
-            ctx.opts.session = !use_touchid;
             ctx.opts.remember_touchid = p_bool(p, "remember_touchid");
             let result = app::open_vault(ctx, true).and_then(|o| {
                 let id = ctx.unlock(&o.v.state)?;
@@ -164,7 +165,10 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
         }
         "session.lock" => {
             *ctx.unlocked.borrow_mut() = None;
-            Ok(json!({ "locked": true }))
+            // Locking the app locks nepomuk: identities cached by the Touch ID agent for the
+            // command line go too (`nepomuk lock`).
+            let agent = crate::agent::forget(None);
+            Ok(json!({ "locked": true, "agent_cleared": agent }))
         }
         "vault.status" => app::status(ctx),
         "vault.info" => Ok(queries::info(&app::open_vault(ctx, true)?)),
@@ -180,7 +184,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                 p.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize),
             )
         }
-        "vault.trust" => app::trust(ctx, &p_str(p, "fingerprint")?),
+        "vault.trust" => app::trust(ctx, &p_str(p, "fingerprint")?, p_bool(p, "replace")),
         "whoami" => queries::whoami(ctx, &app::open_vault(ctx, true)?),
         "node.list" => {
             let o = app::open_vault(ctx, true)?;

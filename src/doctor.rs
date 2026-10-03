@@ -426,6 +426,9 @@ fn vault_checks(ctx: &Ctx, fps: &[(String, String)], out: &mut Vec<Check>) {
         }
         Err(e) => {
             let hint = match e.code {
+                crate::error::Code::UntrustedRoot if e.details.get("needs_replace").is_some() => {
+                    "this is not the vault or master trusted on this computer – the file may have been swapped; ask your administrator before running `nepomuk trust --replace <fingerprint>`"
+                }
                 crate::error::Code::UntrustedRoot => {
                     "verify the master fingerprint with your administrator and run `nepomuk trust <fingerprint>`"
                 }

@@ -352,7 +352,7 @@ impl Ctx {
     }
 
     fn check_session(&self) -> Result<()> {
-        if self.opts.session && self.password_override.borrow().is_none() {
+        if self.opts.session && !self.opts.touchid && self.password_override.borrow().is_none() {
             return Err(Error::new(
                 Code::PasswordRequired,
                 "the session is locked; call session.unlock",
@@ -504,6 +504,7 @@ pub struct Opened {
 /// Determines the pinned master fingerprint (§7.1).
 fn pin_for(
     ctx: &Ctx,
+    loc: &Location,
     vault: crate::model::Id,
     mem: &VaultMemory,
     file: &VaultFile,
@@ -548,7 +549,29 @@ fn pin_for(
     if let Some(fp) = project_fp {
         err = err.with("project_fingerprint", fp);
     }
-    Err(err)
+    Err(with_replaced_vault(err, loc, vault)?)
+}
+
+/// A vault without a pin at a place where another, pinned vault was opened before is not a
+/// first start: the file has been swapped. Say so, and require `trust --replace`.
+fn with_replaced_vault(err: Error, loc: &Location, vault: crate::model::Id) -> Result<Error> {
+    let Some(prev) = config::Locations::load()?.previous(&loc.path, vault) else {
+        return Ok(err);
+    };
+    let Some(prev_pin) = VaultMemory::load(prev)?.pin else {
+        return Ok(err);
+    };
+    let mut e = Error::new(
+        Code::UntrustedRoot,
+        format!(
+            "{} held another vault before, pinned to {prev_pin}; this file is a different vault with a different master. If this was not announced to you, do not trust it",
+            loc.path.display()
+        ),
+    );
+    e.details = err.details;
+    Ok(e.with("replaces_vault_id", prev.hex())
+        .with("pinned", prev_pin)
+        .with("needs_replace", true))
 }
 
 /// The master fingerprint the file claims (unverified; for display only).
@@ -639,8 +662,16 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
     let mut mem = VaultMemory::load(vault)?;
-    let pin = pin_for(ctx, vault, &mem, &file)?;
-    let v = verify_file_with(file, &pin, &mem.former)?;
+    let pin = pin_for(ctx, &loc, vault, &mem, &file)?;
+    let v = verify_file_with(file, &pin, &mem.former).map_err(|e| {
+        // Signed by a key that is not the pinned master and no transfer from it: a different
+        // vault with the same id, not a first start.
+        if e.code == Code::UntrustedRoot && e.details.get("found").is_some() {
+            e.with("needs_replace", true)
+        } else {
+            e
+        }
+    })?;
     check_memory(&v, &mem)?;
     check_former_signer(&v, &mut mem, &pin)?;
     if ctx.ci() {
@@ -660,6 +691,9 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
+    if !ctx.ci() {
+        config::Locations::record(&loc.path, vault)?;
+    }
     Ok(Opened { loc, loaded, v })
 }
 
@@ -722,6 +756,17 @@ pub fn human_age(secs: i64) -> String {
 
 // ---------------------------------------------------------------- Write intents
 
+/// Public keys for `identity passwd` (§4.4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RotatedKeys {
+    pub kem: crypto::KemPublic,
+    pub sig: crypto::SigPublic,
+    #[serde(with = "serde_bytes")]
+    pub proof: Vec<u8>,
+    /// The new password over the current seed, used instead when the user is the master.
+    pub master_credential: Option<crypto::PasswordSealed>,
+}
+
 /// A write expressed as intent ("store X", "give Bob read") so that it can be replayed on top of
 /// a newer vault after a rejected push or during `sync` (§9.3).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -750,6 +795,8 @@ pub enum Intent {
     Rekey {
         path: String,
     },
+    /// Rekeys what the vault records as pending (§8.1) as far as the author may.
+    RekeyPending,
     Grant {
         who: String,
         right: Right,
@@ -798,9 +845,17 @@ pub enum Intent {
     },
     Passwd {
         credential: crypto::PasswordSealed,
+        /// New keys (§4.4): the credential seals a new seed, so the old password (still in the
+        /// git history) no longer unlocks the identity. Public parts only; no secret is stored
+        /// in the intent.
+        #[serde(default)]
+        rotate: Option<RotatedKeys>,
     },
     MasterTransfer {
         user: String,
+        /// The former master keeps its grant on the root (§8.3).
+        #[serde(default)]
+        keep_access: bool,
     },
     /// Folders and secrets copied from another vault (`nepomuk migrate`), in one commit.
     Import {
@@ -954,6 +1009,10 @@ impl Intent {
                 tx.rekey(n)?;
                 json!({ "path": path })
             }
+            Intent::RekeyPending => {
+                let done = tx.rekey_pending()?;
+                json!({ "rekeyed": done })
+            }
             Intent::Grant { who, right, path } => {
                 let p = tx.principal(who)?;
                 tx.grant(p, *right, path)?;
@@ -1023,13 +1082,34 @@ impl Intent {
                 tx.clear_rotation(path)?;
                 json!({ "path": path })
             }
-            Intent::Passwd { credential } => {
-                tx.update_own_credential(credential.clone())?;
-                json!({ "updated": true })
-            }
-            Intent::MasterTransfer { user } => {
+            Intent::Passwd { credential, rotate } => match rotate {
+                Some(k) if !tx.state.is_master(tx.me) => {
+                    tx.rotate_own_keys(
+                        k.kem.clone(),
+                        k.sig.clone(),
+                        Some(credential.clone()),
+                        k.proof.clone(),
+                    )?;
+                    json!({ "updated": true, "rotated": true })
+                }
+                _ => {
+                    // Only the credential of the master changes: its keys are pinned everywhere.
+                    let cred = match rotate {
+                        Some(k) => k.master_credential.clone().ok_or_else(|| {
+                            Error::general("missing credential for the current keys")
+                        })?,
+                        None => credential.clone(),
+                    };
+                    tx.update_own_credential(cred)?;
+                    tx.warnings.push(
+                        "the master's keys are pinned everywhere and stay the same: whoever knows the old password and has the git history can still unlock it; if it leaked, transfer the master role to a new identity".into(),
+                    );
+                    json!({ "updated": true, "rotated": false })
+                }
+            },
+            Intent::MasterTransfer { user, keep_access } => {
                 let u = tx.user_named(user)?;
-                tx.transfer_master(u)?;
+                tx.transfer_master(u, *keep_access)?;
                 let fp = crate::verify::user_fp(&tx.state.users[&u]);
                 json!({ "user": user, "new_fingerprint": fp })
             }
@@ -1256,6 +1336,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::RmNode { node } => format!("rm --node {node}"),
         Intent::Mv { src, dst } => format!("mv {src} {dst}"),
         Intent::Rekey { path } => format!("rekey {path}"),
+        Intent::RekeyPending => "rekey --pending".into(),
         Intent::Grant { who, right, path } => format!("grant {who} {} {path}", right.as_str()),
         Intent::Revoke { who, path, .. } => format!("revoke {who} {path}"),
         Intent::UserAdd { .. } => "user add".into(),
@@ -1269,7 +1350,7 @@ pub fn describe(i: &Intent) -> String {
         Intent::SysRevoke { user, right } => format!("sysrevoke {user} {right}"),
         Intent::RotationDone { path } => format!("rotation done {path}"),
         Intent::Passwd { .. } => "identity passwd".into(),
-        Intent::MasterTransfer { user } => format!("master transfer {user}"),
+        Intent::MasterTransfer { user, .. } => format!("master transfer {user}"),
         Intent::Import { entries } => format!("import of {} items", entries.len()),
     }
 }
@@ -1339,6 +1420,7 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     mem.head = Some(hex::encode(file.head_hash()));
     mem.checkpoint = Some(hex::encode(file.head_hash()));
     mem.save(file.vault_id)?;
+    config::Locations::record(&loc.path, file.vault_id)?;
     Ok(json!({
         "vault": loc.path.display().to_string(),
         "vault_id": file.vault_id.hex(),
@@ -1348,7 +1430,13 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     }))
 }
 
-pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
+/// Pins the master fingerprint of the vault (§7.1).
+///
+/// Replacing a pin is what an attacker who swaps the vault file wants the user to do, so it
+/// needs `replace` unless the file proves the change: its checkpoint is signed by the master
+/// pinned here (or a former one) and its log transfers the master role to `fp`. The same holds
+/// for a vault at a place where another pinned vault was opened before.
+pub fn trust(ctx: &Ctx, fp: &str, replace: bool) -> Result<Value> {
     if !fp.starts_with("npk1") || bech32::decode(fp).is_err() {
         return Err(Error::usage("invalid fingerprint (expected npk1…)"));
     }
@@ -1356,12 +1444,44 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
     let loaded = loc.load(!ctx.opts.offline)?;
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
+    let mut mem = VaultMemory::load(vault)?;
+    let signer = claimed_master_fp(&file).unwrap_or_default();
+    let replacing = mem.pin.clone().filter(|p| p != fp);
+    let proven = mem.pin.as_deref() == Some(signer.as_str()) || mem.former.contains(&signer);
+    let replacing_vault = match config::Locations::load()?.previous(&loc.path, vault) {
+        Some(prev) => VaultMemory::load(prev)?.pin.map(|p| (prev, p)),
+        None => None,
+    };
+    let unproven_change = replacing.is_some() && !(proven && signer != fp);
+    if !replace && (unproven_change || replacing_vault.is_some()) {
+        let mut e = Error::new(
+            Code::UntrustedRoot,
+            "this would replace the master pinned on this computer; a vault swapped by an attacker looks exactly like this. Confirm the new fingerprint with your administrator, then run `nepomuk trust --replace <fingerprint>`",
+        )
+        .with("found", signer.clone())
+        .with("needs_replace", true);
+        if let Some(p) = &replacing {
+            e = e.with("pinned", p.clone());
+        }
+        if let Some((prev, p)) = &replacing_vault {
+            e = e
+                .with("replaces_vault_id", prev.hex())
+                .with("pinned", p.clone());
+        }
+        return Err(e);
+    }
+    if replace && unproven_change {
+        // A deliberate new root of trust: nothing pinned before is trusted any more, and the
+        // history seen under the old master says nothing about the new one.
+        mem = VaultMemory {
+            fetched_at: mem.fetched_at,
+            ..Default::default()
+        };
+    }
     // Verify before pinning: the fingerprint must be the vault's current master, and the
     // checkpoint must be signed by it or by a master pinned here before.
-    let mut mem = VaultMemory::load(vault)?;
     let mut trusted = mem.former.clone();
     trusted.extend(mem.pin.clone());
-    let signer = claimed_master_fp(&file).unwrap_or_default();
     let v = verify_file_with(file, fp, &trusted).map_err(|e| {
         if e.code == Code::UntrustedRoot && signer != fp && !trusted.contains(&signer) {
             e.with(
@@ -1389,6 +1509,8 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
+    config::Locations::record(&loc.path, vault)?;
+    let previous = replacing.or(previous).or(replacing_vault.map(|(_, p)| p));
     Ok(json!({ "vault_id": vault.hex(), "pinned": fp, "previous": previous, "seq": v.seq }))
 }
 

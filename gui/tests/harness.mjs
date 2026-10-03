@@ -396,6 +396,23 @@ step("switch to another vault", async () => {
   // The second vault has a different master, not pinned yet.
   await waitFor(hasText("Verify the master"), "trust screen of the second vault");
 });
+step("a swapped vault file is not a first start", async () => {
+  await click("Back");
+  await waitFor(hasText("Open a vault"), "start screen");
+  // An attacker replaces the trusted vault with one of their own (another master).
+  writeFileSync(env.NEPOMUK_VAULT, readFileSync(vault2));
+  const fp2 = JSON.parse(run(["--identity", join(work, "master2.npk"), "--vault", vault2, "info"], { NEPOMUK_PASSPHRASE: MASTER_PASS })).data.master_fingerprint;
+  picks.push(env.NEPOMUK_VAULT);
+  await click("Vault file");
+  await waitFor(hasText("This is not the vault you trusted"), "swap warning");
+  await type("input.mono", fp2);
+  await waitFor(hasText("Matches the vault"), "match");
+  if (!(await js(`[...document.querySelectorAll("button")].find(b => b.innerText.includes("Replace the pinned master")).disabled`)))
+    throw new Error("replacing the pin must need the confirmation");
+  await shot("15-swapped-vault");
+  await click("Close this vault");
+  await waitFor(hasText("Open a vault"), "closed");
+});
 
 let failed = false;
 for (const [name, fn] of steps) {

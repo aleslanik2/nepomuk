@@ -115,19 +115,58 @@ async function afterConnect() {
 // ------------------------------------------------------------------ Root of trust (§7.1)
 
 function renderTrust(err) {
-  const claimed = err.details?.claimed_fingerprint || err.details?.new_fingerprint || err.details?.found || "";
-  const transferred = !!err.details?.new_fingerprint;
+  const d = err.details || {};
+  const claimed = d.claimed_fingerprint || d.new_fingerprint || d.found || "";
+  const transferred = !!d.new_fingerprint;
+  // A pin exists for this vault, or another pinned vault was opened from this file before:
+  // this is not a first start, and the usual reason is a swapped vault file.
+  const replacing = !transferred && (!!d.needs_replace || !!d.pinned);
   const input = h("input", { class: "mono", placeholder: "npk1…", autocomplete: "off", spellcheck: "false" });
   const verdict = h("div", { class: "match" });
-  const trustBtn = h("button", { class: "primary", type: "submit", disabled: true }, "Trust this master");
+  const confirm = h("input", { type: "checkbox" });
+  const trustBtn = h("button", { class: replacing ? "danger" : "primary", type: "submit", disabled: true },
+    replacing ? "Replace the pinned master" : "Trust this master");
   const check = () => {
     const v = input.value.trim();
     const ok = v && v === claimed;
-    trustBtn.disabled = !ok;
+    trustBtn.disabled = !ok || (replacing && !confirm.checked);
     verdict.className = `match ${v ? (ok ? "yes" : "no") : ""}`;
     verdict.textContent = v ? (ok ? "Matches the vault's master." : "Does not match the vault's master. Do not trust this vault.") : "";
   };
   input.addEventListener("input", check);
+  confirm.addEventListener("change", check);
+  const submit = async (ev) => {
+    ev.preventDefault();
+    const ok = await busy(trustBtn, () => rpc("vault.trust", { fingerprint: input.value.trim(), replace: replacing }));
+    if (ok) {
+      toast(replacing ? "The pinned master was replaced." : "Master fingerprint pinned.");
+      afterConnect();
+    }
+  };
+  const back = h("button", { class: replacing ? "primary" : "quiet", type: "button", onClick: () => renderStart() },
+    replacing ? "Close this vault" : "Back");
+
+  if (replacing) {
+    mount(app, gate(
+      h("div", { class: "stack" },
+        h("p", "Pinned on this computer:"),
+        d.pinned ? fingerprint(d.pinned, 72) : h("p", "—"),
+        h("p", "The file now claims:"),
+        claimed ? fingerprint(claimed, 72) : h("p", "No master fingerprint found.")),
+      h("h1", "This is not the vault you trusted"),
+      h("div", { class: "notice warn" }, d.replaces_vault_id
+        ? "A different vault, with a different master, has replaced the one you opened from this place before."
+        : "This vault is not signed by the master pinned on this computer, and no signed hand-over from it exists."),
+      h("p", "Someone who can push to the repository may have swapped the file to make you store secrets under their key. Close the vault and ask your administrator. Replace the pin only if they announced a new vault or master and you confirmed its fingerprint over a separate channel."),
+      h("form", { onSubmit: submit },
+        h("label", "New fingerprint from your administrator", input),
+        verdict,
+        h("label", { class: "check" }, confirm, " I confirmed this fingerprint with my administrator over a separate channel"),
+        h("div", { class: "actions" }, back, trustBtn))));
+    back.focus();
+    return;
+  }
+
   mount(app, gate(
     h("div", { class: "stack" },
       h("p", "The vault claims this master:"),
@@ -136,17 +175,10 @@ function renderTrust(err) {
     h("p", transferred
       ? "The master role of this vault was transferred to a new identity. Confirm the new fingerprint with your administrator before you continue."
       : "nepomuk opens a vault only after you pin its master fingerprint. Get the fingerprint from your administrator through a separate channel and paste it here."),
-    h("form", { onSubmit: async (ev) => {
-      ev.preventDefault();
-      const ok = await busy(trustBtn, () => rpc("vault.trust", { fingerprint: input.value.trim() }));
-      if (ok) {
-        toast("Master fingerprint pinned.");
-        afterConnect();
-      }
-    } },
+    h("form", { onSubmit: submit },
       h("label", "Fingerprint from your administrator", input),
       verdict,
-      h("div", { class: "actions" }, trustBtn, h("button", { class: "quiet", type: "button", onClick: () => renderStart() }, "Back")))));
+      h("div", { class: "actions" }, trustBtn, back))));
   input.focus();
 }
 

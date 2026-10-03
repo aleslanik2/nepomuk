@@ -281,3 +281,82 @@ fn touch_id_prompt_names_the_project() {
         "use master for eshop-android (vault.nepomuk): nepomuk exec release"
     );
 }
+
+/// Audit finding 7: a Touch ID unlock in the app does not feed the agent, and locking the app
+/// clears identities the agent holds for the command line.
+#[test]
+fn app_lock_clears_the_agent() {
+    use std::io::{BufRead, BufReader, Write};
+    let e = Env::new("agent-app");
+    let helper = e.path("nepomuk-touchid");
+    std::fs::write(&helper, FAKE_HELPER).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(e.path("cfg/config.toml"), "agent_timeout = 60\n").unwrap();
+    let tmp = std::env::temp_dir();
+    let base: Vec<(&str, &str)> = vec![
+        ("NEPOMUK_TOUCHID_HELPER", helper.to_str().unwrap()),
+        ("TMPDIR", tmp.to_str().unwrap()),
+    ];
+    let id = e.master_identity();
+    let mut enable_env = base.clone();
+    enable_env.push(("NEPOMUK_PASSPHRASE", MASTER_PASS));
+    e.cmd(
+        &[
+            "--identity",
+            id.to_str().unwrap(),
+            "identity",
+            "touchid",
+            "enable",
+        ],
+        &enable_env,
+        None,
+    )
+    .ok();
+    e.cmd(&["lock"], &base, None);
+    // Identities the agent holds for any terminal (this test runs outside of one).
+    let cached = || {
+        let d = e.cmd(&["agent"], &base, None).json()["data"].clone();
+        d["vaults"].as_array().map_or(0, |v| v.len()) as u64
+            + d["cached_elsewhere"].as_u64().unwrap_or(0)
+    };
+
+    let mut c = e.command(&["serve", "--stdio"], &base);
+    c.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut app = c.spawn().unwrap();
+    let mut stdin = app.stdin.take().unwrap();
+    let mut stdout = BufReader::new(app.stdout.take().unwrap());
+    let mut call = |id: u32, method: &str, params: serde_json::Value| {
+        let req =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(stdin, "{req}").unwrap();
+        loop {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == id {
+                return v;
+            }
+        }
+    };
+    let r = call(1, "session.unlock", serde_json::json!({ "touchid": true }));
+    assert_eq!(r["result"]["name"], "master", "{r}");
+    assert_eq!(
+        cached(),
+        0,
+        "the app's Touch ID unlock must not feed the agent"
+    );
+
+    // The command line caches the identity (only in a terminal); locking the app clears it.
+    let r = e.in_terminal(&[(&["--touchid", "whoami"], &base)]);
+    assert_eq!(r[0].data()["master"], true);
+    assert_eq!(cached(), 1);
+    let r = call(2, "session.lock", serde_json::json!({}));
+    assert_eq!(r["result"]["agent_cleared"], true, "{r}");
+    assert_eq!(cached(), 0);
+    drop(stdin);
+    let _ = app.wait();
+}

@@ -276,6 +276,20 @@ fn wrong_password_and_weak_password() {
 fn password_change() {
     let e = Env::new("passwd");
     e.add_password_user("jane@example.com");
+    e.m(&["mkdir", "-p", "/team/core"]).ok();
+    e.m_in(&["put", "/team/doc"], b"direct").ok();
+    e.m_in(&["put", "/team/core/wifi"], b"via-group").ok();
+    e.m(&["grant", "user:jane@example.com", "read", "/team"])
+        .ok();
+    e.m(&["group", "create", "core"]).ok();
+    e.m(&["group", "add", "core", "jane@example.com"]).ok();
+    e.m(&["grant", "group:core", "read", "/team/core"]).ok();
+    e.m(&["revoke", "--no-rekey", "user:jane@example.com", "/team"])
+        .ok();
+    e.m(&["grant", "user:jane@example.com", "read", "/team"])
+        .ok();
+    // The vault as it is in the git history before the change.
+    let before = std::fs::read(&e.vault).unwrap();
     let old = password_for("jane@example.com");
     let new = "a-completely-new-long-password";
     let input = format!("{old}\n{new}\n");
@@ -301,6 +315,38 @@ fn password_change() {
         e.u("jane@example.com", &["whoami"]).err_code(),
         "BAD_CREDENTIALS"
     );
+    // Grants and group memberships follow the new keys.
+    let get = |path: &str| {
+        e.cmd(
+            &["--email", "jane@example.com", "get", path],
+            &[("NEPOMUK_PASSWORD", new)],
+            None,
+        )
+        .data()["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get("/team/doc"), "direct");
+    assert_eq!(get("/team/core/wifi"), "via-group");
+    e.m(&["verify"]).ok();
+
+    // Audit finding 3: the old password, with the old credential from the git history, no
+    // longer unlocks an identity of the vault.
+    use nepomuk::format::VaultFile;
+    // SAFETY: every test of this binary that reads it wants the same value.
+    unsafe { std::env::set_var("NEPOMUK_INSECURE_TEST_KDF", "1") };
+    let old_file = VaultFile::parse(&before).unwrap();
+    let fp = e.m(&["info"]).data()["master_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let old_state = nepomuk::verify::verify_file(old_file, &fp).unwrap().state;
+    let old_user = old_state.user_by_name("jane@example.com").unwrap();
+    let old_id = nepomuk::identity::unlock_password_user(old_user, &old).unwrap();
+    let now = VaultFile::parse(&std::fs::read(&e.vault).unwrap()).unwrap();
+    let now = nepomuk::verify::verify_file(now, &fp).unwrap();
+    assert!(nepomuk::tx::find_me(&now.state, &old_id).is_err());
 }
 
 #[test]
@@ -517,7 +563,14 @@ fn delegated_offboarding_returns_tasks() {
     assert_eq!(
         e.u("alice@example.com", &["ls"]).err_code(),
         "IDENTITY_DISABLED"
+    ); // The rekey the IT admin could not do is kept in the vault for the folder's admins.
+    let info = e.m(&["info"]).data();
+    assert!(
+        info["warnings"].to_string().contains("rekey --pending"),
+        "{info}"
     );
+    e.m(&["rekey", "--pending"]).ok();
+    assert_eq!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
 }
 
 #[test]
@@ -616,10 +669,64 @@ fn trust_and_root_of_trust() {
     )
     .data();
 
-    // A vault file swapped for another vault with a different master is rejected.
+    // A vault file swapped for another vault with a different master is rejected, and is not
+    // presented as a first start: the vault seen here before is named.
+    let first_id = e.m(&["info"]).data()["vault_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     std::fs::copy(&other.vault, &e.vault).unwrap();
     let r = e.m(&["info"]);
     assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    let d = &r.json()["error"]["details"];
+    assert_eq!(d["needs_replace"], true, "{d}");
+    assert_eq!(d["replaces_vault_id"], first_id.as_str());
+    assert_eq!(d["pinned"], fp.as_str());
+    // Pinning it needs an explicit --replace.
+    let r = e.cmd(&["trust", &other_fp], &[], None);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    let d = e.cmd(&["trust", "--replace", &other_fp], &[], None).data();
+    assert_eq!(d["previous"], fp.as_str());
+}
+
+/// A vault with the pinned vault's id but signed by another key: `trust` must not silently
+/// replace the pin (audit finding 4).
+#[test]
+fn trust_does_not_silently_replace_the_pin() {
+    use nepomuk::format::{CheckpointBody, Envelope, RawEntry, VaultFile, from_cbor, to_cbor};
+    use nepomuk::identity::Unlocked;
+    use nepomuk::model::IdentityKind;
+    let e = Env::new("trust-replace");
+    let info = e.m(&["info"]).data();
+    let fp = info["master_fingerprint"].as_str().unwrap().to_string();
+    let real = VaultFile::parse(&std::fs::read(&e.vault).unwrap()).unwrap();
+
+    // Mallory's own vault, relabelled with the real vault's id.
+    let mallory = Unlocked::generate("mallory", IdentityKind::Local);
+    let g = nepomuk::tx::genesis(&mallory).unwrap();
+    let mut cp: CheckpointBody = from_cbor(&g.entries[0].envelope.body).unwrap();
+    cp.vault_id = real.vault_id;
+    cp.state.vault_id = real.vault_id;
+    cp.seq = 100;
+    let body = to_cbor(&cp);
+    let sig = mallory.sig.sign("checkpoint", &body);
+    let forged = VaultFile {
+        vault_id: real.vault_id,
+        entries: vec![RawEntry::from_envelope(Envelope { body, sig })],
+    };
+    std::fs::write(&e.vault, forged.serialize()).unwrap();
+
+    let r = e.m(&["info"]);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    let mfp = mallory.fingerprint();
+    let r = e.cmd(&["trust", &mfp], &[], None);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["pinned"], fp.as_str());
+    // The pin is unchanged: the real vault still opens.
+    std::fs::write(&e.vault, real.serialize()).unwrap();
+    e.m(&["info"]).data();
 }
 
 #[test]
@@ -666,6 +773,19 @@ fn master_transfer() {
         .unwrap()
         .to_string();
     let new_master = e.add_local_user("new-master");
+    let trust = |state: &str, args: &[&str]| {
+        let mut c = e.command(args, &[]);
+        c.env("NEPOMUK_STATE_DIR", e.path(state));
+        let out = c.output().unwrap();
+        Res {
+            code: out.status.code().unwrap(),
+            stdout: String::from_utf8_lossy(&out.stdout).into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into(),
+        }
+    };
+    // Two other clients pinned to the master before the transfer.
+    trust("state-old", &["trust", &old_fp]).data();
+    trust("state-other", &["trust", &old_fp]).data();
     let d = e.m(&["master", "transfer", "new-master"]).data();
     let new_fp = d["new_fingerprint"].as_str().unwrap().to_string();
     // The author's client follows the transfer it signed.
@@ -684,6 +804,37 @@ fn master_transfer() {
     let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(j["error"]["code"], "UNTRUSTED_ROOT");
     assert_eq!(j["error"]["details"]["new_fingerprint"], new_fp.as_str());
+
+    // A client pinned to the old master follows a signed transfer without --replace…
+    let d = trust("state-old", &["trust", &new_fp]).data();
+    assert_eq!(d["pinned"], new_fp.as_str());
+    assert_eq!(d["previous"], old_fp.as_str());
+
+    // …but once the new master has compacted, the old pin proves nothing: --replace it is.
+    e.l(&new_master, "new-master", &["compact"]).data();
+    let r = trust("state-other", &["trust", &new_fp]);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    trust("state-other", &["trust", "--replace", &new_fp]).data();
+
+    // Audit finding 5: the former master gave up / and the new master is told to rekey it.
+    let info = e.l(&new_master, "new-master", &["info"]).data();
+    assert!(
+        info["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("rekey /")),
+        "{info}"
+    );
+    assert_eq!(
+        e.m(&["ls", "/"]).json()["ok"],
+        false,
+        "the former master still reads /"
+    );
+    e.l(&new_master, "new-master", &["rekey", "/"]).data();
+    let info = e.l(&new_master, "new-master", &["info"]).data();
+    assert_eq!(info["warnings"], serde_json::json!([]));
 }
 
 #[test]
@@ -975,6 +1126,70 @@ public class ToPkcs12 { public static void main(String[] a) throws Exception {
         e.m(&["get", "/s/ok#key_password"]).data()["value"],
         "key-pass-BBB"
     );
+}
+
+/// Audit finding 6: a revocation its author cannot rekey is recorded in the vault, shown to
+/// everyone, and done later by an admin of the parent with `rekey --pending`.
+#[test]
+fn revocation_without_rekey_is_kept_until_done() {
+    let e = Env::new("pending-rekey");
+    e.add_password_user("alice@example.com");
+    e.add_password_user("bob@example.com");
+    e.m(&["mkdir", "-p", "/team/x"]).ok();
+    e.m_in(&["put", "/team/x/key"], b"k").ok();
+    e.m(&["grant", "user:alice@example.com", "admin", "/team/x"])
+        .ok();
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+
+    // Alice is admin of /team/x but not of /team: she can revoke, not rekey.
+    let d = e
+        .u(
+            "alice@example.com",
+            &["revoke", "user:bob@example.com", "/team/x"],
+        )
+        .json();
+    assert_eq!(d["ok"], true, "{d}");
+    let warnings = d["data"]["warnings"].to_string();
+    assert!(warnings.contains("rekey --pending"), "{d}");
+    let info = e.u("alice@example.com", &["info"]).data();
+    assert!(
+        info["warnings"].to_string().contains("rekey --pending"),
+        "{info}"
+    );
+    // She cannot do it herself.
+    assert_eq!(
+        e.u("alice@example.com", &["rekey", "--pending"]).err_code(),
+        "ACCESS_DENIED"
+    );
+    // The master (admin of the parent) can, and the record goes away.
+    let d = e.m(&["rekey", "--pending"]).data();
+    assert_eq!(d["rekeyed"], serde_json::json!(["/team/x"]));
+    let info = e.m(&["info"]).data();
+    assert_eq!(info["warnings"], serde_json::json!([]));
+    assert_eq!(
+        e.m(&["rekey", "--pending"]).err_code(),
+        "NOT_FOUND",
+        "nothing left"
+    );
+    assert_eq!(
+        e.u("alice@example.com", &["get", "/team/x/key"]).data()["value"],
+        "k"
+    );
+
+    // Giving the access back also settles it.
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+    e.u(
+        "alice@example.com",
+        &["revoke", "user:bob@example.com", "/team/x"],
+    )
+    .ok();
+    assert_ne!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+    assert_eq!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
+    e.m(&["verify"]).ok();
 }
 
 /// The pseudo-terminal helper used by the Touch ID agent tests on macOS.

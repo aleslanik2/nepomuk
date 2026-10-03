@@ -146,7 +146,8 @@ Neither the master nor an administrator ever learns the user's password or priva
 
 ### 4.4 Recovery and change
 
-- **Changing a password or passphrase** re-encrypts only the seed; keys and grants stay the same.
+- **Changing a password** (`nepomuk identity passwd`) creates new keys: the old credential stays in the git history, so re-encrypting the same seed would leave the identity open to anyone who knows the old password. One `RotateOwnKeys` operation sets the new public keys and credential (with a proof of possession) and re-wraps the user's own grants and group memberships for the new keys; only the user's own grants and groups can be touched, anything left out is dropped, and the master cannot rotate (its keys are pinned; it changes only its credential, with a warning). Old keys can no longer sign or receive anything new, but whatever they could decrypt until then stays decryptable until it is rekeyed. Cached unlocks (agent, Touch ID) are cleared.
+- **Changing the passphrase of an identity file** re-encrypts the file only; keys and grants stay the same.
 - **Forgotten password / lost key**: users cannot recover anything themselves. They submit a new request, an administrator approves it as a replacement of the old identity (inheriting groups), and admins who hold the keys re-issue the grants. The old identity is revoked.
 
 ## 5. Permission model
@@ -259,6 +260,8 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 - The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override.
 - `root_fp` in `.nepomuk.toml` is only a hint: it is shown next to the fingerprint the file claims, but never pinned automatically, because whoever controls the project repository could ship a vault of their own with a matching fingerprint. A pin that differs from it produces a warning.
 - Without a pin nepomuk does not open the file.
+- Replacing a pin is what an attacker who swaps the vault file wants, so `nepomuk trust` replaces a different pin only with `--replace` – unless the file proves the change: its checkpoint is signed by the master pinned here (or a former one) and its log transfers the master role to the new fingerprint. After the new master has compacted, that proof is gone and `--replace` is needed. Errors that would need it carry `needs_replace` and the currently pinned fingerprint.
+- The client remembers which vault was opened from which file (`locations.json` in the local state). An unpinned vault at a place where another pinned vault was opened before is not treated as a first start: the error names the previous vault (`replaces_vault_id`) and pinning needs `--replace`. The GUI shows a warning screen with both fingerprints instead of the first-start screen, defaults to closing the vault and requires an explicit confirmation to replace the pin.
 - **The checkpoint is the anchor**: it must be signed by the pinned master, or, until the next `compact`, by a master pinned earlier on this machine and replaced after a `TransferMaster` – and then only if the file contains, as a commit, the head this machine saw before (a former master can sign a checkpoint of any content). Former masters are forgotten once a checkpoint signed by the pinned master is seen. A log that ends with a transfer to the pinned master proves nothing on its own – a forged checkpoint could contain it.
 - After a master transfer the new master should run `compact`; until then, clients that never pinned the former master cannot open the vault.
 - The local state (pins, `seq`, head) fails closed: an unreadable or corrupt state file is an error.
@@ -287,6 +290,7 @@ Each commit carries one or more operations applied atomically. The client verifi
 | --- | --- |
 | `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all grants, memberships and system rights of the user (re-granted only by holders of the rights, with `+delegate` for system rights), so re-enabling a disabled user grants nothing |
 | `UpdateOwnCredential` (password change, Argon2id parameters) | the user themselves |
+| `RotateOwnKeys` (password change, §4.4) | the user themselves, not the master; with a proof of possession of the new keys; may re-wrap only the user's own grants (metadata unchanged) and memberships |
 | `CreateGroup` | master or `groups` |
 | `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |
 | `CreateNode` | `write` on the parent |
@@ -297,7 +301,8 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `Rekey` (new NK for a subtree) | `admin` on the node's parent or master |
 | `GrantSystemRight` | the same right with `+delegate`, or master |
 | `MarkRotation`, `ClearRotation` | `write` on the node |
-| `TransferMaster`, `Checkpoint` | master |
+| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1) |
+| `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
 ### 8.1 Revocation and rekey
 
@@ -307,6 +312,8 @@ Each commit carries one or more operations applied atomically. The client verifi
 4. nepomuk lists the secrets the revoked party had access to and marks them "pending rotation".
 
 Everything below a node decrypts with that node's key, so whoever rekeys can read the whole subtree. A node that does not decrypt (written by a broken or malicious client of someone with `write` there) would make the rekey impossible; the rekey removes it in the same commit, with a warning naming its id. This takes nothing from anyone with legitimate access and is no more than its writer could do with `rm`; the node stays in git history. A readable folder whose own content does not decrypt but which has readable children is sealed again as an empty folder instead. `nepomuk rm --node <id>` removes such a node directly. If a rekey still cannot be built, the revocation is committed without it, with a warning and a task.
+
+A rekey needs `admin` on the node's parent (the new key is wrapped under the parent's key). When the author of a revocation or of a group removal lacks it, the operation is committed and the state records the node with the principals that still know its key (`rekey_pending`); `DisableUser` records the nodes the disabled user could read in the same way. Every client derives this record from the log. It is cleared by a `Rekey` of the node or an ancestor, by deleting it, or for one principal by granting that principal access again. `info` (and the GUI) report pending rekeys, and `nepomuk rekey --pending` performs those the author may.
 
 Rekey protects only future content. Anything the revoked party has already seen must be changed at the source (new certificate, new database password, upload key reset in Google Play).
 
@@ -321,6 +328,13 @@ Rekey protects only future content. Anything the revoked party has already seen 
 - marks secrets for rotation and lists them (the GUI turns them into a checklist).
 
 If the author does not hold keys to all affected nodes (e.g. has only `users`), offboarding disables the identity, removes the memberships and grants it is able to remove, and returns the rest (rekey) as tasks for the admins of the respective folders. A disabled identity cannot sign any further change, effective immediately.
+
+### 8.3 Master transfer
+
+`nepomuk master transfer <user>` gives the new master an `admin` grant on the root (if needed) and the master role. The former master held every node key, so:
+
+- unless `--keep-access`, the former master revokes its own grant on the root in the same commit;
+- the state records the former master (`former_master`) until the root is rekeyed; while it is set and the former master no longer has `admin` on the root, `info` (and the GUI) tells the master to run `nepomuk rekey /`. With `--keep-access` the former master stays an admin deliberately and nothing is reported.
 
 ## 9. Git integration
 
@@ -379,7 +393,7 @@ History keeps all old versions of the vault and is not erased. That is why secre
 
 | Area | Commands |
 | --- | --- |
-| Vault | `init`, `trust`, `info`, `status`, `verify [--full]`, `log`, `compact`, `sync` |
+| Vault | `init`, `trust [--replace]`, `info`, `status`, `verify [--full]`, `log`, `compact`, `sync` |
 | Identity | `identity new`, `identity request`, `identity passwd`, `passgen` |
 | Users | `user add <request>`, `user list`, `user disable`, `user offboard`, `user replace` |
 | Groups | `group create`, `group add`, `group remove`, `group list` |
@@ -490,6 +504,7 @@ A long-running process started by the GUI; JSON-RPC 2.0 over stdin and stdout, o
 - Solves the unlock cost: Argon2id (~1 s, 256 MiB) runs once per session, not on every click.
 - Only this process holds the unlocked identity, in locked memory; the GUI forgets the password once it is handed over.
 - Forgets the identity after inactivity (default 10 min), on a `lock` request, and when the screen is locked (signal from the GUI).
+- A Touch ID unlock in the session never puts the identity into the Touch ID agent, and `session.lock` (the app's Lock button and screen lock) also clears every identity the agent holds for the command line, like `nepomuk lock`.
 - Opens no socket or port; exits when stdin is closed.
 - Methods correspond to CLI commands: `vault.status`, `node.list`, `node.get`, `node.put`, `grant.add`, `user.offboard`, `sync.run`, `session.unlock`, `session.lock` …
 - Asynchronous events (notifications): `sync.progress`, `vault.changed`, `session.expired`.
