@@ -765,9 +765,37 @@ impl<'a> Tx<'a> {
                     "rekey {p} (node {}) – requires admin on its parent",
                     n.hex()
                 ));
+                self.warnings.push(format!(
+                    "{p} is not rekeyed: whoever lost access can still decrypt new content there until an admin of its parent folder runs `nepomuk rekey --pending` (the vault keeps the request)"
+                ));
             }
         }
         Ok(())
+    }
+
+    /// Rekeys the nodes waiting for it (§8.1) that the author may rekey; returns their paths.
+    pub fn rekey_pending(&mut self) -> Result<Vec<String>> {
+        let pending: BTreeSet<Id> = self.state.rekey_pending.keys().copied().collect();
+        if pending.is_empty() {
+            return Err(Error::not_found("pending rekeys"));
+        }
+        let before = self.state.rekey_pending.len();
+        let paths: BTreeMap<Id, String> = pending.iter().map(|n| (*n, self.path_of(*n))).collect();
+        self.rekey_all(pending)?;
+        let done: Vec<String> = paths
+            .into_iter()
+            .filter(|(n, _)| !self.state.rekey_pending.contains_key(n))
+            .map(|(_, p)| p)
+            .collect();
+        if self.state.rekey_pending.len() == before {
+            return Err(Error::access_denied("pending rekeys").with(
+                "reason",
+                "none of the pending rekeys can be done by you: they need admin on the parent folder",
+            ));
+        }
+        // The tasks are kept in the vault; repeating them as warnings adds nothing.
+        self.warnings.retain(|w| !w.contains("rekey --pending"));
+        Ok(done)
     }
 
     /// Marks all secrets in the subtrees for rotation; returns their paths.

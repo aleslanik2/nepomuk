@@ -354,6 +354,15 @@ pub fn state_warnings(s: &State) -> Vec<String> {
             f.name
         ));
     }
+    if !s.rekey_pending.is_empty() {
+        let n = s.rekey_pending.len();
+        out.push(format!(
+            "{n} folder{} or secret{} still readable by someone who lost access to {}: an admin of the parent folder should run `nepomuk rekey --pending`",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        ));
+    }
     out
 }
 

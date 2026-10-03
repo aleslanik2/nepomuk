@@ -197,6 +197,11 @@ pub struct State {
     /// node key at the time of the transfer (§8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub former_master: Option<Id>,
+    /// Nodes whose keys are still known to principals that lost access to them (a `Revoke` or a
+    /// group removal without a `Rekey`, e.g. because its author lacked `admin` on the parent),
+    /// until the node is rekeyed or the principal gets access again (§8.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rekey_pending: BTreeMap<Id, BTreeSet<Principal>>,
 }
 
 /// A node rewritten by a `Rekey`.

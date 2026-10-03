@@ -563,7 +563,14 @@ fn delegated_offboarding_returns_tasks() {
     assert_eq!(
         e.u("alice@example.com", &["ls"]).err_code(),
         "IDENTITY_DISABLED"
+    ); // The rekey the IT admin could not do is kept in the vault for the folder's admins.
+    let info = e.m(&["info"]).data();
+    assert!(
+        info["warnings"].to_string().contains("rekey --pending"),
+        "{info}"
     );
+    e.m(&["rekey", "--pending"]).ok();
+    assert_eq!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
 }
 
 #[test]
@@ -1119,4 +1126,68 @@ public class ToPkcs12 { public static void main(String[] a) throws Exception {
         e.m(&["get", "/s/ok#key_password"]).data()["value"],
         "key-pass-BBB"
     );
+}
+
+/// Audit finding 6: a revocation its author cannot rekey is recorded in the vault, shown to
+/// everyone, and done later by an admin of the parent with `rekey --pending`.
+#[test]
+fn revocation_without_rekey_is_kept_until_done() {
+    let e = Env::new("pending-rekey");
+    e.add_password_user("alice@example.com");
+    e.add_password_user("bob@example.com");
+    e.m(&["mkdir", "-p", "/team/x"]).ok();
+    e.m_in(&["put", "/team/x/key"], b"k").ok();
+    e.m(&["grant", "user:alice@example.com", "admin", "/team/x"])
+        .ok();
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+
+    // Alice is admin of /team/x but not of /team: she can revoke, not rekey.
+    let d = e
+        .u(
+            "alice@example.com",
+            &["revoke", "user:bob@example.com", "/team/x"],
+        )
+        .json();
+    assert_eq!(d["ok"], true, "{d}");
+    let warnings = d["data"]["warnings"].to_string();
+    assert!(warnings.contains("rekey --pending"), "{d}");
+    let info = e.u("alice@example.com", &["info"]).data();
+    assert!(
+        info["warnings"].to_string().contains("rekey --pending"),
+        "{info}"
+    );
+    // She cannot do it herself.
+    assert_eq!(
+        e.u("alice@example.com", &["rekey", "--pending"]).err_code(),
+        "ACCESS_DENIED"
+    );
+    // The master (admin of the parent) can, and the record goes away.
+    let d = e.m(&["rekey", "--pending"]).data();
+    assert_eq!(d["rekeyed"], serde_json::json!(["/team/x"]));
+    let info = e.m(&["info"]).data();
+    assert_eq!(info["warnings"], serde_json::json!([]));
+    assert_eq!(
+        e.m(&["rekey", "--pending"]).err_code(),
+        "NOT_FOUND",
+        "nothing left"
+    );
+    assert_eq!(
+        e.u("alice@example.com", &["get", "/team/x/key"]).data()["value"],
+        "k"
+    );
+
+    // Giving the access back also settles it.
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+    e.u(
+        "alice@example.com",
+        &["revoke", "user:bob@example.com", "/team/x"],
+    )
+    .ok();
+    assert_ne!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
+    e.m(&["grant", "user:bob@example.com", "read", "/team/x"])
+        .ok();
+    assert_eq!(e.m(&["info"]).data()["warnings"], serde_json::json!([]));
+    e.m(&["verify"]).ok();
 }

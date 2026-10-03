@@ -123,6 +123,40 @@ impl State {
     fn remove_grants_where(&mut self, f: impl Fn(&Grant) -> bool) {
         self.grants.retain(|_, g| !f(g));
     }
+
+    /// `who` lost access to `node` but still knows its key (§8.1) – unless it can still read
+    /// the node anyway.
+    fn mark_rekey_pending(&mut self, node: Id, who: Principal) {
+        let still = match who {
+            Principal::User(u) => self.effective_right(u, node).is_some(),
+            Principal::Group(g) => {
+                let path = self.ancestors(node);
+                self.grants
+                    .values()
+                    .any(|x| x.to == Principal::Group(g) && path.contains(&x.node))
+            }
+        };
+        if !still {
+            self.rekey_pending.entry(node).or_default().insert(who);
+        }
+    }
+
+    /// Clears pending rekeys in the subtree, for everyone or only for `who`.
+    fn clear_rekey_pending(&mut self, node: Id, who: Option<Principal>) {
+        for n in self.subtree(node) {
+            if let Some(set) = self.rekey_pending.get_mut(&n) {
+                match who {
+                    Some(p) => {
+                        set.remove(&p);
+                    }
+                    None => set.clear(),
+                }
+                if set.is_empty() {
+                    self.rekey_pending.remove(&n);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Verification
@@ -446,6 +480,21 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             require(!s.is_master(*user), "the master cannot be disabled")?;
             let u = s.users.get_mut(user).ok_or_else(|| deny("unknown user"))?;
             u.disabled = true;
+            // A disabled user cannot sign, but still knows the keys of what it could read.
+            let uid = *user;
+            let groups = s.user_groups(uid);
+            let nodes: BTreeSet<Id> = s
+                .grants
+                .values()
+                .filter(|g| match g.to {
+                    Principal::User(u) => u == uid,
+                    Principal::Group(gr) => groups.contains(&gr),
+                })
+                .map(|g| g.node)
+                .collect();
+            for n in nodes {
+                s.mark_rekey_pending(n, Principal::User(uid));
+            }
         }
         Op::ReplaceIdentity {
             user,
@@ -638,6 +687,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for x in grants {
                 s.grants.insert(x.id, x.clone());
             }
+            for x in grants {
+                s.mark_rekey_pending(x.node, Principal::User(*user));
+            }
             if let Some(m) = s.sysrights.get_mut(user) {
                 m.remove(&SysRight::GroupAdmin(gid));
             }
@@ -724,6 +776,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             s.nodes.retain(|k, _| !sub.contains(k));
             s.remove_grants_where(|g| sub.contains(&g.node));
             s.rotation.retain(|k| !sub.contains(k));
+            s.rekey_pending.retain(|k, _| !sub.contains(k));
         }
         Op::Grant { grant } => {
             node_exists(s, grant.node)?;
@@ -750,6 +803,8 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "cannot grant more than one holds",
             )?;
             s.grants.insert(grant.id, grant.clone());
+            // Access again: what they still know is no longer a leak.
+            s.clear_rekey_pending(grant.node, Some(grant.to));
         }
         Op::Revoke { grant } => {
             let g = s.grants.get(grant).ok_or_else(|| deny("unknown grant"))?;
@@ -761,7 +816,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 !(g.node == s.root && g.to == Principal::User(s.master)),
                 "the master's grant on the root cannot be revoked",
             )?;
+            let (node, to) = (g.node, g.to);
             s.grants.remove(grant);
+            s.mark_rekey_pending(node, to);
         }
         Op::Rekey {
             node,
@@ -809,6 +866,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             if *node == s.root {
                 s.former_master = None;
             }
+            s.clear_rekey_pending(*node, None);
         }
         Op::GrantSystemRight {
             user,
