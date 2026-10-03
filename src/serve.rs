@@ -180,7 +180,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                 p.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize),
             )
         }
-        "vault.trust" => app::trust(ctx, &p_str(p, "fingerprint")?),
+        "vault.trust" => app::trust(ctx, &p_str(p, "fingerprint")?, p_bool(p, "replace")),
         "whoami" => queries::whoami(ctx, &app::open_vault(ctx, true)?),
         "node.list" => {
             let o = app::open_vault(ctx, true)?;

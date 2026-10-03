@@ -259,6 +259,8 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 - The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override.
 - `root_fp` in `.nepomuk.toml` is only a hint: it is shown next to the fingerprint the file claims, but never pinned automatically, because whoever controls the project repository could ship a vault of their own with a matching fingerprint. A pin that differs from it produces a warning.
 - Without a pin nepomuk does not open the file.
+- Replacing a pin is what an attacker who swaps the vault file wants, so `nepomuk trust` replaces a different pin only with `--replace` – unless the file proves the change: its checkpoint is signed by the master pinned here (or a former one) and its log transfers the master role to the new fingerprint. After the new master has compacted, that proof is gone and `--replace` is needed. Errors that would need it carry `needs_replace` and the currently pinned fingerprint.
+- The client remembers which vault was opened from which file (`locations.json` in the local state). An unpinned vault at a place where another pinned vault was opened before is not treated as a first start: the error names the previous vault (`replaces_vault_id`) and pinning needs `--replace`. The GUI shows a warning screen with both fingerprints instead of the first-start screen, defaults to closing the vault and requires an explicit confirmation to replace the pin.
 - **The checkpoint is the anchor**: it must be signed by the pinned master, or, until the next `compact`, by a master pinned earlier on this machine and replaced after a `TransferMaster` – and then only if the file contains, as a commit, the head this machine saw before (a former master can sign a checkpoint of any content). Former masters are forgotten once a checkpoint signed by the pinned master is seen. A log that ends with a transfer to the pinned master proves nothing on its own – a forged checkpoint could contain it.
 - After a master transfer the new master should run `compact`; until then, clients that never pinned the former master cannot open the vault.
 - The local state (pins, `seq`, head) fails closed: an unreadable or corrupt state file is an error.
@@ -379,7 +381,7 @@ History keeps all old versions of the vault and is not erased. That is why secre
 
 | Area | Commands |
 | --- | --- |
-| Vault | `init`, `trust`, `info`, `status`, `verify [--full]`, `log`, `compact`, `sync` |
+| Vault | `init`, `trust [--replace]`, `info`, `status`, `verify [--full]`, `log`, `compact`, `sync` |
 | Identity | `identity new`, `identity request`, `identity passwd`, `passgen` |
 | Users | `user add <request>`, `user list`, `user disable`, `user offboard`, `user replace` |
 | Groups | `group create`, `group add`, `group remove`, `group list` |

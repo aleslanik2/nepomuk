@@ -463,6 +463,7 @@ pub struct Opened {
 /// Determines the pinned master fingerprint (§7.1).
 fn pin_for(
     ctx: &Ctx,
+    loc: &Location,
     vault: crate::model::Id,
     mem: &VaultMemory,
     file: &VaultFile,
@@ -507,7 +508,29 @@ fn pin_for(
     if let Some(fp) = project_fp {
         err = err.with("project_fingerprint", fp);
     }
-    Err(err)
+    Err(with_replaced_vault(err, loc, vault)?)
+}
+
+/// A vault without a pin at a place where another, pinned vault was opened before is not a
+/// first start: the file has been swapped. Say so, and require `trust --replace`.
+fn with_replaced_vault(err: Error, loc: &Location, vault: crate::model::Id) -> Result<Error> {
+    let Some(prev) = config::Locations::load()?.previous(&loc.path, vault) else {
+        return Ok(err);
+    };
+    let Some(prev_pin) = VaultMemory::load(prev)?.pin else {
+        return Ok(err);
+    };
+    let mut e = Error::new(
+        Code::UntrustedRoot,
+        format!(
+            "{} held another vault before, pinned to {prev_pin}; this file is a different vault with a different master. If this was not announced to you, do not trust it",
+            loc.path.display()
+        ),
+    );
+    e.details = err.details;
+    Ok(e.with("replaces_vault_id", prev.hex())
+        .with("pinned", prev_pin)
+        .with("needs_replace", true))
 }
 
 /// The master fingerprint the file claims (unverified; for display only).
@@ -598,8 +621,16 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
     let mut mem = VaultMemory::load(vault)?;
-    let pin = pin_for(ctx, vault, &mem, &file)?;
-    let v = verify_file_with(file, &pin, &mem.former)?;
+    let pin = pin_for(ctx, &loc, vault, &mem, &file)?;
+    let v = verify_file_with(file, &pin, &mem.former).map_err(|e| {
+        // Signed by a key that is not the pinned master and no transfer from it: a different
+        // vault with the same id, not a first start.
+        if e.code == Code::UntrustedRoot && e.details.get("found").is_some() {
+            e.with("needs_replace", true)
+        } else {
+            e
+        }
+    })?;
     check_memory(&v, &mem)?;
     check_former_signer(&v, &mut mem, &pin)?;
     if ctx.ci() {
@@ -619,6 +650,9 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
+    if !ctx.ci() {
+        config::Locations::record(&loc.path, vault)?;
+    }
     Ok(Opened { loc, loaded, v })
 }
 
@@ -1298,6 +1332,7 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     mem.head = Some(hex::encode(file.head_hash()));
     mem.checkpoint = Some(hex::encode(file.head_hash()));
     mem.save(file.vault_id)?;
+    config::Locations::record(&loc.path, file.vault_id)?;
     Ok(json!({
         "vault": loc.path.display().to_string(),
         "vault_id": file.vault_id.hex(),
@@ -1307,7 +1342,13 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     }))
 }
 
-pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
+/// Pins the master fingerprint of the vault (§7.1).
+///
+/// Replacing a pin is what an attacker who swaps the vault file wants the user to do, so it
+/// needs `replace` unless the file proves the change: its checkpoint is signed by the master
+/// pinned here (or a former one) and its log transfers the master role to `fp`. The same holds
+/// for a vault at a place where another pinned vault was opened before.
+pub fn trust(ctx: &Ctx, fp: &str, replace: bool) -> Result<Value> {
     if !fp.starts_with("npk1") || bech32::decode(fp).is_err() {
         return Err(Error::usage("invalid fingerprint (expected npk1…)"));
     }
@@ -1315,12 +1356,44 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
     let loaded = loc.load(!ctx.opts.offline)?;
     let file = VaultFile::parse(&loaded.bytes)?;
     let vault = file.vault_id;
+    let mut mem = VaultMemory::load(vault)?;
+    let signer = claimed_master_fp(&file).unwrap_or_default();
+    let replacing = mem.pin.clone().filter(|p| p != fp);
+    let proven = mem.pin.as_deref() == Some(signer.as_str()) || mem.former.contains(&signer);
+    let replacing_vault = match config::Locations::load()?.previous(&loc.path, vault) {
+        Some(prev) => VaultMemory::load(prev)?.pin.map(|p| (prev, p)),
+        None => None,
+    };
+    let unproven_change = replacing.is_some() && !(proven && signer != fp);
+    if !replace && (unproven_change || replacing_vault.is_some()) {
+        let mut e = Error::new(
+            Code::UntrustedRoot,
+            "this would replace the master pinned on this computer; a vault swapped by an attacker looks exactly like this. Confirm the new fingerprint with your administrator, then run `nepomuk trust --replace <fingerprint>`",
+        )
+        .with("found", signer.clone())
+        .with("needs_replace", true);
+        if let Some(p) = &replacing {
+            e = e.with("pinned", p.clone());
+        }
+        if let Some((prev, p)) = &replacing_vault {
+            e = e
+                .with("replaces_vault_id", prev.hex())
+                .with("pinned", p.clone());
+        }
+        return Err(e);
+    }
+    if replace && unproven_change {
+        // A deliberate new root of trust: nothing pinned before is trusted any more, and the
+        // history seen under the old master says nothing about the new one.
+        mem = VaultMemory {
+            fetched_at: mem.fetched_at,
+            ..Default::default()
+        };
+    }
     // Verify before pinning: the fingerprint must be the vault's current master, and the
     // checkpoint must be signed by it or by a master pinned here before.
-    let mut mem = VaultMemory::load(vault)?;
     let mut trusted = mem.former.clone();
     trusted.extend(mem.pin.clone());
-    let signer = claimed_master_fp(&file).unwrap_or_default();
     let v = verify_file_with(file, fp, &trusted).map_err(|e| {
         if e.code == Code::UntrustedRoot && signer != fp && !trusted.contains(&signer) {
             e.with(
@@ -1348,6 +1421,8 @@ pub fn trust(ctx: &Ctx, fp: &str) -> Result<Value> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
+    config::Locations::record(&loc.path, vault)?;
+    let previous = replacing.or(previous).or(replacing_vault.map(|(_, p)| p));
     Ok(json!({ "vault_id": vault.hex(), "pinned": fp, "previous": previous, "seq": v.seq }))
 }
 

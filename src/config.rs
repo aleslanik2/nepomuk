@@ -252,6 +252,71 @@ pub fn pending_path(vault: Id) -> PathBuf {
         .join(format!("{}.npk", vault.hex()))
 }
 
+/// Which vault was opened from which file on this machine. Pins are kept per `vault_id`, so a
+/// file swapped for another vault (a new id, a new master) would otherwise look exactly like a
+/// vault opened for the first time (§7.1).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Locations {
+    /// Canonical vault path → vault id (hex).
+    #[serde(default)]
+    pub vaults: BTreeMap<String, String>,
+}
+
+fn locations_path() -> PathBuf {
+    state_dir().join("locations.json")
+}
+
+/// The key of a vault location: its canonical absolute path.
+pub fn location_key(path: &Path) -> String {
+    let canon = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => dir
+            .canonicalize()
+            .map(|d| d.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    };
+    canon.to_string_lossy().into_owned()
+}
+
+impl Locations {
+    /// Fails closed like [`VaultMemory::load`].
+    pub fn load() -> Result<Locations> {
+        let path = locations_path();
+        match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| {
+                Error::general(format!(
+                    "the local state {} is corrupt ({e}); check it before removing it",
+                    path.display()
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Locations::default()),
+            Err(e) => Err(Error::general(format!(
+                "cannot read the local state {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// The vault seen at `path` before, if it is a different one than `vault`.
+    pub fn previous(&self, path: &Path, vault: Id) -> Option<Id> {
+        self.vaults
+            .get(&location_key(path))
+            .and_then(|h| Id::parse(h))
+            .filter(|id| *id != vault)
+    }
+
+    /// Remembers `vault` at `path`; writes only when something changed.
+    pub fn record(path: &Path, vault: Id) -> Result<()> {
+        let mut l = Locations::load()?;
+        let key = location_key(path);
+        if l.vaults.get(&key) == Some(&vault.hex()) {
+            return Ok(());
+        }
+        l.vaults.insert(key, vault.hex());
+        write_private(&locations_path(), &serde_json::to_vec_pretty(&l).unwrap())
+    }
+}
+
 pub fn is_ci() -> bool {
     [
         "CI",

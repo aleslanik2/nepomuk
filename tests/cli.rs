@@ -616,10 +616,64 @@ fn trust_and_root_of_trust() {
     )
     .data();
 
-    // A vault file swapped for another vault with a different master is rejected.
+    // A vault file swapped for another vault with a different master is rejected, and is not
+    // presented as a first start: the vault seen here before is named.
+    let first_id = e.m(&["info"]).data()["vault_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     std::fs::copy(&other.vault, &e.vault).unwrap();
     let r = e.m(&["info"]);
     assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    let d = &r.json()["error"]["details"];
+    assert_eq!(d["needs_replace"], true, "{d}");
+    assert_eq!(d["replaces_vault_id"], first_id.as_str());
+    assert_eq!(d["pinned"], fp.as_str());
+    // Pinning it needs an explicit --replace.
+    let r = e.cmd(&["trust", &other_fp], &[], None);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    let d = e.cmd(&["trust", "--replace", &other_fp], &[], None).data();
+    assert_eq!(d["previous"], fp.as_str());
+}
+
+/// A vault with the pinned vault's id but signed by another key: `trust` must not silently
+/// replace the pin (audit finding 4).
+#[test]
+fn trust_does_not_silently_replace_the_pin() {
+    use nepomuk::format::{CheckpointBody, Envelope, RawEntry, VaultFile, from_cbor, to_cbor};
+    use nepomuk::identity::Unlocked;
+    use nepomuk::model::IdentityKind;
+    let e = Env::new("trust-replace");
+    let info = e.m(&["info"]).data();
+    let fp = info["master_fingerprint"].as_str().unwrap().to_string();
+    let real = VaultFile::parse(&std::fs::read(&e.vault).unwrap()).unwrap();
+
+    // Mallory's own vault, relabelled with the real vault's id.
+    let mallory = Unlocked::generate("mallory", IdentityKind::Local);
+    let g = nepomuk::tx::genesis(&mallory).unwrap();
+    let mut cp: CheckpointBody = from_cbor(&g.entries[0].envelope.body).unwrap();
+    cp.vault_id = real.vault_id;
+    cp.state.vault_id = real.vault_id;
+    cp.seq = 100;
+    let body = to_cbor(&cp);
+    let sig = mallory.sig.sign("checkpoint", &body);
+    let forged = VaultFile {
+        vault_id: real.vault_id,
+        entries: vec![RawEntry::from_envelope(Envelope { body, sig })],
+    };
+    std::fs::write(&e.vault, forged.serialize()).unwrap();
+
+    let r = e.m(&["info"]);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    let mfp = mallory.fingerprint();
+    let r = e.cmd(&["trust", &mfp], &[], None);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["pinned"], fp.as_str());
+    // The pin is unchanged: the real vault still opens.
+    std::fs::write(&e.vault, real.serialize()).unwrap();
+    e.m(&["info"]).data();
 }
 
 #[test]
@@ -666,6 +720,19 @@ fn master_transfer() {
         .unwrap()
         .to_string();
     let new_master = e.add_local_user("new-master");
+    let trust = |state: &str, args: &[&str]| {
+        let mut c = e.command(args, &[]);
+        c.env("NEPOMUK_STATE_DIR", e.path(state));
+        let out = c.output().unwrap();
+        Res {
+            code: out.status.code().unwrap(),
+            stdout: String::from_utf8_lossy(&out.stdout).into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into(),
+        }
+    };
+    // Two other clients pinned to the master before the transfer.
+    trust("state-old", &["trust", &old_fp]).data();
+    trust("state-other", &["trust", &old_fp]).data();
     let d = e.m(&["master", "transfer", "new-master"]).data();
     let new_fp = d["new_fingerprint"].as_str().unwrap().to_string();
     // The author's client follows the transfer it signed.
@@ -684,6 +751,18 @@ fn master_transfer() {
     let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(j["error"]["code"], "UNTRUSTED_ROOT");
     assert_eq!(j["error"]["details"]["new_fingerprint"], new_fp.as_str());
+
+    // A client pinned to the old master follows a signed transfer without --replace…
+    let d = trust("state-old", &["trust", &new_fp]).data();
+    assert_eq!(d["pinned"], new_fp.as_str());
+    assert_eq!(d["previous"], old_fp.as_str());
+
+    // …but once the new master has compacted, the old pin proves nothing: --replace it is.
+    e.l(&new_master, "new-master", &["compact"]).data();
+    let r = trust("state-other", &["trust", &new_fp]);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    assert_eq!(r.json()["error"]["details"]["needs_replace"], true);
+    trust("state-other", &["trust", "--replace", &new_fp]).data();
 }
 
 #[test]

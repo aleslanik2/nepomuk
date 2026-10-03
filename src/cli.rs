@@ -73,7 +73,13 @@ pub enum Cmd {
         out: Option<PathBuf>,
     },
     /// Pin the master fingerprint of the vault
-    Trust { fingerprint: String },
+    Trust {
+        fingerprint: String,
+        /// Replace the master pinned on this computer (or the vault seen at this path before)
+        /// without a signed transfer – only after confirming the new fingerprint out of band
+        #[arg(long)]
+        replace: bool,
+    },
     /// Show vault information
     Info,
     /// Show sync status (up to date / behind / ahead / conflict)
@@ -654,7 +660,10 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             );
             Ok(Out::human(d, human))
         }
-        Cmd::Trust { fingerprint } => Ok(Out::data(app::trust(ctx, &fingerprint)?)),
+        Cmd::Trust {
+            fingerprint,
+            replace,
+        } => Ok(Out::data(app::trust(ctx, &fingerprint, replace)?)),
         Cmd::Info => {
             let o = app::open_vault(ctx, true)?;
             Ok(Out::data(queries::info(&o)))
