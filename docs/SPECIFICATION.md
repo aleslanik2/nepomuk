@@ -306,6 +306,8 @@ Each commit carries one or more operations applied atomically. The client verifi
 3. Both are in one commit; revocation without rekey is only possible with `--no-rekey` and a warning.
 4. nepomuk lists the secrets the revoked party had access to and marks them "pending rotation".
 
+Everything below a node decrypts with that node's key, so whoever rekeys can read the whole subtree. A node that does not decrypt (written by a broken or malicious client of someone with `write` there) would make the rekey impossible; the rekey removes it in the same commit, with a warning naming its id. This takes nothing from anyone with legitimate access and is no more than its writer could do with `rm`; the node stays in git history. A readable folder whose own content does not decrypt but which has readable children is sealed again as an empty folder instead. `nepomuk rm --node <id>` removes such a node directly. If a rekey still cannot be built, the revocation is committed without it, with a warning and a task.
+
 Rekey protects only future content. Anything the revoked party has already seen must be changed at the source (new certificate, new database password, upload key reset in Google Play).
 
 ### 8.2 Offboarding
@@ -329,6 +331,7 @@ The company vault has its own repository, included in projects as a submodule. n
 - `git fetch` in the submodule directory, then `git show origin/main:vault.nepomuk`.
 - The submodule checkout is not modified; the submodule pointer in the project is not the source of the version.
 - Offline: reads come from the last fetched version with a warning about its age.
+- The vault path comes from `.nepomuk.toml`, i.e. from whoever controls the project repository. git is run with `safe.bareRepository=explicit`, `core.fsmonitor=false` and `protocol.ext.allow=never`, and a work tree whose top level has no `.git` is refused: a bare repository committed into a project carries its own `config`, which git would otherwise execute (e.g. through `fsmonitor` or the `ext::` transport) before any signature is checked.
 
 ### 9.2 Writing with automatic push
 

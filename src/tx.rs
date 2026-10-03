@@ -435,6 +435,66 @@ impl<'a> Tx<'a> {
         self.push(Op::DeleteNode { id })
     }
 
+    /// Removes a node by its id: the only way to delete a node whose name cannot be decrypted
+    /// (or that shares its path with a sibling). The verifier still requires `write` on the
+    /// parent.
+    pub fn rm_node(&mut self, id: Id) -> Result<()> {
+        if !self.state.nodes.contains_key(&id) {
+            return Err(Error::not_found(&format!("node {}", id.hex())));
+        }
+        if id == self.state.root {
+            return Err(Error::usage("the root folder cannot be removed"));
+        }
+        self.push(Op::DeleteNode { id })
+    }
+
+    /// Deletes what nobody holding the subtree's keys can open (§8.1).
+    ///
+    /// The author holds the key of `node`, and every honest client wraps a child's key under its
+    /// parent's key and seals its name and content with it, so everything below `node` decrypts
+    /// for the author. A node that does not was written by a broken or malicious client of
+    /// someone with `write` there; left in place it would make every rekey of the subtree, and
+    /// so revocation and offboarding, fail. Removing it takes nothing from anyone with legitimate
+    /// access (it was never readable with the real keys) and is no more than its writer could do
+    /// with `rm`; it stays in git history.
+    ///
+    /// - a node whose key or name does not open is removed with its subtree (nothing below it is
+    ///   readable either);
+    /// - a node that opens but whose content does not is removed if it has no children; one with
+    ///   children is kept, and [`Tx::rekey`] seals it again as a folder.
+    fn purge_unreadable(&mut self, node: Id) -> Result<()> {
+        let acc = Access::build(&self.state, self.me, self.id);
+        if !acc.nodes.contains_key(&node) {
+            return Ok(());
+        }
+        let mut doomed: Vec<(Id, &'static str)> = Vec::new();
+        for n in self.state.subtree(node) {
+            if n == node {
+                continue;
+            }
+            let parent = self.state.nodes[&n].parent;
+            let parent_readable = parent.is_some_and(|p| acc.nodes.contains_key(&p));
+            if !acc.nodes.contains_key(&n) {
+                // Only the topmost unreadable node; deleting it removes everything below.
+                if parent_readable {
+                    doomed.push((n, "its key or name cannot be decrypted"));
+                }
+            } else if acc.content(&self.state, n).is_err() && self.state.children(n).is_empty() {
+                doomed.push((n, "its content cannot be decrypted"));
+            }
+        }
+        for (n, why) in doomed {
+            let parent = self.state.nodes[&n].parent.expect("not the root");
+            let at = acc.path(parent).unwrap_or("?").to_string();
+            self.push(Op::DeleteNode { id: n })?;
+            self.warnings.push(format!(
+                "removed node {} in {at}: {why} with the folder's key (written by a broken or malicious client; still in git history)",
+                n.hex()
+            ));
+        }
+        Ok(())
+    }
+
     /// Re-wraps all grants in a subtree after its paths changed.
     fn rewrapped_grants(
         &mut self,
@@ -566,6 +626,7 @@ impl<'a> Tx<'a> {
 
     /// New node keys for the whole subtree, re-encrypted content, re-issued grants (§8.1).
     pub fn rekey(&mut self, node: Id) -> Result<()> {
+        self.purge_unreadable(node)?;
         let sub = self.state.subtree(node);
         let vault = self.vault();
         let acc = Access::build(&self.state, self.me, self.id);
@@ -576,7 +637,25 @@ impl<'a> Tx<'a> {
                 .nodes
                 .get(n)
                 .ok_or_else(|| Error::access_denied(acc.path(node).unwrap_or("?")))?;
-            let content = acc.content(&self.state, *n)?;
+            let content = match acc.content(&self.state, *n) {
+                Ok(c) => c,
+                // Left by `purge_unreadable` only when it has children: keep them reachable.
+                Err(_) if *n != node && !self.state.children(*n).is_empty() => {
+                    self.warnings.push(format!(
+                        "{}: its content could not be decrypted; sealed again as an empty folder",
+                        v.path
+                    ));
+                    NodeContent {
+                        content: Content::Folder,
+                        meta: Meta {
+                            created: now(),
+                            updated: now(),
+                            not_after: None,
+                        },
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             let nk = crypto::random_key();
             let parent = self.state.nodes[n].parent;
             let wrapped_key = match parent {
@@ -660,8 +739,26 @@ impl<'a> Tx<'a> {
                 continue;
             }
             if self.can_rekey(n) {
-                self.rekey(n)?;
-                done.push(n);
+                // A rekey that cannot be built must not take the rest of the commit (the
+                // revocation, the disabled user) down with it: undo it and leave a task.
+                let (state, ops) = (self.state.clone(), self.ops.len());
+                let warnings = self.warnings.len();
+                match self.rekey(n) {
+                    Ok(()) => done.push(n),
+                    Err(e) if e.code == Code::AccessDenied => {
+                        self.state = state;
+                        self.ops.truncate(ops);
+                        self.warnings.truncate(warnings);
+                        self.access = None;
+                        let p = self.path_of(n);
+                        self.warnings.push(format!(
+                            "{p} was not rekeyed ({}); whoever could read it still can",
+                            e.message
+                        ));
+                        self.tasks.push(format!("rekey {p} (node {})", n.hex()));
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 let p = self.path_of(n);
                 self.tasks.push(format!(
@@ -744,7 +841,7 @@ impl<'a> Tx<'a> {
                 Error::not_found(&format!("grant for {} on {path}", self.principal_name(who)))
             })?;
         self.push(Op::Revoke { grant: g.id })?;
-        let rotate = self.mark_rotation(&BTreeSet::from([node]))?;
+        // Rekey first: it removes nodes nobody can read, which are then not listed for rotation.
         if no_rekey {
             self.warnings.push(
                 "revoked without rekey: the revoked party can still decrypt future content".into(),
@@ -752,6 +849,7 @@ impl<'a> Tx<'a> {
         } else {
             self.rekey_all(BTreeSet::from([node]))?;
         }
+        let rotate = self.mark_rotation(&BTreeSet::from([node]))?;
         if let Principal::User(u) = who
             && let Some(r) = self.state.effective_right(u, node)
         {
@@ -862,8 +960,9 @@ impl<'a> Tx<'a> {
             }
         }
         self.push(Op::DisableUser { user })?;
+        // Rekey first: it removes nodes nobody can read, which are then not listed for rotation.
+        self.rekey_all(affected.clone())?;
         let rotate = self.mark_rotation(&affected)?;
-        self.rekey_all(affected)?;
         Ok(rotate)
     }
 
