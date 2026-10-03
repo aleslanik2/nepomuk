@@ -47,6 +47,14 @@ pub mod tempdir {
     }
 }
 
+/// Fails a test with a message that GitHub Actions also shows as an annotation (CI logs are
+/// not always at hand).
+pub fn fail(msg: &str) -> ! {
+    let one_line = msg.replace('\r', "").replace('\n', " | ");
+    let one_line: String = one_line.chars().take(3000).collect();
+    panic!("\n::error title=test failure::{one_line}\n");
+}
+
 pub struct Res {
     pub code: i32,
     pub stdout: String,
@@ -56,16 +64,20 @@ pub struct Res {
 impl Res {
     pub fn json(&self) -> Value {
         serde_json::from_str(self.stdout.lines().last().unwrap_or("null"))
-            .unwrap_or_else(|_| panic!("not JSON: {}\n{}", self.stdout, self.stderr))
+            .unwrap_or_else(|_| fail(&format!("not JSON: {}\n{}", self.stdout, self.stderr)))
     }
     pub fn data(&self) -> Value {
         let j = self.json();
-        assert_eq!(j["ok"], true, "command failed: {j}\n{}", self.stderr);
+        if j["ok"] != true {
+            fail(&format!("command failed: {j}\n{}", self.stderr));
+        }
         j["data"].clone()
     }
     pub fn err_code(&self) -> String {
         let j = self.json();
-        assert_eq!(j["ok"], false, "expected failure: {j}");
+        if j["ok"] != false {
+            fail(&format!("expected failure: {j}"));
+        }
         j["error"]["code"].as_str().unwrap().to_string()
     }
     pub fn ok(self) -> Res {
@@ -315,12 +327,20 @@ impl Env {
         } else {
             s.args(["-qec", &body, "/dev/null"]);
         }
-        let out = s
+        // Keep script's stdin open until it is done: some versions stop at end of input.
+        let mut child = s
             .current_dir(self.dir.path())
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("script(1)");
-        let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+        let stdin = child.stdin.take();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut child.stdout.take().unwrap(), &mut raw).unwrap();
+        let status = child.wait().unwrap();
+        drop(stdin);
+        let text = String::from_utf8_lossy(&raw).replace('\r', "");
         let mut res = Vec::new();
         let mut chunk = String::new();
         for line in text.lines() {
@@ -335,7 +355,13 @@ impl Env {
                 chunk.push('\n');
             }
         }
-        assert_eq!(res.len(), cmds.len(), "terminal output:\n{text}");
+        if res.len() != cmds.len() {
+            fail(&format!(
+                "script(1) ran {} of {} commands (exit {status}); output:\n{text}",
+                res.len(),
+                cmds.len()
+            ));
+        }
         res
     }
 }
