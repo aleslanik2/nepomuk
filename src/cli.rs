@@ -207,8 +207,9 @@ pub enum Cmd {
     },
     /// Version of the CLI, JSON API, file format and crypto suites
     Version,
-    /// Copy folders and secrets from a vault in an older file format, read by the older nepomuk
-    /// binary (e.g. `nepomuk-0.2.7`); users, groups and grants are not copied
+    /// Obsolete: copy folders and secrets from a 0.2.x vault, read by the older nepomuk binary
+    /// (e.g. `nepomuk-0.2.7`); users, groups and grants are not copied
+    #[command(hide = true)]
     Migrate {
         /// The older nepomuk binary that can read the old vault
         #[arg(long, value_name = "BINARY")]
@@ -734,16 +735,19 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             from_identity,
             from_email,
             dry_run,
-        } => Ok(Out::data(crate::migrate::run(
-            ctx,
-            &crate::migrate::Source {
-                cli: from_cli,
-                vault: from_vault,
-                identity: from_identity,
-                email: from_email,
-            },
-            dry_run,
-        )?)),
+        } => {
+            ctx.warn("`nepomuk migrate` is obsolete and will be removed in a future release");
+            Ok(Out::data(crate::migrate::run(
+                ctx,
+                &crate::migrate::Source {
+                    cli: from_cli,
+                    vault: from_vault,
+                    identity: from_identity,
+                    email: from_email,
+                },
+                dry_run,
+            )?))
+        }
         Cmd::Sync { resolve } => {
             let r = match resolve.as_deref() {
                 Some("ours") => Resolve::Ours,

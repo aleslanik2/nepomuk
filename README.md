@@ -158,7 +158,9 @@ This installs the latest release: the CLI into `/usr/local/bin` (using sudo) and
 
 The script runs on Linux, macOS and Windows in Git Bash; for PowerShell use `install.ps1` from the same release (`-Gui`, `-System`). Other options: `--version <tag>` for a specific release, `--dir <path>` for another CLI location, `--sha256 <hash>` to pin the exact archive in CI, and `--from-source` to build with cargo (the app also needs Node.js). `nepomuk doctor` checks the installation: whether it is up to date, whether `nepomuk` in `PATH` is this installation, how the identity and the vault are configured, and whether you are a user of the vault. Later, `nepomuk upgrade` installs a newer release the same way (it updates the desktop app too, when installed); the CLI looks for new releases once a day and mentions them (`update_check = false` in `~/.config/nepomuk/config.toml` turns this off). While the repository is private, the download above does not work: set `GH_TOKEN`, get `install.sh` with `gh release download -R aleslanik2/nepomuk -p install.sh` and run `sh install.sh --gui --system`.
 
-## Moving a vault from 0.2.x
+## Moving a vault from 0.2.x (obsolete)
+
+`nepomuk migrate` is obsolete: it is kept only for moving vaults from 0.2.x and will be removed in a future release.
 
 File format 2 (this version) fixes security flaws found in review and cannot read vaults created by 0.2.x. Keep the old binary (e.g. as `nepomuk-0.2.7`), create a new vault and copy the folders and secrets over; the old binary reads them and they travel through a pipe, never through a file:
 

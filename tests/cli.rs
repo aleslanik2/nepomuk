@@ -1209,3 +1209,27 @@ fn commands_run_in_one_terminal() {
     assert_ne!(r[1].code, 0);
     assert_eq!(r[2].data()["master"], true);
 }
+
+#[cfg(unix)]
+#[test]
+fn migrate_resolves_relative_from_cli() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new("migrate-rel");
+    let old = e.path("old-nepomuk");
+    // Reads the first request, then quits: the client sees it exit, never a broken pipe.
+    std::fs::write(&old, "#!/bin/sh\nread -r _\nexit 0\n").unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(e.path("old.nepomuk"), b"").unwrap();
+    // The older binary runs in nepomuk's config folder; ./old-nepomuk must still be found.
+    let r = e.m(&[
+        "migrate",
+        "--from-cli",
+        "./old-nepomuk",
+        "--from-vault",
+        "old.nepomuk",
+    ]);
+    assert_ne!(r.code, 0);
+    let out = format!("{}{}", r.stdout, r.stderr);
+    assert_ne!(r.err_code(), "NOT_FOUND", "{out}");
+    assert!(out.contains("exited unexpectedly"), "{out}");
+}

@@ -43,7 +43,17 @@ impl OldCli {
         // finds in or above its working directory, so start it in nepomuk's own config folder.
         let dir = crate::config::config_dir();
         std::fs::create_dir_all(&dir)?;
-        let mut cmd = Command::new(&src.cli);
+        // The child starts in `dir`, so a relative path like `./nepomuk-0.2.7` must be resolved
+        // here; a bare name is still looked up in PATH.
+        let cli = if src.cli.components().count() > 1 {
+            std::fs::canonicalize(&src.cli).map_err(|e| {
+                Error::not_found(&src.cli.display().to_string())
+                    .with("reason", format!("cannot start the older nepomuk: {e}"))
+            })?
+        } else {
+            src.cli.clone()
+        };
+        let mut cmd = Command::new(&cli);
         cmd.arg("--vault").arg(&vault);
         if let Some(i) = &src.identity {
             cmd.arg("--identity").arg(std::fs::canonicalize(i)?);
