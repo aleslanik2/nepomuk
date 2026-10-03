@@ -45,10 +45,16 @@ impl Unlocked {
         &u.kem == self.kem.public() && &u.sig == self.sig.public()
     }
 
-    pub fn proof(&self, kind: IdentityKind) -> Vec<u8> {
+    pub fn proof(&self, kind: IdentityKind, credential: Option<&PasswordSealed>) -> Vec<u8> {
         self.sig.sign(
             "request",
-            &proof_data(&self.name, kind, self.kem.public(), self.sig.public()),
+            &proof_data(
+                &self.name,
+                kind,
+                self.kem.public(),
+                self.sig.public(),
+                credential,
+            ),
         )
     }
 }
@@ -171,6 +177,9 @@ impl IdentityFile {
 
 // ---------------------------------------------------------------- Enrollment requests
 
+/// Version 2: the proof of possession also covers the credential.
+pub const REQUEST_VERSION: u8 = 2;
+
 /// What a new user sends to an administrator (§4.3). Contains no secrets in clear.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -187,13 +196,13 @@ pub struct Request {
 impl Request {
     pub fn new(id: &Unlocked, credential: Option<PasswordSealed>) -> Request {
         Request {
-            version: 1,
+            version: REQUEST_VERSION,
             name: id.name.clone(),
             kind: id.kind,
             kem: id.kem.public().clone(),
             sig: id.sig.public().clone(),
+            proof: id.proof(id.kind, credential.as_ref()),
             credential,
-            proof: id.proof(id.kind),
         }
     }
 
@@ -202,7 +211,14 @@ impl Request {
     }
 
     pub fn parse(text: &str) -> Result<Request> {
-        from_cbor(&dearmor("REQUEST", text)?)
+        let r: Request = from_cbor(&dearmor("REQUEST", text)?)?;
+        if r.version != REQUEST_VERSION {
+            return Err(Error::format(format!(
+                "unsupported request version {} (create a new request with this version of nepomuk)",
+                r.version
+            )));
+        }
+        Ok(r)
     }
 
     pub fn fingerprint(&self) -> String {
@@ -213,7 +229,13 @@ impl Request {
         if !crypto::verify(
             &self.sig,
             "request",
-            &proof_data(&self.name, self.kind, &self.kem, &self.sig),
+            &proof_data(
+                &self.name,
+                self.kind,
+                &self.kem,
+                &self.sig,
+                self.credential.as_ref(),
+            ),
             &self.proof,
         ) {
             return Err(Error::new(
@@ -221,9 +243,17 @@ impl Request {
                 "the request's proof of possession is invalid",
             ));
         }
-        if self.kind == IdentityKind::Password && self.credential.is_none() {
-            return Err(Error::format("password request without credential"));
+        match (self.kind, &self.credential) {
+            (IdentityKind::Password, Some(c)) => c.check()?,
+            (IdentityKind::Password, None) => {
+                return Err(Error::format("password request without credential"));
+            }
+            (IdentityKind::Local, Some(_)) => {
+                return Err(Error::format("local identity request with a credential"));
+            }
+            (IdentityKind::Local, None) => {}
         }
+        crypto::check_kem_public(&self.kem)?;
         Ok(())
     }
 }

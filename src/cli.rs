@@ -187,6 +187,25 @@ pub enum Cmd {
     },
     /// Version of the CLI, JSON API, file format and crypto suites
     Version,
+    /// Copy folders and secrets from a vault in an older file format, read by the older nepomuk
+    /// binary (e.g. `nepomuk-0.2.7`); users, groups and grants are not copied
+    Migrate {
+        /// The older nepomuk binary that can read the old vault
+        #[arg(long, value_name = "BINARY")]
+        from_cli: PathBuf,
+        /// The old vault file
+        #[arg(long, value_name = "FILE")]
+        from_vault: PathBuf,
+        /// Identity file for the old vault (default: the older binary's default identity)
+        #[arg(long, value_name = "FILE", conflicts_with = "from_email")]
+        from_identity: Option<PathBuf>,
+        /// Log in to the old vault with this email
+        #[arg(long, value_name = "EMAIL")]
+        from_email: Option<String>,
+        /// Only list what would be copied
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Master management
     #[command(subcommand)]
     Master(MasterCmd),
@@ -680,6 +699,22 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             Ok(Out::human(d, h))
         }
         Cmd::Compact => Ok(Out::data(app::compact(ctx)?)),
+        Cmd::Migrate {
+            from_cli,
+            from_vault,
+            from_identity,
+            from_email,
+            dry_run,
+        } => Ok(Out::data(crate::migrate::run(
+            ctx,
+            &crate::migrate::Source {
+                cli: from_cli,
+                vault: from_vault,
+                identity: from_identity,
+                email: from_email,
+            },
+            dry_run,
+        )?)),
         Cmd::Sync { resolve } => {
             let r = match resolve.as_deref() {
                 Some("ours") => Resolve::Ours,

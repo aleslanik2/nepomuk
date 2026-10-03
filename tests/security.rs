@@ -141,7 +141,7 @@ fn reader_cannot_escalate() {
         Principal::User(eve_id(&v)),
         Right::Admin,
         &nk,
-        "/public",
+        &acc.proof(public).unwrap(),
     )
     .unwrap();
     rejected(
@@ -224,7 +224,7 @@ fn cannot_add_users_or_groups_without_rights() {
         kem: mallory.kem.public().clone(),
         sig: mallory.sig.public().clone(),
         credential: None,
-        proof: mallory.proof(IdentityKind::Local),
+        proof: mallory.proof(IdentityKind::Local, None),
         disabled: false,
     };
     rejected(
@@ -260,11 +260,13 @@ fn cannot_create_nodes_under_foreign_folders() {
         .id;
     let nk = crypto::random_key();
     let id = Id::random();
+    let name = keyring::seal_name(v.state.vault_id, id, &nk, "planted");
     let node = Node {
         id,
         parent: Some(secret),
         wrapped_key: Some(crypto::seal(&[0u8; 32], nk.as_ref(), b"")),
-        name: keyring::seal_name(v.state.vault_id, id, &nk, "planted"),
+        name: name.sealed,
+        name_commit: name.commit,
         content: keyring::seal_content(
             v.state.vault_id,
             id,

@@ -53,6 +53,12 @@ fn intent(ctx: &Ctx, i: Intent) -> Result<Value> {
 }
 
 fn content_from(p: &Value) -> Result<(Content, Option<i64>)> {
+    content_from_json(p, true)
+}
+
+/// Content in the shape of `node.get` / `get --json`. With `validate`, a record must pass its
+/// template's validation; without it, the validation only supplies the expiry when it can.
+pub fn content_from_json(p: &Value, validate: bool) -> Result<(Content, Option<i64>)> {
     let t = p_opt(p, "type").unwrap_or_else(|| "text".into());
     Ok(match t.as_str() {
         "text" => (
@@ -88,8 +94,12 @@ fn content_from(p: &Value) -> Result<(Content, Option<i64>)> {
                 };
                 fields.insert(k.clone(), f);
             }
-            let val = crate::templates::validate(&template, &fields)?;
-            (Content::Record { template, fields }, val.not_after)
+            let not_after = match crate::templates::validate(&template, &fields) {
+                Ok(val) => val.not_after,
+                Err(e) if validate => return Err(e),
+                Err(_) => None,
+            };
+            (Content::Record { template, fields }, not_after)
         }
         other => return Err(Error::usage(format!("unknown type {other}"))),
     })

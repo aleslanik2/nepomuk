@@ -103,6 +103,8 @@ export async function switchVault() {
 async function afterConnect() {
   try {
     state.info = await rpc("vault.info");
+    // Trust-related notices (e.g. .nepomuk.toml naming another master) must reach the user.
+    if (state.info?.warnings) state.info.warnings.forEach((w) => toast(w));
     renderLogin();
   } catch (e) {
     if (e.code === "UNTRUSTED_ROOT") renderTrust(e);
