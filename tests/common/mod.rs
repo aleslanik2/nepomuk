@@ -47,6 +47,14 @@ pub mod tempdir {
     }
 }
 
+/// Fails a test with a message that GitHub Actions also shows as an annotation (CI logs are
+/// not always at hand).
+pub fn fail(msg: &str) -> ! {
+    let one_line = msg.replace('\r', "").replace('\n', " | ");
+    let one_line: String = one_line.chars().take(3000).collect();
+    panic!("\n::error title=test failure::{one_line}\n");
+}
+
 pub struct Res {
     pub code: i32,
     pub stdout: String,
@@ -56,16 +64,20 @@ pub struct Res {
 impl Res {
     pub fn json(&self) -> Value {
         serde_json::from_str(self.stdout.lines().last().unwrap_or("null"))
-            .unwrap_or_else(|_| panic!("not JSON: {}\n{}", self.stdout, self.stderr))
+            .unwrap_or_else(|_| fail(&format!("not JSON: {}\n{}", self.stdout, self.stderr)))
     }
     pub fn data(&self) -> Value {
         let j = self.json();
-        assert_eq!(j["ok"], true, "command failed: {j}\n{}", self.stderr);
+        if j["ok"] != true {
+            fail(&format!("command failed: {j}\n{}", self.stderr));
+        }
         j["data"].clone()
     }
     pub fn err_code(&self) -> String {
         let j = self.json();
-        assert_eq!(j["ok"], false, "expected failure: {j}");
+        if j["ok"] != false {
+            fail(&format!("expected failure: {j}"));
+        }
         j["error"]["code"].as_str().unwrap().to_string()
     }
     pub fn ok(self) -> Res {
@@ -130,8 +142,18 @@ impl Env {
         c
     }
 
+    /// Runs a command in a new session without a controlling terminal, so that results do not
+    /// depend on whether the tests themselves run in a terminal.
     pub fn cmd(&self, args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> Res {
         let mut c = self.command(args, env);
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            c.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         c.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -258,4 +280,88 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Arguments and extra environment of one command run by [`Env::in_terminal`].
+pub type TerminalCmd<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
+
+/// Quotes a word for `sh`.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+impl Env {
+    /// Runs several commands one after another inside one new pseudo-terminal (one terminal
+    /// session, as in a terminal window) and returns their results. Needs `script(1)`.
+    pub fn in_terminal(&self, cmds: &[TerminalCmd]) -> Vec<Res> {
+        let mut body = String::new();
+        for (args, env) in cmds {
+            // `["@sleep", "<seconds>"]` pauses inside the same terminal.
+            if args.first() == Some(&"@sleep") {
+                body.push_str(&format!("sleep {}; echo \"@@EXIT 0\"\n", args[1]));
+                continue;
+            }
+            let c = self.command(args, env);
+            body.push_str("env -i");
+            for (k, v) in c.get_envs() {
+                if let Some(v) = v {
+                    body.push(' ');
+                    body.push_str(&sh_quote(&format!(
+                        "{}={}",
+                        k.to_string_lossy(),
+                        v.to_string_lossy()
+                    )));
+                }
+            }
+            body.push(' ');
+            body.push_str(&sh_quote(&c.get_program().to_string_lossy()));
+            for a in c.get_args() {
+                body.push(' ');
+                body.push_str(&sh_quote(&a.to_string_lossy()));
+            }
+            body.push_str(" </dev/null 2>/dev/null; echo \"@@EXIT $?\"\n");
+        }
+        let mut s = Command::new("script");
+        if cfg!(target_os = "macos") {
+            s.args(["-q", "/dev/null", "sh", "-c", &body]);
+        } else {
+            s.args(["-qec", &body, "/dev/null"]);
+        }
+        // Keep script's stdin open until it is done: some versions stop at end of input.
+        let mut child = s
+            .current_dir(self.dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("script(1)");
+        let stdin = child.stdin.take();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut child.stdout.take().unwrap(), &mut raw).unwrap();
+        let status = child.wait().unwrap();
+        drop(stdin);
+        let text = String::from_utf8_lossy(&raw).replace('\r', "");
+        let mut res = Vec::new();
+        let mut chunk = String::new();
+        for line in text.lines() {
+            if let Some(code) = line.strip_prefix("@@EXIT ") {
+                res.push(Res {
+                    code: code.trim().parse().unwrap_or(-1),
+                    stdout: std::mem::take(&mut chunk),
+                    stderr: String::new(),
+                });
+            } else {
+                chunk.push_str(line);
+                chunk.push('\n');
+            }
+        }
+        if res.len() != cmds.len() {
+            fail(&format!(
+                "script(1) ran {} of {} commands (exit {status}); output:\n{text}",
+                res.len(),
+                cmds.len()
+            ));
+        }
+        res
+    }
 }

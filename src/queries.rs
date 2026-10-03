@@ -15,8 +15,8 @@ pub const EXPIRY_WARNING_DAYS: i64 = 30;
 
 pub fn access_for(ctx: &Ctx, o: &Opened) -> Result<(Id, Access)> {
     let id = ctx.unlock(&o.v.state)?;
-    let me = find_me(&o.v.state, &id)?;
-    Ok((me, Access::build(&o.v.state, me, &id)))
+    let me = find_me(&o.v.state, &*id)?;
+    Ok((me, Access::build(&o.v.state, me, &*id)))
 }
 
 fn iso(t: i64) -> String {
@@ -396,7 +396,7 @@ pub fn log(ctx: &Ctx, o: &Opened, limit: Option<usize>) -> Result<Value> {
     let acc = ctx
         .unlock(s)
         .ok()
-        .and_then(|id| find_me(s, &id).ok().map(|me| Access::build(s, me, &id)));
+        .and_then(|id| find_me(s, &*id).ok().map(|me| Access::build(s, me, &*id)));
     let mut commits: Vec<Value> =
         o.v.commits
             .iter()

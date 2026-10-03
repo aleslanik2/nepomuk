@@ -14,7 +14,7 @@ use crate::config::{self, ProjectConfig, UserConfig, VaultMemory};
 use crate::crypto;
 use crate::error::{Code, Error, Result};
 use crate::format::{VaultFile, from_cbor, to_cbor};
-use crate::identity::{self, IdentityFile, Request, Unlocked};
+use crate::identity::{self, IdentityFile, Keys, Request, Unlocked};
 use crate::model::*;
 use crate::store::{self, Loaded, Location, SaveError};
 use crate::tx::{self, Tx};
@@ -42,12 +42,29 @@ pub struct Options {
     pub remember_touchid: bool,
 }
 
+/// An identity unlocked for this process: with its own keys, or served by the Touch ID agent
+/// (which can only read).
+#[derive(Clone)]
+pub enum Session {
+    Local(Rc<Unlocked>),
+    Agent(Rc<crate::agent::AgentKeys>),
+}
+
+impl Session {
+    pub fn keys(&self) -> Rc<dyn Keys> {
+        match self {
+            Session::Local(u) => u.clone(),
+            Session::Agent(a) => a.clone(),
+        }
+    }
+}
+
 pub struct Ctx {
     pub opts: Options,
     pub project: Option<ProjectConfig>,
     pub user: UserConfig,
     /// Unlocked identity cached for the session (`serve --stdio`) or the current command.
-    pub unlocked: RefCell<Option<Rc<Unlocked>>>,
+    pub unlocked: RefCell<Option<Session>>,
     /// Password handed over by the GUI (`session.unlock`).
     pub password_override: RefCell<Option<Zeroizing<String>>>,
     secret_reader: RefCell<Option<Box<dyn BufRead>>>,
@@ -242,16 +259,15 @@ impl Ctx {
             .ok()
             .and_then(|l| l.path.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_else(|| "the vault".into());
-        let ttl = self
-            .user
-            .agent_timeout
-            .unwrap_or(crate::agent::DEFAULT_TIMEOUT);
-        let lasting = if ttl > 0 && !self.opts.session {
+        let ttl = self.agent_ttl();
+        let lasting = if ttl > 0 && crate::agent::has_terminal() {
             match ttl {
-                t if t % 60 == 0 => {
-                    format!(" for {} minute{}", t / 60, if t == 60 { "" } else { "s" })
-                }
-                t => format!(" for {t} seconds"),
+                t if t % 60 == 0 => format!(
+                    " for {} minute{} in this terminal",
+                    t / 60,
+                    if t == 60 { "" } else { "s" }
+                ),
+                t => format!(" for {t} seconds in this terminal"),
             }
         } else {
             String::new()
@@ -305,47 +321,72 @@ impl Ctx {
             .or_else(|| self.user.email.clone())
     }
 
-    /// Unlocks the identity for this command (once per session).
-    pub fn unlock(&self, state: &State) -> Result<Rc<Unlocked>> {
-        if let Some(u) = self.unlocked.borrow().as_ref() {
+    /// Unlocks the identity for reading (once per command or GUI session). With Touch ID, an
+    /// identity the agent still holds for this terminal is used without a new prompt.
+    pub fn unlock(&self, state: &State) -> Result<Rc<dyn Keys>> {
+        if let Some(s) = self.unlocked.borrow().as_ref() {
+            return Ok(s.keys());
+        }
+        self.check_session()?;
+        if self.opts.touchid
+            && self.agent_ttl() > 0
+            && crate::agent::has_terminal()
+            && let Some(a) = crate::agent::keys(state.vault_id)
+                .filter(|a| state.users.values().any(|u| a.matches(u) && !u.disabled))
+        {
+            let a = Rc::new(a);
+            *self.unlocked.borrow_mut() = Some(Session::Agent(a.clone()));
+            return Ok(a);
+        }
+        Ok(self.unlock_local(state)?)
+    }
+
+    /// Unlocks the identity with its own keys, as signing a change needs. An identity held by
+    /// the Touch ID agent is not enough: every change asks for the fingerprint again.
+    pub fn unlock_for_write(&self, state: &State) -> Result<Rc<Unlocked>> {
+        if let Some(Session::Local(u)) = self.unlocked.borrow().as_ref() {
             return Ok(u.clone());
         }
+        self.check_session()?;
+        self.unlock_local(state)
+    }
+
+    fn check_session(&self) -> Result<()> {
         if self.opts.session && !self.opts.touchid && self.password_override.borrow().is_none() {
             return Err(Error::new(
                 Code::PasswordRequired,
                 "the session is locked; call session.unlock",
             ));
         }
+        Ok(())
+    }
+
+    /// How long the agent keeps an identity (0 = not at all; never in a GUI session).
+    fn agent_ttl(&self) -> u64 {
+        if self.opts.session {
+            return 0;
+        }
+        self.user
+            .agent_timeout
+            .unwrap_or(crate::agent::DEFAULT_TIMEOUT)
+    }
+
+    fn unlock_local(&self, state: &State) -> Result<Rc<Unlocked>> {
         if self.opts.touchid {
-            let ttl = self
-                .user
-                .agent_timeout
-                .unwrap_or(crate::agent::DEFAULT_TIMEOUT);
-            // Unlocked with Touch ID less than `agent_timeout` ago?
-            let cached = if ttl > 0 && !self.opts.session {
-                crate::agent::get(state.vault_id)
-                    .filter(|id| state.users.values().any(|u| id.matches(u) && !u.disabled))
-            } else {
-                None
-            };
-            let id = match cached {
-                Some(id) => id,
-                None => {
-                    let id = self.unlock_touchid(state)?;
-                    if ttl > 0
-                        && !self.opts.session
-                        && let Err(e) = crate::agent::put(state.vault_id, &id, ttl)
-                    {
-                        self.warn(format!(
-                            "Touch ID will be asked again next time: {}",
-                            e.message
-                        ));
-                    }
-                    id
-                }
-            };
+            let id = self.unlock_touchid(state)?;
+            let ttl = self.agent_ttl();
+            // Remembered only for a terminal session (see `agent`); other programs ask each time.
+            if ttl > 0
+                && crate::agent::has_terminal()
+                && let Err(e) = crate::agent::put(state.vault_id, &id, ttl)
+            {
+                self.warn(format!(
+                    "Touch ID will be asked again next time: {}",
+                    e.message
+                ));
+            }
             let rc = Rc::new(id);
-            *self.unlocked.borrow_mut() = Some(rc.clone());
+            *self.unlocked.borrow_mut() = Some(Session::Local(rc.clone()));
             return Ok(rc);
         }
         let id = if let Some(f) = self.identity_file()? {
@@ -396,7 +437,7 @@ impl Ctx {
             ));
         };
         let rc = Rc::new(id);
-        *self.unlocked.borrow_mut() = Some(rc.clone());
+        *self.unlocked.borrow_mut() = Some(Session::Local(rc.clone()));
         Ok(rc)
     }
 
@@ -1097,9 +1138,9 @@ pub fn execute(
     let mut base_seq = base_seq;
     for _ in 0..MAX_PUSH_ATTEMPTS {
         let opened = open_vault(ctx, true)?;
-        let id = ctx.unlock(&opened.v.state)?;
+        let id = ctx.unlock_for_write(&opened.v.state)?;
         let base = *base_seq.get_or_insert(opened.v.seq);
-        let mut tx = Tx::new(&opened.v, &id)?;
+        let mut tx = Tx::new(&opened.v, &*id)?;
         if let Some(target) = intent.target(&mut tx) {
             let me = tx.me;
             let changed = opened
@@ -1172,7 +1213,7 @@ fn pending_aad(vault: crate::model::Id) -> Vec<u8> {
     [&vault.0[..], b"pending"].concat()
 }
 
-fn load_pending(ctx: &Ctx, vault: crate::model::Id, id: &Unlocked) -> Result<Vec<PendingItem>> {
+fn load_pending(ctx: &Ctx, vault: crate::model::Id, id: &dyn Keys) -> Result<Vec<PendingItem>> {
     let p = config::pending_path(vault);
     let Ok(bytes) = std::fs::read(&p) else {
         return Ok(Vec::new());
@@ -1182,18 +1223,18 @@ fn load_pending(ctx: &Ctx, vault: crate::model::Id, id: &Unlocked) -> Result<Vec
         ctx.warn("pending offline changes belong to another identity and were left untouched");
         return Ok(Vec::new());
     }
-    let plain = crypto::unwrap(&id.kem, &f.items, &pending_aad(vault))?;
+    let plain = id.unwrap(&f.items, &pending_aad(vault))?;
     from_cbor(&plain)
 }
 
-fn save_pending(vault: crate::model::Id, id: &Unlocked, items: &[PendingItem]) -> Result<()> {
+fn save_pending(vault: crate::model::Id, id: &dyn Keys, items: &[PendingItem]) -> Result<()> {
     let p = config::pending_path(vault);
     if items.is_empty() {
         let _ = std::fs::remove_file(p);
         return Ok(());
     }
     let plain = Zeroizing::new(to_cbor(&items));
-    let items = crypto::wrap(id.kem.public(), &plain, &pending_aad(vault))?;
+    let items = crypto::wrap(id.kem_public(), &plain, &pending_aad(vault))?;
     config::write_private(
         &p,
         &to_cbor(&PendingFile {
@@ -1205,18 +1246,18 @@ fn save_pending(vault: crate::model::Id, id: &Unlocked, items: &[PendingItem]) -
 
 fn queue_offline(ctx: &Ctx, intent: &Intent) -> Result<Value> {
     let opened = open_vault(ctx, false)?;
-    let id = ctx.unlock(&opened.v.state)?;
+    let id = ctx.unlock_for_write(&opened.v.state)?;
     // Check that the intent applies to the current state before queueing it.
-    let mut tx = Tx::new(&opened.v, &id)?;
+    let mut tx = Tx::new(&opened.v, &*id)?;
     let out = intent.apply(&mut tx)?;
     let vault = opened.v.file.vault_id;
-    let mut items = load_pending(ctx, vault, &id)?;
+    let mut items = load_pending(ctx, vault, &*id)?;
     items.push(PendingItem {
         intent: intent.clone(),
         base_seq: opened.v.seq,
         created: tx::now(),
     });
-    save_pending(vault, &id, &items)?;
+    save_pending(vault, &*id, &items)?;
     ctx.warn(format!(
         "offline: {} change(s) not pushed; run `nepomuk sync` when online",
         items.len()
@@ -1241,8 +1282,8 @@ pub fn sync(ctx: &Ctx, resolve: Resolve) -> Result<Value> {
     if !config::pending_path(vault).is_file() {
         return Ok(json!({ "state": "up-to-date", "seq": opened.v.seq, "replayed": [] }));
     }
-    let id = ctx.unlock(&opened.v.state)?;
-    let items = load_pending(ctx, vault, &id)?;
+    let id = ctx.unlock_for_write(&opened.v.state)?;
+    let items = load_pending(ctx, vault, &*id)?;
     let mut replayed = Vec::new();
     let mut conflicts = Vec::new();
     let mut dropped = Vec::new();
@@ -1270,12 +1311,12 @@ pub fn sync(ctx: &Ctx, resolve: Resolve) -> Result<Value> {
             }
             Err(e) => {
                 keep.push(item);
-                save_pending(vault, &id, &keep)?;
+                save_pending(vault, &*id, &keep)?;
                 return Err(e);
             }
         }
     }
-    save_pending(vault, &id, &keep)?;
+    save_pending(vault, &*id, &keep)?;
     let state = if conflicts.is_empty() {
         "up-to-date"
     } else {
@@ -1476,7 +1517,7 @@ pub fn trust(ctx: &Ctx, fp: &str, replace: bool) -> Result<Value> {
 pub fn compact(ctx: &Ctx) -> Result<Value> {
     for _ in 0..MAX_PUSH_ATTEMPTS {
         let opened = open_vault(ctx, true)?;
-        let id = ctx.unlock(&opened.v.state)?;
+        let id = ctx.unlock_for_write(&opened.v.state)?;
         let file = tx::compact(&opened.v, &id)?;
         let before = opened.loaded.bytes.len();
         let bytes = file.serialize();

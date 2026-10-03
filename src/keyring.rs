@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::crypto::{self, KemSecret, Key32, Sealed};
 use crate::error::{Error, Result};
 use crate::format::{from_cbor, to_cbor};
-use crate::identity::Unlocked;
+use crate::identity::Keys;
 use crate::memory::LockedSeed;
 use crate::model::*;
 
@@ -190,7 +190,7 @@ pub fn join(parent: &str, name: &str) -> String {
 }
 
 impl Access {
-    pub fn build(state: &State, me: Id, id: &Unlocked) -> Access {
+    pub fn build(state: &State, me: Id, id: &dyn Keys) -> Access {
         let vault = state.vault_id;
         let mut acc = Access {
             vault,
@@ -205,7 +205,7 @@ impl Access {
         }
         for g in state.groups.values() {
             if let Some(w) = g.members.get(&me)
-                && let Ok(seed) = crypto::unwrap(&id.kem, w, &aad_member(vault, g.id, me))
+                && let Ok(seed) = id.unwrap(w, &aad_member(vault, g.id, me))
                 && let Ok(seed) = LockedSeed::from_slice(&seed)
             {
                 let kem = KemSecret::from_seed(seed.as_ref(), "group");
@@ -216,16 +216,16 @@ impl Access {
         }
         let mut roots: Vec<(Id, Key32, PathProof)> = Vec::new();
         for gr in state.grants.values() {
-            let kem = match gr.to {
-                Principal::User(u) if u == me => &id.kem,
+            let aad = aad_grant(vault, gr.node, gr.to);
+            let bytes = match gr.to {
+                Principal::User(u) if u == me => id.unwrap(&gr.wrapped, &aad),
                 Principal::Group(g) => match acc.groups.get(&g) {
-                    Some((_, k)) => k,
+                    Some((_, k)) => crypto::unwrap(k, &gr.wrapped, &aad),
                     None => continue,
                 },
                 _ => continue,
             };
-            let Ok(bytes) = crypto::unwrap(kem, &gr.wrapped, &aad_grant(vault, gr.node, gr.to))
-            else {
+            let Ok(bytes) = bytes else {
                 continue;
             };
             let Ok(payload) = from_cbor::<GrantPayload>(&bytes) else {

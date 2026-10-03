@@ -59,6 +59,49 @@ impl Unlocked {
     }
 }
 
+/// What the rest of nepomuk needs from an unlocked identity. A local identity holds its seed;
+/// one served by the Touch ID agent does not – the agent keeps the seed and only unwraps keys
+/// for the caller, and never signs (writing needs a fresh unlock, see `Ctx::unlock_for_write`).
+pub trait Keys {
+    fn name(&self) -> &str;
+    fn kind(&self) -> IdentityKind;
+    fn kem_public(&self) -> &KemPublic;
+    fn sig_public(&self) -> &SigPublic;
+    /// Unwraps a secret wrapped for this identity with the hybrid KEM.
+    fn unwrap(&self, w: &crypto::Wrapped, aad: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>>;
+    /// Signs with the hybrid signature; only a local identity can.
+    fn sign(&self, label: &str, data: &[u8]) -> Result<Vec<u8>>;
+
+    fn fingerprint(&self) -> String {
+        crypto::fingerprint(self.kem_public(), self.sig_public())
+    }
+
+    fn matches(&self, u: &User) -> bool {
+        &u.kem == self.kem_public() && &u.sig == self.sig_public()
+    }
+}
+
+impl Keys for Unlocked {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> IdentityKind {
+        self.kind
+    }
+    fn kem_public(&self) -> &KemPublic {
+        self.kem.public()
+    }
+    fn sig_public(&self) -> &SigPublic {
+        self.sig.public()
+    }
+    fn unwrap(&self, w: &crypto::Wrapped, aad: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        crypto::unwrap(&self.kem, w, aad)
+    }
+    fn sign(&self, label: &str, data: &[u8]) -> Result<Vec<u8>> {
+        Ok(self.sig.sign(label, data))
+    }
+}
+
 pub fn credential_aad(name: &str) -> Vec<u8> {
     format!("nepomuk/credential/{}", name.to_lowercase()).into_bytes()
 }

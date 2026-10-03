@@ -138,7 +138,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             ctx.opts.remember_touchid = p_bool(p, "remember_touchid");
             let result = app::open_vault(ctx, true).and_then(|o| {
                 let id = ctx.unlock(&o.v.state)?;
-                Ok(json!({ "name": id.name, "fingerprint": id.fingerprint(), "touchid": crate::touchid::enabled_for(o.v.file.vault_id).is_some() }))
+                Ok(json!({ "name": id.name(), "fingerprint": id.fingerprint(), "touchid": crate::touchid::enabled_for(o.v.file.vault_id).is_some() }))
             });
             ctx.opts.touchid = false;
             ctx.opts.session = true;

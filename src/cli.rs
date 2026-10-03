@@ -1222,7 +1222,7 @@ fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
                         touchid: false,
                         ..ctx.opts.clone()
                     })?;
-                    let id = ctx2.unlock(&o.v.state)?;
+                    let id = ctx2.unlock_for_write(&o.v.state)?;
                     Ok(Out::data(json!({ "enabled": true, "identity": id.name })))
                 }
                 TouchidCmd::Disable => {
@@ -1335,7 +1335,7 @@ fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
                 ));
             }
             let o = app::open_vault(ctx, true)?;
-            let id = ctx.unlock(&o.v.state)?;
+            let id = ctx.unlock_for_write(&o.v.state)?;
             if id.kind != IdentityKind::Password {
                 return Err(Error::usage("not a password identity"));
             }
