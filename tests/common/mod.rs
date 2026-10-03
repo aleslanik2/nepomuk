@@ -284,6 +284,11 @@ impl Env {
     pub fn in_terminal(&self, cmds: &[TerminalCmd]) -> Vec<Res> {
         let mut body = String::new();
         for (args, env) in cmds {
+            // `["@sleep", "<seconds>"]` pauses inside the same terminal.
+            if args.first() == Some(&"@sleep") {
+                body.push_str(&format!("sleep {}; echo \"@@EXIT 0\"\n", args[1]));
+                continue;
+            }
             let c = self.command(args, env);
             body.push_str("env -i");
             for (k, v) in c.get_envs() {

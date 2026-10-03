@@ -13,11 +13,11 @@
 //! - **It never signs.** Every change to the vault needs a fresh unlock; the cache only reads.
 //! - **One terminal.** An identity is cached for the terminal session of the program that
 //!   unlocked it (terminal device, session and the session leader's start time, taken from the
-//!   kernel, not from the client) and is served only to programs in that same session. Programs
-//!   without a terminal – other windows, editors, background jobs – get nothing.
+//!   kernel, not from the client) and is served only to programs in that same session. Other
+//!   terminal windows, and programs without a terminal (editors, daemons, cron), get nothing.
 //!
-//! Remaining trade-off: within the timeout, a program running as this user in that terminal
-//! session can read what the identity can read.
+//! Remaining trade-off: within the timeout, any program in that terminal session – including
+//! background jobs started from it – can read what the identity can read.
 
 use crate::crypto::{KemPublic, SigPublic, Wrapped};
 use crate::error::{Code, Error, Result};
@@ -604,8 +604,11 @@ mod imp {
             }
         });
 
+        // One thread per connection: a client that connects and stays silent must not stall
+        // the others.
         for s in listener.incoming().flatten() {
-            handle(&store, s);
+            let store = store.clone();
+            std::thread::spawn(move || handle(&store, s));
         }
         0
     }
