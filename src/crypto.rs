@@ -287,6 +287,8 @@ pub struct SigPublic {
     pub ec: Vec<u8>,
 }
 
+pub const KEM_MATERIAL_LEN: usize = 96;
+
 pub struct KemSecret {
     pq: mlkem1024::MlKem1024KeyPair,
     ec: x25519_dalek::StaticSecret,
@@ -296,10 +298,23 @@ pub struct KemSecret {
 impl KemSecret {
     /// Deterministically derives a hybrid KEM key pair from a seed.
     pub fn from_seed(seed: &[u8], label: &str) -> Self {
+        Self::from_material(&Self::material(seed, label))
+    }
+
+    /// What the KEM key pair is generated from (ML-KEM randomness, then the X25519 secret):
+    /// enough to decrypt, not to sign, unlike the seed.
+    pub fn material(seed: &[u8], label: &str) -> Zeroizing<[u8; KEM_MATERIAL_LEN]> {
+        let mut m = Zeroizing::new([0u8; KEM_MATERIAL_LEN]);
+        hkdf(seed, &[], &format!("{label}/ml-kem-1024"), &mut m[..64]);
+        hkdf(seed, &[], &format!("{label}/x25519"), &mut m[64..]);
+        m
+    }
+
+    pub fn from_material(m: &[u8; KEM_MATERIAL_LEN]) -> Self {
         let mut pq_rand = Zeroizing::new([0u8; 64]);
-        hkdf(seed, &[], &format!("{label}/ml-kem-1024"), pq_rand.as_mut());
+        pq_rand.copy_from_slice(&m[..64]);
         let mut ec_bytes = Zeroizing::new([0u8; 32]);
-        hkdf(seed, &[], &format!("{label}/x25519"), ec_bytes.as_mut());
+        ec_bytes.copy_from_slice(&m[64..]);
         let pq = mlkem1024::generate_key_pair(*pq_rand);
         let ec = x25519_dalek::StaticSecret::from(*ec_bytes);
         let public = KemPublic {

@@ -110,6 +110,8 @@ impl Env {
 
     fn apply(&self, c: &mut Command) {
         c.env("NEPOMUK_STATE_DIR", self.dir.join("state"))
+            // The steps run in this test binary; the agent is the CLI.
+            .env("NEPOMUK_AGENT_EXE", env!("CARGO_BIN_EXE_nepomuk"))
             .env("NEPOMUK_CONFIG_DIR", self.dir.join("cfg"))
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("HOME", &self.dir);
