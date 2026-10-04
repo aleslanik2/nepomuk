@@ -123,6 +123,17 @@ impl Sidecar {
 
     /// Sends a request and waits for its response (blocking).
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Value> {
+        self.call_within(method, params, None)
+            .unwrap_or_else(|| Err(err("GUI_CLI_EXITED", "the nepomuk process exited")))
+    }
+
+    /// Like `call`, but gives up after `limit`; `None` when it timed out.
+    pub fn call_within(
+        &self,
+        method: &str,
+        params: Value,
+        limit: Option<std::time::Duration>,
+    ) -> Option<Result<Value, Value>> {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -135,11 +146,36 @@ impl Sidecar {
                 .is_err()
             {
                 self.pending.lock().unwrap().remove(&id);
-                return Err(err("GUI_CLI_EXITED", "the nepomuk process is not running"));
+                return Some(Err(err(
+                    "GUI_CLI_EXITED",
+                    "the nepomuk process is not running",
+                )));
             }
         }
-        rx.recv()
-            .unwrap_or_else(|_| Err(err("GUI_CLI_EXITED", "the nepomuk process exited")))
+        match limit {
+            None => Some(
+                rx.recv()
+                    .unwrap_or_else(|_| Err(err("GUI_CLI_EXITED", "the nepomuk process exited"))),
+            ),
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(r) => Some(r),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Some(Err(err("GUI_CLI_EXITED", "the nepomuk process exited")))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    None
+                }
+            },
+        }
+    }
+
+    /// Ends the process now; it holds the unlocked identity only in memory.
+    pub fn kill(&self) {
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 

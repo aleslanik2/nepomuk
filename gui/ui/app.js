@@ -1,6 +1,6 @@
 // nepomuk GUI: opening a vault, pinning its master, logging in and the main shell (§13).
 
-import { invoke, rpc, listen, h, mount, toast, showError, busy, dialog, fingerprint, halo, fpText, basename, settings, errorText } from "./lib.js";
+import { invoke, rpc, listen, h, mount, toast, showError, busy, dialog, closeAllDialogs, session, fingerprint, halo, fpText, basename, settings, errorText } from "./lib.js";
 import { views } from "./views.js";
 
 const app = document.getElementById("app");
@@ -90,7 +90,9 @@ export async function switchVault() {
       h("div", { class: "actions end" }, h("button", { class: "quiet", onClick: () => close() }, "Cancel")));
   });
   if (!target) return;
-  if (state.unlocked) await rpc("session.lock").catch(() => {});
+  session.epoch += 1;
+  closeAllDialogs();
+  if (state.unlocked) await invoke("lock_session").catch(() => {});
   state.unlocked = false;
   state.me = null;
   state.selected = null;
@@ -547,12 +549,21 @@ async function conflictDialog(conflicts) {
 
 // ------------------------------------------------------------------ Locking (§12.2, §13)
 
+/**
+ * Locks at once: the content and every dialog go away before anything else, and answers to
+ * calls still running are dropped; then the CLI forgets the identity (and is ended and
+ * restarted if a long operation keeps it from answering, see `lock_session`).
+ */
 export async function lock(message) {
-  if (state.unlocked) await rpc("session.lock").catch(() => {});
+  const wasUnlocked = state.unlocked;
+  session.epoch += 1;
+  closeAllDialogs();
   state.unlocked = false;
   state.me = null;
   state.collapsed = null;
   refs = {};
+  mount(app);
+  if (wasUnlocked) await invoke("lock_session").catch(() => {});
   renderLogin(message);
 }
 

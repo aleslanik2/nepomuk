@@ -24,6 +24,8 @@ const API_VERSION: u64 = 1;
 
 struct AppState {
     sidecar: Mutex<Option<Arc<Sidecar>>>,
+    /// What the sidecar was started for, to start a fresh one after a forced lock.
+    target: Mutex<Option<(Option<PathBuf>, Option<PathBuf>)>>,
     clipboard: clipboard::SecretClipboard,
 }
 
@@ -66,6 +68,7 @@ async fn connect(
         }));
     }
     *state.sidecar.lock().unwrap() = Some(sc);
+    *state.target.lock().unwrap() = Some((vault.clone(), project.clone()));
     Ok(json!({
         "version": version,
         "vault": vault.map(|p| p.display().to_string()),
@@ -77,6 +80,35 @@ async fn connect(
 async fn disconnect(state: State<'_, AppState>) -> Result<(), Value> {
     state.sidecar.lock().unwrap().take();
     Ok(())
+}
+
+/// How long a lock may wait for the CLI before the CLI is ended instead.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Locks the session. The CLI handles one request at a time, so a long operation (`exec`, a
+/// slow git) would delay a plain `session.lock`: if it does not answer within `LOCK_WAIT`, the
+/// process is ended – which forgets the identity – and a fresh, locked one is started.
+fn lock_now(app: &AppHandle) -> Value {
+    let state = app.state::<AppState>();
+    let Some(sc) = state.sidecar.lock().unwrap().clone() else {
+        return json!({ "locked": true, "restarted": false });
+    };
+    if let Some(Ok(_)) = sc.call_within("session.lock", json!({}), Some(LOCK_WAIT)) {
+        return json!({ "locked": true, "restarted": false });
+    }
+    sc.kill();
+    state.sidecar.lock().unwrap().take();
+    let target = state.target.lock().unwrap().clone();
+    let restarted = target
+        .and_then(|(v, p)| Sidecar::spawn(app.clone(), v, p).ok())
+        .map(|fresh| *state.sidecar.lock().unwrap() = Some(fresh))
+        .is_some();
+    json!({ "locked": true, "restarted": restarted })
+}
+
+#[tauri::command]
+async fn lock_session(app: AppHandle) -> Result<Value, Value> {
+    blocking(move || lock_now(&app)).await
 }
 
 /// Forwards one JSON-RPC call to the CLI.
@@ -247,11 +279,9 @@ fn watch_screen_lock(app: AppHandle) {
             std::thread::sleep(Duration::from_secs(3));
             let locked = lockwatch::screen_locked().unwrap_or(false);
             if locked && !was_locked {
-                let sc = app.state::<AppState>().sidecar.lock().unwrap().clone();
-                if let Some(sc) = sc {
-                    let _ = sc.call("session.lock", json!({}));
-                }
+                // The window hides its content first; the CLI is locked (or ended) after.
                 let _ = app.emit("nepomuk:locked", json!({ "reason": "screen" }));
+                lock_now(&app);
             }
             was_locked = locked;
         }
@@ -263,6 +293,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sidecar: Mutex::new(None),
+            target: Mutex::new(None),
             clipboard: clipboard::SecretClipboard::start(),
         })
         .setup(|app| {
@@ -273,6 +304,7 @@ fn main() {
             connect,
             disconnect,
             rpc,
+            lock_session,
             pick,
             pick_save,
             pick_file_b64,
