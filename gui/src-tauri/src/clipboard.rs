@@ -12,6 +12,8 @@ enum Msg {
         secret: bool,
         clear_after: Duration,
     },
+    /// Clears a copied secret now (the session got locked).
+    ClearSecret,
 }
 
 pub struct SecretClipboard {
@@ -46,7 +48,7 @@ impl SecretClipboard {
                             armed = None;
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Ok(Msg::ClearSecret) | Err(mpsc::RecvTimeoutError::Timeout) => {
                         if let Some((value, _)) = armed.take() {
                             // Clear only if nothing else was copied meanwhile.
                             if cb
@@ -71,6 +73,11 @@ impl SecretClipboard {
             secret: true,
             clear_after,
         });
+    }
+
+    /// Clears the clipboard now if it still holds a copied secret.
+    pub fn clear_secret(&self) {
+        let _ = self.tx.send(Msg::ClearSecret);
     }
 
     pub fn copy_plain(&self, text: String) {

@@ -147,56 +147,175 @@ pub fn cleanup_stale() {
 /// split across two reads is still caught.
 pub struct Masker {
     secrets: Vec<Vec<u8>>,
+    /// Bytes read but not yet emitted (raw, before masking).
     buf: Vec<u8>,
-    hold: usize,
+    /// How many bytes at the start of `buf` a secret already found covers.
+    covered: usize,
+    /// The last thing emitted was "***" (a covered run continues it).
+    in_mask: bool,
 }
 
 impl Masker {
     pub fn new(mut secrets: Vec<Vec<u8>>) -> Masker {
         secrets.retain(|s| s.len() >= 3);
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.sort();
         secrets.dedup();
-        let hold = secrets.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         Masker {
             secrets,
             buf: Vec::new(),
-            hold,
+            covered: 0,
+            in_mask: false,
         }
     }
 
-    fn replace(&mut self) {
-        for s in &self.secrets {
-            let mut out = Vec::with_capacity(self.buf.len());
-            let mut i = 0;
-            while i < self.buf.len() {
-                if self.buf[i..].starts_with(s) {
-                    out.extend_from_slice(b"***");
-                    i += s.len();
-                } else {
-                    out.push(self.buf[i]);
-                    i += 1;
+    /// Replaces every byte covered by any occurrence of any secret – overlapping ones
+    /// included – with one "***" per covered run. Unless `finish`, it emits only up to the first
+    /// position where a secret could still begin (the rest of the buffer is a proper prefix of
+    /// a secret) and keeps the rest, newlines included, for the next read.
+    fn process(&mut self, finish: bool) -> Vec<u8> {
+        let n = self.buf.len();
+        let limit = if finish {
+            n
+        } else {
+            (0..n)
+                .find(|&k| {
+                    let rest = &self.buf[k..];
+                    self.secrets
+                        .iter()
+                        .any(|s| s.len() > rest.len() && s.starts_with(rest))
+                })
+                .unwrap_or(n)
+        };
+        let mut cover = vec![false; n];
+        for c in cover.iter_mut().take(self.covered.min(n)) {
+            *c = true;
+        }
+        let mut reach = self.covered;
+        for k in 0..limit {
+            for s in &self.secrets {
+                if self.buf[k..].starts_with(s) {
+                    for c in &mut cover[k..k + s.len()] {
+                        *c = true;
+                    }
+                    reach = reach.max(k + s.len());
                 }
             }
-            self.buf = out;
         }
+        let mut out = Vec::with_capacity(limit);
+        for (j, &b) in self.buf[..limit].iter().enumerate() {
+            if cover[j] {
+                if !self.in_mask {
+                    out.extend_from_slice(b"***");
+                    self.in_mask = true;
+                }
+            } else {
+                out.push(b);
+                self.in_mask = false;
+            }
+        }
+        self.buf.drain(..limit);
+        self.covered = reach.saturating_sub(limit);
+        out
     }
 
     /// Feeds bytes; returns what can be emitted now.
     pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         self.buf.extend_from_slice(data);
-        self.replace();
-        let cut = if self.buf.ends_with(b"\n") {
-            self.buf.len()
-        } else {
-            self.buf.len().saturating_sub(self.hold)
-        };
-        // Never emit a partial "***" boundary problem: the replacement is already done.
-        self.buf.drain(..cut).collect()
+        self.process(false)
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
-        self.replace();
-        std::mem::take(&mut self.buf)
+        self.process(true)
+    }
+}
+
+#[cfg(test)]
+mod masker_tests {
+    use super::Masker;
+
+    fn run(secrets: &[&str], chunks: &[&str]) -> String {
+        let mut m = Masker::new(secrets.iter().map(|s| s.as_bytes().to_vec()).collect());
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(m.feed(c.as_bytes()));
+        }
+        out.extend(m.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Every way of splitting `input` into two or three reads gives the same, fully masked
+    /// output.
+    fn all_splits(secrets: &[&str], input: &str, expected: &str) {
+        let n = input.len();
+        for a in 0..=n {
+            for b in a..=n {
+                let out = run(secrets, &[&input[..a], &input[a..b], &input[b..]]);
+                assert!(out == expected, "split at {a}/{b}: wrong output");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_and_multiline_secrets_never_leak() {
+        all_splits(&["abc", "abcdef"], "abcdef\n", "***\n");
+        all_splits(&["abc", "abcdef"], "x abc y abcdef z\n", "x *** y *** z\n");
+        all_splits(&["ab\ncd"], "ab\ncd\n", "***\n");
+        all_splits(
+            &["secret-value"],
+            "a secret-value b\nsecret-\n",
+            "a *** b\nsecret-\n",
+        );
+        all_splits(&["aaa"], "aaaaa\n", "***\n");
+        all_splits(&["abc", "bcdefgh"], "xabcdefgh\n", "x***\n");
+        all_splits(&["abcd", "cdefgh"], "abcdefgh!\n", "***!\n");
+    }
+
+    /// Random secrets and outputs: streamed in random reads, the result equals masking the
+    /// whole output at once, and no secret is ever visible.
+    #[test]
+    fn fuzz_streamed_equals_whole_and_hides_secrets() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let alphabet = b"ab\nc";
+        // Failure messages name the case number only: the generated values stand for secrets.
+        for case in 0..3000 {
+            let secrets: Vec<Vec<u8>> = (0..1 + rnd(3))
+                .map(|_| (0..3 + rnd(4)).map(|_| alphabet[rnd(4) as usize]).collect())
+                .collect();
+            let input: Vec<u8> = (0..rnd(30)).map(|_| alphabet[rnd(4) as usize]).collect();
+            let mut whole = Masker::new(secrets.clone());
+            let mut expected = whole.feed(&input);
+            expected.extend(whole.finish());
+            let mut m = Masker::new(secrets.clone());
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < input.len() {
+                let j = (i + 1 + rnd(5) as usize).min(input.len());
+                out.extend(m.feed(&input[i..j]));
+                i = j;
+            }
+            out.extend(m.finish());
+            assert!(out == expected, "case {case}: streamed output differs");
+            for s in &secrets {
+                assert!(
+                    !out.windows(s.len()).any(|w| w == s.as_slice()),
+                    "case {case}: a secret is visible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_output_is_emitted_without_delay() {
+        let mut m = Masker::new(vec![b"secret".to_vec()]);
+        assert_eq!(m.feed(b"hello\n"), b"hello\n");
+        assert_eq!(m.feed(b"a se"), b"a ");
+        assert_eq!(m.feed(b"xy"), b"sexy");
     }
 }
 

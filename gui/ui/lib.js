@@ -4,7 +4,18 @@
 const tauri = window.__TAURI__;
 
 export const invoke = (cmd, args = {}) => tauri.core.invoke(cmd, args);
-export const rpc = (method, params = {}) => invoke("rpc", { method, params });
+/** Changes whenever the session is locked; answers to calls made before are dropped. */
+export const session = { epoch: 0 };
+
+export async function rpc(method, params = {}) {
+  const epoch = session.epoch;
+  const result = await invoke("rpc", { method, params });
+  if (epoch !== session.epoch) {
+    // Whatever this was (a secret, a listing), it belongs to a session that has been locked.
+    throw { code: "SESSION_LOCKED", message: "The session was locked.", details: {} };
+  }
+  return result;
+}
 export const listen = (event, cb) => tauri.event.listen(event, cb);
 
 // ------------------------------------------------------------------ DOM
@@ -60,18 +71,41 @@ export function errorText(e) {
 }
 
 export function showError(e) {
+  // Answers that arrive after a lock are dropped on purpose; there is nothing to report.
+  if (e && e.code === "SESSION_LOCKED") return;
   toast(errorText(e), "error", e && e.code);
+}
+
+const openDialogs = new Set();
+
+/**
+ * Closes every open dialog at once (the session got locked): typed and revealed values are
+ * cleared first, and each dialog resolves as if cancelled.
+ */
+export function closeAllDialogs() {
+  for (const close of [...openDialogs]) close(undefined, true);
 }
 
 /** Modal dialog; `build(close)` returns its content. Resolves with the value passed to close. */
 export function dialog(title, build) {
   return new Promise((resolve) => {
     const d = h("dialog", { "aria-label": title });
-    const close = (value) => {
+    let closed = false;
+    const close = (value, wipe = false) => {
+      if (closed) return;
+      closed = true;
+      openDialogs.delete(close);
+      if (wipe) {
+        for (const el of d.querySelectorAll("input, textarea")) {
+          if (el.type === "text" || el.type === "password" || el.tagName === "TEXTAREA") el.value = "";
+        }
+        d.replaceChildren();
+      }
       d.close();
       d.remove();
       resolve(value);
     };
+    openDialogs.add(close);
     d.addEventListener("cancel", (ev) => {
       ev.preventDefault();
       close(undefined);

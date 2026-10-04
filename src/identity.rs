@@ -148,24 +148,78 @@ fn armor(label: &str, data: &[u8]) -> String {
     out
 }
 
+/// Largest armored identity or request accepted (they are a few kilobytes).
+const MAX_ARMORED: usize = 1 << 20;
+
 fn dearmor(label: &str, text: &str) -> Result<Vec<u8>> {
     let begin = format!("-----BEGIN NEPOMUK {label}-----");
-    let end = format!("-----END NEPOMUK {label}-----");
+    let what = label.to_lowercase();
     let text = text.trim();
-    let body = if let Some(rest) = text.strip_prefix(&begin) {
-        rest.split(&end).next().unwrap_or("")
-    } else {
-        // Bare base64 of an armored file (e.g. NEPOMUK_IDENTITY in CI).
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(text.split_whitespace().collect::<String>())
-            .map_err(|_| Error::format(format!("not a nepomuk {} file", label.to_lowercase())))?;
-        let inner =
-            String::from_utf8(decoded).map_err(|_| Error::format("bad identity encoding"))?;
-        return dearmor(label, &inner);
-    };
-    base64::engine::general_purpose::STANDARD
+    if text.is_empty() {
+        return Err(Error::format(format!("empty nepomuk {what} file")));
+    }
+    if text.len() > MAX_ARMORED {
+        return Err(Error::format(format!(
+            "the nepomuk {what} file is too large"
+        )));
+    }
+    if text.starts_with(&begin) {
+        return dearmor_block(label, text);
+    }
+    // Bare base64 of an armored file (e.g. NEPOMUK_IDENTITY in CI): one layer, no more.
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(text.split_whitespace().collect::<String>())
+        .map_err(|_| Error::format(format!("not a nepomuk {what} file")))?;
+    let inner = String::from_utf8(decoded).map_err(|_| Error::format("bad identity encoding"))?;
+    let inner = inner.trim();
+    if !inner.starts_with(&begin) {
+        return Err(Error::format(format!("not a nepomuk {what} file")));
+    }
+    dearmor_block(label, inner)
+}
+
+/// An armored block: the BEGIN line, base64, and the END line.
+fn dearmor_block(label: &str, text: &str) -> Result<Vec<u8>> {
+    let begin = format!("-----BEGIN NEPOMUK {label}-----");
+    let end = format!("-----END NEPOMUK {label}-----");
+    let what = label.to_lowercase();
+    let body = text
+        .strip_prefix(&begin)
+        .and_then(|rest| rest.split_once(&end).map(|(b, _)| b))
+        .ok_or_else(|| Error::format(format!("malformed nepomuk {what}")))?;
+    let bytes = base64::engine::general_purpose::STANDARD
         .decode(body.split_whitespace().collect::<String>())
-        .map_err(|_| Error::format(format!("malformed nepomuk {}", label.to_lowercase())))
+        .map_err(|_| Error::format(format!("malformed nepomuk {what}")))?;
+    if bytes.is_empty() {
+        return Err(Error::format(format!("empty nepomuk {what}")));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod armor_tests {
+    use super::*;
+
+    #[test]
+    fn dearmor_rejects_empty_and_nested_input() {
+        for bad in [
+            "",
+            "   \n\t",
+            "AAAA",
+            "-----BEGIN NEPOMUK IDENTITY-----\n-----END NEPOMUK IDENTITY-----",
+        ] {
+            assert!(dearmor("IDENTITY", bad).is_err(), "{bad:?}");
+        }
+        let armored = armor("IDENTITY", b"payload");
+        assert_eq!(dearmor("IDENTITY", &armored).unwrap(), b"payload");
+        let once = base64::engine::general_purpose::STANDARD.encode(&armored);
+        assert_eq!(dearmor("IDENTITY", &once).unwrap(), b"payload");
+        let twice = base64::engine::general_purpose::STANDARD.encode(&once);
+        assert!(dearmor("IDENTITY", &twice).is_err());
+        // Missing END line.
+        let cut = armored.replace("-----END NEPOMUK IDENTITY-----\n", "");
+        assert!(dearmor("IDENTITY", &cut).is_err());
+    }
 }
 
 // ---------------------------------------------------------------- Identity files

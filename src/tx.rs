@@ -681,9 +681,12 @@ impl<'a> Tx<'a> {
                 name_commit: sealed_name.commit,
                 grants,
             })?;
-            self.warnings.push(format!(
-                "{old_path} moved: whoever could read the old location still holds its key; consider `nepomuk rekey {dst}`"
-            ));
+            if self.state.rekey_pending.contains_key(&id) || self.state.stale_keys.contains_key(&id)
+            {
+                self.warnings.push(format!(
+                    "{old_path} moved: whoever could read the old location but not the new one still holds its key; it waits for `nepomuk rekey --pending`"
+                ));
+            }
             Ok(())
         }
     }
@@ -852,19 +855,33 @@ impl<'a> Tx<'a> {
 
     /// Rekeys the nodes waiting for it (§8.1) that the author may rekey; returns their paths.
     pub fn rekey_pending(&mut self) -> Result<Vec<String>> {
-        let pending: BTreeSet<Id> = self.state.rekey_pending.keys().copied().collect();
+        // A node read only by a stale group waits for the group's new key, not for a rekey.
+        let waiting = |s: &State| -> BTreeSet<Id> {
+            s.rekey_pending
+                .keys()
+                .chain(
+                    s.stale_keys
+                        .iter()
+                        .filter(|(_, why)| why.iter().any(|r| !s.stale_groups.contains(r)))
+                        .map(|(n, _)| n),
+                )
+                .copied()
+                .collect()
+        };
+        let pending = waiting(&self.state);
         if pending.is_empty() {
             return Err(Error::not_found("pending rekeys"));
         }
-        let before = self.state.rekey_pending.len();
+        let before = pending.len();
         let paths: BTreeMap<Id, String> = pending.iter().map(|n| (*n, self.path_of(*n))).collect();
         self.rekey_all(pending)?;
+        let left = waiting(&self.state);
         let done: Vec<String> = paths
             .into_iter()
-            .filter(|(n, _)| !self.state.rekey_pending.contains_key(n))
+            .filter(|(n, _)| !left.contains(n))
             .map(|(_, p)| p)
             .collect();
-        if self.state.rekey_pending.len() == before {
+        if left.len() == before {
             return Err(Error::access_denied("pending rekeys").with(
                 "reason",
                 "none of the pending rekeys can be done by you: they need admin on the parent folder",
@@ -1134,6 +1151,72 @@ impl<'a> Tx<'a> {
         } else {
             old_sysrights
         };
+        // The old keys may be in the wrong hands (that is often why they are replaced) and they
+        // know every key they could read, from the history. Everything they could read gets new
+        // keys: group keys first (while the user is still a member), the nodes at the end.
+        let all_groups = self.state.user_groups(user);
+        let mut readable: BTreeSet<Id> = self
+            .state
+            .grants
+            .values()
+            .filter(|g| match g.to {
+                Principal::User(u) => u == user,
+                Principal::Group(gr) => all_groups.contains(&gr),
+            })
+            .map(|g| g.node)
+            .collect();
+        let mut unrotated: BTreeSet<Id> = BTreeSet::new();
+        for g in &all_groups {
+            let can = self
+                .state
+                .sys_right(self.me, SysRight::GroupAdmin(*g))
+                .is_some()
+                && self.access().group_kem(*g).is_some();
+            // Rotating needs the keys of everything the group can read; without them, leave it
+            // as a task rather than failing the replacement.
+            let (state, ops) = (self.state.clone(), self.ops.len());
+            let rotated = can
+                && match self.group_remove_inner(*g, user, false) {
+                    Ok(()) => true,
+                    Err(e) if e.code == Code::AccessDenied => {
+                        self.state = state;
+                        self.ops.truncate(ops);
+                        self.access = None;
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+            if !rotated {
+                // The vault keeps the group marked (and what it reads) until it gets a new key.
+                let group = &self.state.groups[g];
+                let others: Vec<String> = group
+                    .members
+                    .keys()
+                    .filter(|m| **m != user)
+                    .filter_map(|m| self.state.users.get(m).map(|u| u.name.clone()))
+                    .collect();
+                unrotated.insert(*g);
+                self.tasks.push(match others.first() {
+                    Some(_) => format!(
+                        "give group {0} a new key – the replaced keys of {old_name} hold the current one: a group admin who is a member runs `nepomuk group add {0} {old_name}`, `nepomuk group remove {0} {old_name}` and `nepomuk group add {0} {old_name}`",
+                        group.name
+                    ),
+                    None => format!(
+                        "group {} has no other members and the replaced keys of {old_name} hold its key: revoke its grants",
+                        group.name
+                    ),
+                });
+            }
+        }
+        // What the user lost earlier without a rekey is known to the replaced keys too.
+        readable.extend(
+            self.state
+                .rekey_pending
+                .iter()
+                .filter(|(_, who)| who.contains(&Principal::User(user)))
+                .map(|(n, _)| *n),
+        );
+        readable.retain(|n| self.state.nodes.contains_key(n));
         self.push(Op::ReplaceIdentity {
             user,
             kind: req.kind,
@@ -1172,7 +1255,7 @@ impl<'a> Tx<'a> {
                         delegate: *d,
                     })?;
                 }
-            } else {
+            } else if !unrotated.contains(&g) {
                 self.tasks.push(format!(
                     "add {old_name} back to group {}",
                     self.state.groups[&g].name
@@ -1213,6 +1296,10 @@ impl<'a> Tx<'a> {
                 ));
             }
         }
+        self.rekey_all(readable)?;
+        self.warnings.push(format!(
+            "if the replaced keys of {old_name} may have been stolen, change the secrets they could read at their source"
+        ));
         Ok(())
     }
 

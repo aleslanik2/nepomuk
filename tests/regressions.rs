@@ -1088,3 +1088,365 @@ fn master_transfer_steps_down_and_asks_for_root_rekey() {
     assert!(v.state.has_right(old, v.state.root, Right::Admin));
     assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
 }
+
+/// NPK-01: replacing an identity gives new keys to everything the replaced keys could read,
+/// so content written afterwards is out of their reach; what the author cannot rekey stays
+/// pending in the vault, even after the new keys are granted access again.
+#[test]
+fn replaced_keys_cannot_read_later_content() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    t.mkdir("/team", false).unwrap();
+    t.put("/team/db", Content::Text { value: "v1".into() }, None)
+        .unwrap();
+    let g = t.group_create("devs").unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.group_add(g, b).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.put("/grp/s", Content::Text { value: "g1".into() }, None)
+        .unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // What the old keys know, from the history.
+    let old = Access::build(&v.state, b, &bob);
+    assert_eq!(text(&old, &v, "/team/db"), "v1");
+    assert_eq!(text(&old, &v, "/grp/s"), "g1");
+
+    // The master replaces Bob's keys: everything is rekeyed, nothing is left pending.
+    let new_bob = Unlocked::generate("bob", IdentityKind::Local);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_replace(b, &Request::new(&new_bob, None)).unwrap();
+    assert!(t.tasks.is_empty(), "{:?}", t.tasks);
+    let (_, v2, _, _) = t.commit().unwrap();
+    assert!(v2.state.rekey_pending.is_empty());
+    let mut t = Tx::new(&v2, &master).unwrap();
+    t.put("/team/db", Content::Text { value: "v2".into() }, None)
+        .unwrap();
+    t.put("/grp/s", Content::Text { value: "g2".into() }, None)
+        .unwrap();
+    let (_, v3, _, _) = t.commit().unwrap();
+    for (id, n) in &old.nodes {
+        assert!(
+            old.content(&v3.state, *id).is_err(),
+            "the replaced keys still read {}",
+            n.path
+        );
+    }
+    // The old group key does not open the group's new grants.
+    let (_, old_group) = old.groups.get(&g).unwrap();
+    for gr in v3
+        .state
+        .grants
+        .values()
+        .filter(|x| x.to == Principal::Group(g))
+    {
+        let aad = keyring::aad_grant(v3.state.vault_id, gr.node, gr.to);
+        assert!(crypto::unwrap(old_group, &gr.wrapped, &aad).is_err());
+    }
+    // The new keys read everything again.
+    let acc = Access::build(&v3.state, b, &new_bob);
+    assert_eq!(text(&acc, &v3, "/team/db"), "v2");
+    assert_eq!(text(&acc, &v3, "/grp/s"), "g2");
+
+    // Someone with only `users` can neither rekey nor give the group a new key: the vault
+    // keeps both marked, also after the master grants the new keys access again.
+    let old2 = Access::build(&v3.state, b, &new_bob);
+    let newer = Unlocked::generate("bob", IdentityKind::Local);
+    let mut t = Tx::new(&v3, &it).unwrap();
+    t.user_replace(b, &Request::new(&newer, None)).unwrap();
+    assert!(
+        t.tasks.iter().any(|x| x.contains("group remove devs bob")),
+        "{:?}",
+        t.tasks
+    );
+    let (_, v4, _, _) = t.commit().unwrap();
+    assert!(v4.state.stale_groups.contains(&g));
+    let mut t = Tx::new(&v4, &master).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    t.group_add(g, b).unwrap();
+    let (_, v5, _, _) = t.commit().unwrap();
+    let macc = Access::build(&v5.state, v5.state.master, &master);
+    let (team, grp) = (
+        macc.resolve("/team").unwrap(),
+        macc.resolve("/grp").unwrap(),
+    );
+    assert!(v5.state.stale_keys.contains_key(&team));
+    assert!(v5.state.stale_keys.contains_key(&grp));
+    // A rekey alone does not help /grp while the group key is stale.
+    let mut t = Tx::new(&v5, &master).unwrap();
+    t.rekey_pending().unwrap();
+    let (_, v6, _, _) = t.commit().unwrap();
+    assert!(!v6.state.stale_keys.contains_key(&team));
+    assert!(v6.state.stale_keys.contains_key(&grp));
+    // `group remove devs bob` by a member and admin gives the group a new key (bob is a member
+    // again here; it works too when he is not), then `rekey --pending` clears the rest.
+    let mut t = Tx::new(&v6, &master).unwrap();
+    t.group_remove(g, b).unwrap();
+    let (_, v7, _, _) = t.commit().unwrap();
+    assert!(v7.state.stale_groups.is_empty());
+    let mut t = Tx::new(&v7, &master).unwrap();
+    if !v7.state.stale_keys.is_empty() || !v7.state.rekey_pending.is_empty() {
+        t.rekey_pending().unwrap();
+    }
+    t.put("/team/db", Content::Text { value: "v3".into() }, None)
+        .unwrap();
+    t.put("/grp/s", Content::Text { value: "g3".into() }, None)
+        .unwrap();
+    let (_, v8, _, _) = t.commit().unwrap();
+    assert!(v8.state.stale_keys.is_empty() && v8.state.rekey_pending.is_empty());
+    for (id, n) in &old2.nodes {
+        assert!(
+            old2.content(&v8.state, *id).is_err(),
+            "the replaced keys still read {}",
+            n.path
+        );
+    }
+}
+
+/// A stale group can be given a new key after the replaced user is no longer its member.
+#[test]
+fn stale_group_gets_a_new_key_without_the_replaced_member() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    let g = t.group_create("devs").unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.group_add(g, b).unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let old = Access::build(&v.state, b, &bob);
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.user_replace(
+        b,
+        &Request::new(&Unlocked::generate("bob", IdentityKind::Local), None),
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_groups.contains(&g));
+    assert!(!v.state.groups[&g].members.contains_key(&b));
+    // A new grant for the stale group is readable by the replaced keys: marked.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mkdir("/grp2", false).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp2").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let grp2 = Access::build(&v.state, v.state.master, &master)
+        .resolve("/grp2")
+        .unwrap();
+    assert!(v.state.stale_keys[&grp2].contains(&g));
+    // Only operations every client accepts: add the user back, remove (new key), add again.
+    let mut t = Tx::new(&v, &master).unwrap();
+    assert!(t.group_remove(g, b).is_err(), "bob is not a member");
+    t.group_add(g, b).unwrap();
+    t.group_remove(g, b).unwrap();
+    t.group_add(g, b).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_groups.is_empty());
+    let (_, old_group) = old.groups.get(&g).unwrap();
+    for gr in v
+        .state
+        .grants
+        .values()
+        .filter(|x| x.to == Principal::Group(g))
+    {
+        let aad = keyring::aad_grant(v.state.vault_id, gr.node, gr.to);
+        assert!(crypto::unwrap(old_group, &gr.wrapped, &aad).is_err());
+    }
+}
+
+/// Marks follow a folder moved out of a folder whose key is known to replaced keys, and
+/// pending rekeys of a group follow its members when one is removed.
+#[test]
+fn stale_and_pending_marks_survive_moves_and_group_changes() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.mkdir("/team/sub", true).unwrap();
+    t.mkdir("/other", false).unwrap();
+    t.mkdir("/n", false).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, b).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/n").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // The group loses /n without a rekey: pending under the group.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.revoke(Principal::Group(g), "/n", true).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // `it` replaces bob (no rights to rekey anything).
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.user_replace(
+        b,
+        &Request::new(&Unlocked::generate("bob", IdentityKind::Local), None),
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // The master moves a folder out of /team and gives the group /n back.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mv("/team/sub", "/other/sub").unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/n").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let macc = Access::build(&v.state, v.state.master, &master);
+    let (sub, n) = (
+        macc.resolve("/other/sub").unwrap(),
+        macc.resolve("/n").unwrap(),
+    );
+    assert!(
+        v.state.stale_keys.contains_key(&sub),
+        "moved folder lost its mark"
+    );
+    assert!(
+        v.state.stale_keys.contains_key(&n),
+        "group's pending rekey was lost"
+    );
+    // A rekey clears the moved folder; /n waits for the group's new key.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rekey_pending().unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(!v.state.stale_keys.contains_key(&sub));
+    assert_eq!(v.state.stale_keys.get(&n), Some(&[g].into()));
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.group_add(g, b).unwrap();
+    t.group_remove(g, b).unwrap();
+    t.group_add(g, b).unwrap();
+    // `group remove` also rekeys what the group reads.
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_keys.is_empty() && v.state.rekey_pending.is_empty());
+    assert!(v.state.stale_groups.is_empty());
+}
+
+/// "Removing" a member while keeping the group key does not count as a new key.
+#[test]
+fn group_removal_must_change_the_key() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    let b = t.user_named("bob").unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, b).unwrap();
+    let (mut f, v, _, _) = t.commit().unwrap();
+    let group = v.state.groups[&g].clone();
+    let me = v.state.master;
+    let members = group
+        .members
+        .iter()
+        .filter(|(m, _)| **m != b)
+        .map(|(m, w)| (*m, w.clone()))
+        .collect();
+    sign_commit(
+        &mut f,
+        &master,
+        me,
+        v.seq + 1,
+        vec![Op::RemoveMember {
+            group: g,
+            user: b,
+            kem: group.kem.clone(),
+            members,
+            grants: vec![],
+        }],
+    );
+    assert_eq!(
+        verify_file(f, &master.fingerprint()).unwrap_err().code,
+        Code::UnauthorizedOperation
+    );
+}
+
+/// Keys known through a group's earlier loss, or through a folder moved away from a reader,
+/// are marked when that reader's keys are replaced.
+#[test]
+fn replaced_keys_marks_cover_group_losses_and_earlier_moves() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let lead = Unlocked::generate("lead", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&lead, None)).unwrap();
+    let (b, l) = (t.user_named("bob").unwrap(), t.user_named("lead").unwrap());
+    t.sysgrant(l, SysRight::Groups, false).unwrap();
+    t.mkdir("/n", false).unwrap();
+    t.mkdir("/team/sub", true).unwrap();
+    t.mkdir("/other", false).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // A group the master is not in.
+    let mut t = Tx::new(&v, &lead).unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, b).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/n").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // What bob's keys know before the move.
+    let old = Access::build(&v.state, b, &bob);
+    let sub_old_key = old.key(old.resolve("/team/sub").unwrap()).cloned().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.revoke(Principal::Group(g), "/n", true).unwrap();
+    // Moved away while bob still reads /team: bob keeps knowing its key.
+    t.mv("/team/sub", "/other/sub").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let macc = Access::build(&v.state, v.state.master, &master);
+    let (n, sub) = (
+        macc.resolve("/n").unwrap(),
+        macc.resolve("/other/sub").unwrap(),
+    );
+    assert!(v.state.rekey_pending[&sub].contains(&Principal::User(b)));
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_replace(
+        b,
+        &Request::new(&Unlocked::generate("bob", IdentityKind::Local), None),
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_groups.contains(&g));
+    // /other/sub was pending under bob: the master's replace rekeyed it.
+    assert!(!v.state.stale_keys.contains_key(&sub));
+    assert!(!v.state.rekey_pending.contains_key(&sub));
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.put(
+        "/other/sub/x",
+        Content::Text {
+            value: "later".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let x = Access::build(&v.state, v.state.master, &master)
+        .resolve("/other/sub/x")
+        .unwrap();
+    // The old keys knew the old key of /other/sub, which no longer unlocks its new child.
+    let w = v.state.nodes[&x].wrapped_key.as_ref().unwrap();
+    let aad = keyring::aad_node_key(v.state.vault_id, x);
+    assert!(crypto::open(&keyring::wrap_key(&sub_old_key), w, &aad).is_err());
+    // /n was pending under the group bob was in (the master cannot rotate it): marked for the
+    // replaced keys, and granting access again does not clear it.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/n").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_keys.contains_key(&n));
+}

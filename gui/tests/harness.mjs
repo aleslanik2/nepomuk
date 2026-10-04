@@ -88,6 +88,10 @@ function connect(args) {
   });
 }
 
+function emit(event, payload = {}) {
+  for (const res of sse) res.write(`data: ${JSON.stringify({ event, payload })}\n\n`);
+}
+
 function call(method, params) {
   return new Promise((ok, fail) => {
     const id = nextId++;
@@ -108,6 +112,7 @@ const commands = {
   },
   async disconnect() { if (sidecar) sidecar.kill(); sidecar = null; },
   rpc: (a) => call(a.method, a.params || {}),
+  lock_session: async () => { await call("session.lock", {}); return { locked: true, restarted: false }; },
   pick: () => picks.shift() ?? null,
   pick_save: (a) => join(work, a.defaultName),
   pick_file_b64: () => ({ name: "upload.bin", size: 4, base64: "AAECAw==" }),
@@ -333,6 +338,21 @@ step("describe a secret", async () => {
   await waitFor(`document.querySelector('.detail .description')?.innerText.includes("Rotate yearly")`, "description shown");
   await waitFor(`!!document.querySelector('.tree button[title^="Token for the CI build"]')`, "tree tooltip");
   await shot("06b-description");
+});
+step("locking closes dialogs and their secrets", async () => {
+  await click("db", ".tree button");
+  await click("New secret");
+  await type("dialog input", "half-typed", 0);
+  await type("dialog input[type=password]", "MUST-NOT-SURVIVE-LOCK");
+  // As the backend does when the screen locks.
+  emit("nepomuk:locked", { reason: "screen" });
+  await waitFor(hasText("Locked because the screen was locked"), "locked");
+  await waitFor("!document.querySelector('dialog')", "dialogs closed");
+  const leaked = await js(`[...document.querySelectorAll("input, textarea")].some((i) => i.value.includes("MUST-NOT-SURVIVE"))`);
+  if (leaked) throw new Error("a typed secret survived the lock");
+  await type("input[type=password]", MASTER_PASS);
+  await click("Unlock", "form button[type=submit]");
+  await waitFor("!!document.querySelector('.tree')", "unlocked again");
 });
 step("users", async () => {
   await click("Users", "nav button");
