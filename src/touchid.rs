@@ -38,20 +38,18 @@ fn record_path(vault: Id) -> PathBuf {
         .join(format!("{}.json", vault.hex()))
 }
 
-/// The helper next to the CLI, `NEPOMUK_TOUCHID_HELPER`, or from PATH.
-fn helper() -> PathBuf {
+/// The helper installed next to this program (symlinks resolved). Not from PATH, and the
+/// `NEPOMUK_TOUCHID_HELPER` override only in debug builds (tests): `seal` hands the helper the
+/// plain password, and the helper shows the Touch ID prompt.
+fn helper() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("NEPOMUK_TOUCHID_HELPER") {
-        return PathBuf::from(p);
+        return Some(PathBuf::from(p));
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(p) = exe
-            .parent()
-            .map(|d| d.join("nepomuk-touchid"))
-            .filter(|p| p.is_file())
-    {
-        return p;
-    }
-    PathBuf::from("nepomuk-touchid")
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    exe.parent()
+        .map(|d| d.join("nepomuk-touchid"))
+        .filter(|p| p.is_file())
 }
 
 fn unavailable() -> Error {
@@ -60,16 +58,18 @@ fn unavailable() -> Error {
 
 pub fn available() -> bool {
     cfg!(target_os = "macos")
-        && Command::new(helper())
-            .arg("available")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        && helper().is_some_and(|h| {
+            Command::new(h)
+                .arg("available")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
 }
 
 fn run(args: &[&str], input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    let mut child = Command::new(helper())
+    let mut child = Command::new(helper().ok_or_else(unavailable)?)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

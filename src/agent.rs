@@ -6,18 +6,22 @@
 //! expires, when the screen locks, on `nepomuk lock`, and exits once it holds nothing.
 //!
 //! Limits on what a cached identity can be used for:
-//! - **The seed never leaves the agent.** Clients get the public keys and ask the agent to unwrap
-//!   keys wrapped for the identity (grants, group keys, pending changes of that vault); like
-//!   `ssh-agent`, it never hands out the private key, so a program that reaches it can use the
-//!   identity only while it is cached, not keep it.
+//! - **It gets only the decryption key.** The CLI that unlocked the identity sends the KEM key
+//!   material and the public signing key, never the seed (which also derives the signing key),
+//!   and only to an agent that is the same program run by the same user (peer UID and
+//!   executable checked), not to whatever listens on the socket. Clients get the public keys
+//!   and ask the agent to unwrap keys wrapped for the identity (grants, group keys, pending
+//!   changes of that vault); like `ssh-agent`, it never hands out the private key, so a program
+//!   that reaches it can use the identity only while it is cached, not keep it.
 //! - **It never signs.** Every change to the vault needs a fresh unlock; the cache only reads.
 //! - **One terminal.** An identity is cached for the terminal session of the program that
 //!   unlocked it (terminal device, session and the session leader's start time, taken from the
 //!   kernel, not from the client) and is served only to programs in that same session. Other
 //!   terminal windows, and programs without a terminal (editors, daemons, cron), get nothing.
 //!
-//! Remaining trade-off: within the timeout, any program in that terminal session – including
-//! background jobs started from it – can read what the identity can read.
+//! Remaining trade-offs: within the timeout, any program in that terminal session – including
+//! background jobs and a build started by `nepomuk exec` – can read what the identity can read,
+//! and a program that can type into the terminal (tmux, screen, AppleScript) can too.
 
 use crate::crypto::{KemPublic, SigPublic, Wrapped};
 use crate::error::{Code, Error, Result};
@@ -120,7 +124,6 @@ mod imp {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::memory::LockedSeed;
 
     /// A private directory of this user, short enough for a socket path (about 100 bytes):
     /// `$TMPDIR` on macOS, `$XDG_RUNTIME_DIR` on Linux, otherwise the state directory.
@@ -154,10 +157,18 @@ mod imp {
     }
 
     fn request(msg: &Value) -> Option<Value> {
+        request_line(&Zeroizing::new(format!("{msg}\n")))
+    }
+
+    /// Sends one request line, only to an agent that is this program run by this user: another
+    /// process of the user could have put its own socket in place.
+    fn request_line(line: &Zeroizing<String>) -> Option<Value> {
         let mut s = UnixStream::connect(socket()).ok()?;
+        if !server_is_agent(&s) {
+            return None;
+        }
         s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
-        let line = Zeroizing::new(format!("{msg}\n"));
         s.write_all(line.as_bytes()).ok()?;
         let mut resp = Zeroizing::new(String::new());
         BufReader::new(s).read_line(&mut resp).ok()?;
@@ -216,14 +227,25 @@ mod imp {
         if request(&json!({ "op": "ping" })).is_none() {
             start()?;
         }
-        let seed = Zeroizing::new(b64().encode(id.seed.as_ref()));
+        // Only what decrypting needs: the KEM key material and the public signing key. The seed
+        // (which also derives the signing key) never leaves this process.
+        let kem = Zeroizing::new(
+            b64().encode(crate::crypto::KemSecret::material(id.seed.as_ref(), "identity").as_ref()),
+        );
+        let sig_public = b64().encode(crate::format::to_cbor(id.sig.public()));
         let kind = if id.kind == IdentityKind::Password {
             "password"
         } else {
             "local"
         };
-        let msg = json!({ "op": "put", "vault": vault.hex(), "name": id.name, "kind": kind, "seed": seed.as_str(), "ttl": ttl });
-        match request(&msg) {
+        // Built by hand, so the key material is only in zeroized buffers.
+        let head = json!({ "op": "put", "vault": vault.hex(), "name": id.name, "kind": kind, "sig_public": sig_public, "ttl": ttl }).to_string();
+        let mut line = Zeroizing::new(String::with_capacity(head.len() + kem.len() + 16));
+        line.push_str(&head[..head.len() - 1]);
+        line.push_str(",\"kem\":\"");
+        line.push_str(&kem);
+        line.push_str("\"}\n");
+        match request_line(&line) {
             Some(r) if r["ok"] == true => Ok(()),
             Some(r) if r["error"] == "no-terminal" => Err(Error::general(
                 "it is remembered only for programs in a terminal",
@@ -278,6 +300,89 @@ mod imp {
 
     /// Entries by vault and terminal session.
     type Store = Arc<Mutex<HashMap<(String, String), Entry>>>;
+
+    /// The process at the other end of the socket is this user running this same program.
+    fn server_is_agent(s: &UnixStream) -> bool {
+        if !peer_is_me(s) {
+            return false;
+        }
+        let same = |a: &std::path::Path, b: &std::path::Path| match (
+            std::fs::canonicalize(a),
+            std::fs::canonicalize(b),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        match (peer_pid(s).and_then(exe_of), std::env::current_exe()) {
+            (Some(peer), Ok(me)) => same(&peer, &me),
+            _ => false,
+        }
+    }
+
+    fn peer_pid(s: &UnixStream) -> Option<libc::pid_t> {
+        use std::os::unix::io::AsRawFd;
+        #[cfg(target_os = "macos")]
+        {
+            let mut pid: libc::pid_t = 0;
+            let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+            let ok = unsafe {
+                libc::getsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_LOCAL,
+                    libc::LOCAL_PEERPID,
+                    &mut pid as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            } == 0;
+            (ok && pid > 0).then_some(pid)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let ok = unsafe {
+                libc::getsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    &mut cred as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            } == 0;
+            (ok && cred.pid > 0).then_some(cred.pid)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = s.as_raw_fd();
+            None
+        }
+    }
+
+    /// The executable of a process.
+    fn exe_of(pid: libc::pid_t) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let n = unsafe {
+                libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+            };
+            if n <= 0 {
+                return None;
+            }
+            buf.truncate(n as usize);
+            use std::os::unix::ffi::OsStringExt;
+            Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = pid;
+            None
+        }
+    }
 
     fn peer_is_me(s: &UnixStream) -> bool {
         use std::os::unix::io::AsRawFd;
@@ -489,7 +594,7 @@ mod imp {
         if reader.read_line(&mut line).is_err() {
             return;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+        let Ok(mut msg) = serde_json::from_str::<Value>(&line) else {
             return;
         };
         let mut st = store.lock().unwrap();
@@ -526,30 +631,39 @@ mod imp {
                 }
             }
             Some("put") => {
-                let seed = msg["seed"]
+                let material = match msg["kem"].take() {
+                    Value::String(s) => Some(Zeroizing::new(s)),
+                    _ => None,
+                }
+                .and_then(|s| b64().decode(s.as_bytes()).ok().map(Zeroizing::new))
+                .and_then(|b| {
+                    let mut m = Zeroizing::new([0u8; crate::crypto::KEM_MATERIAL_LEN]);
+                    (b.len() == m.len()).then(|| {
+                        m.copy_from_slice(&b);
+                        m
+                    })
+                });
+                let sig_public = msg["sig_public"]
                     .as_str()
                     .and_then(|s| b64().decode(s).ok())
-                    .map(Zeroizing::new);
+                    .and_then(|b| crate::format::from_cbor::<SigPublic>(&b).ok());
                 match (
                     terminal.as_ref(),
                     msg["vault"].as_str(),
                     msg["name"].as_str(),
-                    seed.and_then(|s| LockedSeed::from_slice(&s).ok()),
+                    material,
+                    sig_public,
                 ) {
                     (None, ..) => json!({ "ok": false, "error": "no-terminal" }),
-                    (Some(t), Some(v), Some(name), Some(seed)) => {
+                    (Some(t), Some(v), Some(name), Some(material), Some(sig_public)) => {
                         let ttl = msg["ttl"]
                             .as_u64()
                             .unwrap_or(DEFAULT_TIMEOUT)
                             .min(24 * 3600);
-                        // Keep only what unwrapping needs: the KEM key pair, not the seed
-                        // (which also derives the signing key).
-                        let kem = crate::crypto::KemSecret::from_seed(seed.as_ref(), "identity");
-                        let sig = crate::crypto::SigSecret::from_seed(seed.as_ref(), "identity");
+                        let kem = crate::crypto::KemSecret::from_material(&material);
+                        drop(material);
                         let public =
-                            b64().encode(crate::format::to_cbor(&(kem.public(), sig.public())));
-                        drop(sig);
-                        drop(seed);
+                            b64().encode(crate::format::to_cbor(&(kem.public(), &sig_public)));
                         st.insert(
                             (v.to_string(), t.clone()),
                             Entry {
@@ -639,6 +753,47 @@ mod imp {
             std::thread::spawn(move || handle(&store, s));
         }
         0
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    mod server_tests {
+        use super::*;
+
+        /// The client talks only to an agent that is this program: a socket another program
+        /// put in place (here a Python listener) gets nothing.
+        #[test]
+        fn foreign_socket_is_refused() {
+            let dir = std::env::temp_dir().join(format!("np-agent-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s.sock");
+            let mut py = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import socket,sys,time\ns=socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.listen(1)\nprint('up',flush=True)\nc,_=s.accept()\ntime.sleep(2)",
+                ])
+                .arg(&path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut up = String::new();
+            BufReader::new(py.stdout.take().unwrap())
+                .read_line(&mut up)
+                .unwrap();
+            let foreign = UnixStream::connect(&path).unwrap();
+            assert!(peer_is_me(&foreign), "same user");
+            assert!(!server_is_agent(&foreign), "python is not this program");
+            let _ = py.kill();
+            let _ = py.wait();
+
+            // This program itself passes.
+            let own = dir.join("own.sock");
+            let l = UnixListener::bind(&own).unwrap();
+            let c = UnixStream::connect(&own).unwrap();
+            let (_server_side, _) = l.accept().unwrap();
+            assert!(server_is_agent(&c));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[cfg(all(test, target_os = "macos"))]
