@@ -246,6 +246,13 @@ pub fn checkpoint_master_fp(file: &VaultFile) -> Option<String> {
     cp.state.users.get(&cp.state.master).map(user_fp)
 }
 
+/// Stands for a user's replaced keys in `rekey_pending`: an id derived from those keys, which
+/// is never a real user or group.
+pub fn replaced_keys_principal(kem: &crypto::KemPublic, sig: &crypto::SigPublic) -> Principal {
+    let h = crypto::sha3(&[b"nepomuk/replaced-keys", crypto::fingerprint(kem, sig).as_bytes()]);
+    Principal::User(Id(h[..16].try_into().unwrap()))
+}
+
 fn sig_err(m: impl Into<String>) -> Error {
     Error::new(Code::SignatureInvalid, m)
 }
@@ -517,11 +524,29 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                     .any(|o| o.id != *user && (o.kem == *kem || o.sig == *sig)),
                 "these keys already belong to a user",
             )?;
+            // The old keys still know the keys of everything they could read (from the
+            // history), and nothing below re-encrypts it: those nodes wait for a rekey. They are
+            // recorded under the old keys, not the user, so re-granting access to the new keys
+            // does not clear them – only a rekey does.
+            let uid = *user;
+            let old = replaced_keys_principal(&u.kem, &u.sig);
+            let groups = s.user_groups(uid);
+            let readable: BTreeSet<Id> = s
+                .grants
+                .values()
+                .filter(|g| match g.to {
+                    Principal::User(x) => x == uid,
+                    Principal::Group(gr) => groups.contains(&gr),
+                })
+                .map(|g| g.node)
+                .collect();
+            for n in readable {
+                s.mark_rekey_pending(n, old);
+            }
             // Everything wrapped for the old keys becomes useless and is removed. System
             // rights are removed too: whoever approves the new keys must not inherit rights
             // they could not grant themselves; they are granted again explicitly. With nothing
             // left, re-enabling a disabled user (a returning employee) grants nothing.
-            let uid = *user;
             s.remove_grants_where(|g| g.to == Principal::User(uid));
             for g in s.groups.values_mut() {
                 g.members.remove(&uid);

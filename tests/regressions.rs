@@ -1088,3 +1088,86 @@ fn master_transfer_steps_down_and_asks_for_root_rekey() {
     assert!(v.state.has_right(old, v.state.root, Right::Admin));
     assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
 }
+
+/// NPK-01: replacing an identity gives new keys to everything the replaced keys could read,
+/// so content written afterwards is out of their reach; what the author cannot rekey stays
+/// pending in the vault, even after the new keys are granted access again.
+#[test]
+fn replaced_keys_cannot_read_later_content() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    t.mkdir("/team", false).unwrap();
+    t.put("/team/db", Content::Text { value: "v1".into() }, None)
+        .unwrap();
+    let g = t.group_create("devs").unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.group_add(g, b).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.put("/grp/s", Content::Text { value: "g1".into() }, None)
+        .unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // What the old keys know, from the history.
+    let old = Access::build(&v.state, b, &bob);
+    assert_eq!(text(&old, &v, "/team/db"), "v1");
+    assert_eq!(text(&old, &v, "/grp/s"), "g1");
+
+    // The master replaces Bob's keys: everything is rekeyed, nothing is left pending.
+    let new_bob = Unlocked::generate("bob", IdentityKind::Local);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_replace(b, &Request::new(&new_bob, None)).unwrap();
+    assert!(t.tasks.is_empty(), "{:?}", t.tasks);
+    let (_, v2, _, _) = t.commit().unwrap();
+    assert!(v2.state.rekey_pending.is_empty());
+    let mut t = Tx::new(&v2, &master).unwrap();
+    t.put("/team/db", Content::Text { value: "v2".into() }, None)
+        .unwrap();
+    t.put("/grp/s", Content::Text { value: "g2".into() }, None)
+        .unwrap();
+    let (_, v3, _, _) = t.commit().unwrap();
+    for (id, n) in &old.nodes {
+        assert!(
+            old.content(&v3.state, *id).is_err(),
+            "the replaced keys still read {}",
+            n.path
+        );
+    }
+    // The old group key does not open the group's new grants.
+    let (_, old_group) = old.groups.get(&g).unwrap();
+    for gr in v3.state.grants.values().filter(|x| x.to == Principal::Group(g)) {
+        let aad = keyring::aad_grant(v3.state.vault_id, gr.node, gr.to);
+        assert!(crypto::unwrap(old_group, &gr.wrapped, &aad).is_err());
+    }
+    // The new keys read everything again.
+    let acc = Access::build(&v3.state, b, &new_bob);
+    assert_eq!(text(&acc, &v3, "/team/db"), "v2");
+    assert_eq!(text(&acc, &v3, "/grp/s"), "g2");
+
+    // Someone with only `users` cannot rekey: the nodes stay pending although the master
+    // grants the new keys access again.
+    let newer = Unlocked::generate("bob", IdentityKind::Local);
+    let mut t = Tx::new(&v3, &it).unwrap();
+    t.user_replace(b, &Request::new(&newer, None)).unwrap();
+    assert!(!t.tasks.is_empty());
+    let (_, v4, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v4, &master).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    let (_, v5, _, _) = t.commit().unwrap();
+    let team = Access::build(&v5.state, v5.state.master, &master)
+        .resolve("/team")
+        .unwrap();
+    assert!(v5.state.rekey_pending.contains_key(&team));
+    // `rekey --pending` by the master clears them.
+    let mut t = Tx::new(&v5, &master).unwrap();
+    t.rekey_pending().unwrap();
+    let (_, v6, _, _) = t.commit().unwrap();
+    assert!(v6.state.rekey_pending.is_empty());
+}

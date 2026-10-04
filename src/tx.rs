@@ -1134,6 +1134,56 @@ impl<'a> Tx<'a> {
         } else {
             old_sysrights
         };
+        // The old keys may be in the wrong hands (that is often why they are replaced) and they
+        // know every key they could read, from the history. Everything they could read gets new
+        // keys: group keys first (while the user is still a member), the nodes at the end.
+        let all_groups = self.state.user_groups(user);
+        let mut readable: BTreeSet<Id> = self
+            .state
+            .grants
+            .values()
+            .filter(|g| match g.to {
+                Principal::User(u) => u == user,
+                Principal::Group(gr) => all_groups.contains(&gr),
+            })
+            .map(|g| g.node)
+            .collect();
+        let mut unrotated: BTreeSet<Id> = BTreeSet::new();
+        for g in &all_groups {
+            let can = self
+                .state
+                .sys_right(self.me, SysRight::GroupAdmin(*g))
+                .is_some()
+                && self.access().group_kem(*g).is_some();
+            // Rotating needs the keys of everything the group can read; without them, leave it
+            // as a task rather than failing the replacement.
+            let (state, ops) = (self.state.clone(), self.ops.len());
+            let rotated = can
+                && match self.group_remove_inner(*g, user, false) {
+                    Ok(()) => true,
+                    Err(e) if e.code == Code::AccessDenied => {
+                        self.state = state;
+                        self.ops.truncate(ops);
+                        self.access = None;
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+            if !rotated {
+                // Rekeying what the group reads is pointless while the replaced keys know the
+                // group key: leave those nodes pending until the group gets a new key.
+                for x in self.state.grants.values() {
+                    if x.to == Principal::Group(*g) {
+                        unrotated.insert(x.node);
+                    }
+                }
+                self.tasks.push(format!(
+                    "give group {} a new key (`nepomuk group remove` and `group add` of {old_name}) – the replaced keys still hold its current key",
+                    self.state.groups[g].name
+                ));
+            }
+        }
+        readable.retain(|n| self.state.nodes.contains_key(n) && !unrotated.contains(n));
         self.push(Op::ReplaceIdentity {
             user,
             kind: req.kind,
@@ -1213,6 +1263,10 @@ impl<'a> Tx<'a> {
                 ));
             }
         }
+        self.rekey_all(readable)?;
+        self.warnings.push(format!(
+            "if the replaced keys of {old_name} may have been stolen, change the secrets they could read at their source"
+        ));
         Ok(())
     }
 
