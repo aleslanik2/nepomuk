@@ -17,18 +17,27 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 echo "Downloading $tag from $repo"
-gh release download "$tag" -R "$repo" -D "$work" -p '*.tar.gz' -p SHA256SUMS
+gh release download "$tag" -R "$repo" -D "$work"
+rm -f "$work/SHA256SUMS.sig"
 
-# Sign only what is actually in the release.
+# Sign only what is actually in the release: every asset is listed and matches, nothing else.
 cd "$work"
+[ -f SHA256SUMS ] || { echo "the release has no SHA256SUMS" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum -c SHA256SUMS
 else
     shasum -a 256 -c SHA256SUMS
 fi
-listed=$(wc -l <SHA256SUMS | tr -d ' ')
-present=$(ls -- *.tar.gz | wc -l | tr -d ' ')
-[ "$listed" = "$present" ] || { echo "SHA256SUMS lists $listed archives, the release has $present" >&2; exit 1; }
+listed=$(sed 's/^[0-9a-f]*  *\*\{0,1\}//' SHA256SUMS | LC_ALL=C sort)
+present=$(ls -- * | grep -vx SHA256SUMS | LC_ALL=C sort)
+[ "$listed" = "$present" ] || {
+    echo "SHA256SUMS and the release assets differ:" >&2
+    printf 'listed:\n%s\npresent:\n%s\n' "$listed" "$present" >&2
+    exit 1
+}
+for f in install.sh install.ps1; do
+    printf '%s\n' "$present" | grep -qx "$f" || { echo "the release has no $f" >&2; exit 1; }
+done
 
 echo
 cat SHA256SUMS

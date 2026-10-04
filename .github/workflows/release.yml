@@ -3,7 +3,8 @@
 # Signing – one of:
 #  - secret NEPOMUK_RELEASE_SIGNING_KEY (OpenSSH private key, ssh-keygen -t ed25519) and, if the key
 #    has one, NEPOMUK_RELEASE_SIGNING_PASSPHRASE: the workflow signs SHA256SUMS and publishes the
-#    release. Store them in the environment "release" and restrict it to tags v*;
+#    release. Store them in the environment "release", restrict it to tags v* and require a
+#    reviewer, so that pushing a tag alone never produces a signed release;
 #  - no secret: the release stays a draft; sign it offline with scripts/sign-release.sh.
 # Either way the signature must verify against the key embedded in install.sh / install.ps1.
 
@@ -21,7 +22,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # A signed release is built only from a commit that is on main, for the version in Cargo.toml.
+  guard:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag is on main and matches the version
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)
+          case "$status" in
+            identical|ahead) ;;
+            *) echo "::error::$TAG points at $GITHUB_SHA, which is not on main ($status)"; exit 1 ;;
+          esac
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          [ "v$version" = "$TAG" ] || { echo "::error::$TAG does not match version $version in Cargo.toml"; exit 1; }
+
   test:
+    needs: guard
     strategy:
       fail-fast: true
       matrix:
@@ -235,8 +257,6 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
       GH_TOKEN: ${{ github.token }}
-      SIGNING_KEY: ${{ secrets.NEPOMUK_RELEASE_SIGNING_KEY }}
-      SIGNING_PASSPHRASE: ${{ secrets.NEPOMUK_RELEASE_SIGNING_PASSPHRASE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -262,6 +282,10 @@ jobs:
 
       - name: Sign
         id: sign
+        # The key reaches only this step, not the actions run before it.
+        env:
+          SIGNING_KEY: ${{ secrets.NEPOMUK_RELEASE_SIGNING_KEY }}
+          SIGNING_PASSPHRASE: ${{ secrets.NEPOMUK_RELEASE_SIGNING_PASSPHRASE }}
         run: |
           if [ -z "$SIGNING_KEY" ]; then
             echo "signed=false" >> "$GITHUB_OUTPUT"
@@ -270,6 +294,7 @@ jobs:
           fi
           umask 077
           key="$RUNNER_TEMP/release-key"
+          trap 'rm -f "$key" "$RUNNER_TEMP/askpass"' EXIT
           printf '%s\n' "$SIGNING_KEY" > "$key"
           if [ -n "$SIGNING_PASSPHRASE" ]; then
             # ssh-keygen reads the passphrase only through an askpass program.
