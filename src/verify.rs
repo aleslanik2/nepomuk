@@ -563,9 +563,14 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 })
                 .map(|g| g.node)
                 .collect();
+            // Pending under the user, or under a group the user is in (the member knew those
+            // keys too; for the group itself the entry stays).
             let me = Principal::User(uid);
             for (n, who) in s.rekey_pending.iter_mut() {
-                if who.remove(&me) {
+                let via_group = who
+                    .iter()
+                    .any(|p| matches!(p, Principal::Group(g) if groups.contains(g)));
+                if who.remove(&me) || via_group {
                     known.insert(*n);
                 }
             }
@@ -835,12 +840,20 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 .flatten()
                 .copied()
                 .collect();
-            let pending: BTreeSet<Principal> = former
+            // Everyone who could read a former ancestor knows the key too (and, below, stays
+            // marked unless they can read the node at its new place).
+            let mut pending: BTreeSet<Principal> = former
                 .iter()
                 .filter_map(|a| s.rekey_pending.get(a))
                 .flatten()
                 .copied()
                 .collect();
+            pending.extend(
+                s.grants
+                    .values()
+                    .filter(|g| former.contains(&g.node))
+                    .map(|g| g.to),
+            );
             let n = s.nodes.get_mut(id).unwrap();
             n.parent = Some(*parent);
             n.wrapped_key = Some(wrapped_key.clone());

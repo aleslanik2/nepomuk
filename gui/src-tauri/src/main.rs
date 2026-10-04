@@ -214,6 +214,7 @@ fn secret_bytes(v: &Value) -> Result<Zeroizing<Vec<u8>>, Value> {
 /// Copies a secret without handing it to the web layer.
 #[tauri::command]
 async fn copy_secret(
+    app: AppHandle,
     state: State<'_, AppState>,
     spec: String,
     seconds: Option<u64>,
@@ -230,16 +231,19 @@ async fn copy_secret(
     let bytes = secret_bytes(&v)?;
     let text = Zeroizing::new(String::from_utf8_lossy(&bytes).to_string());
     // Under the lock guard: a lock either happened before (then nothing is copied) or comes
-    // after and clears the clipboard.
-    let _one = state.locking.lock().unwrap();
-    if state.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
-        return Err(err("PASSWORD_REQUIRED", "the session was locked"));
-    }
-    state.clipboard.copy_secret(
-        text,
-        Duration::from_secs(seconds.unwrap_or(30).clamp(5, 600)),
-    );
-    Ok(())
+    // after and clears the clipboard. The guard may wait for a lock in progress: off the async
+    // runtime.
+    let clear_after = Duration::from_secs(seconds.unwrap_or(30).clamp(5, 600));
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let _one = state.locking.lock().unwrap();
+        if state.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+            return Err(err("PASSWORD_REQUIRED", "the session was locked"));
+        }
+        state.clipboard.copy_secret(text, clear_after);
+        Ok(())
+    })
+    .await?
 }
 
 #[tauri::command]

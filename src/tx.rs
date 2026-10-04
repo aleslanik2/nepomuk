@@ -681,9 +681,12 @@ impl<'a> Tx<'a> {
                 name_commit: sealed_name.commit,
                 grants,
             })?;
-            self.warnings.push(format!(
-                "{old_path} moved: whoever could read the old location still holds its key; consider `nepomuk rekey {dst}`"
-            ));
+            if self.state.rekey_pending.contains_key(&id) || self.state.stale_keys.contains_key(&id)
+            {
+                self.warnings.push(format!(
+                    "{old_path} moved: whoever could read the old location but not the new one still holds its key; it waits for `nepomuk rekey --pending`"
+                ));
+            }
             Ok(())
         }
     }
