@@ -202,6 +202,16 @@ pub struct State {
     /// until the node is rekeyed or the principal gets access again (§8.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rekey_pending: BTreeMap<Id, BTreeSet<Principal>>,
+    /// Nodes whose keys are known to replaced identity keys (§4.4), by reason: the id of the
+    /// replaced keys, or a group in `stale_groups` that can read the node. Unlike
+    /// `rekey_pending`, granting access again never clears them – only a `Rekey` does, and a
+    /// rekeyed node a stale group can still read is marked again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stale_keys: BTreeMap<Id, BTreeSet<Id>>,
+    /// Groups whose current key is held by the replaced keys of a former member, until the
+    /// group gets a new key (`RemoveMember`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub stale_groups: BTreeSet<Id>,
 }
 
 /// A node rewritten by a `Rekey`.

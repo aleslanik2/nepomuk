@@ -149,53 +149,72 @@ pub struct Masker {
     secrets: Vec<Vec<u8>>,
     /// Bytes read but not yet emitted (raw, before masking).
     buf: Vec<u8>,
+    /// How many bytes at the start of `buf` a secret already found covers.
+    covered: usize,
+    /// The last thing emitted was "***" (a covered run continues it).
+    in_mask: bool,
 }
 
 impl Masker {
     pub fn new(mut secrets: Vec<Vec<u8>>) -> Masker {
         secrets.retain(|s| s.len() >= 3);
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.sort();
         secrets.dedup();
         Masker {
             secrets,
             buf: Vec::new(),
+            covered: 0,
+            in_mask: false,
         }
     }
 
-    /// Masks the buffer from the left: at each position the longest secret that matches there
-    /// is replaced. Unless `finish`, it stops at the first position where a secret could still
-    /// begin (the rest of the buffer is a prefix of a secret that would match there, or of a
-    /// longer one than what matches now) and keeps the rest for the next read – whatever the
-    /// bytes are, newlines included.
+    /// Replaces every byte covered by any occurrence of any secret – overlapping ones
+    /// included – with one "***" per covered run. Unless `finish`, it emits only up to the first
+    /// position where a secret could still begin (the rest of the buffer is a proper prefix of
+    /// a secret) and keeps the rest, newlines included, for the next read.
     fn process(&mut self, finish: bool) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.buf.len());
-        let mut i = 0;
-        while i < self.buf.len() {
-            let rest = &self.buf[i..];
-            let full = self
-                .secrets
-                .iter()
-                .find(|s| rest.starts_with(s))
-                .map(Vec::len);
-            let may_grow = !finish
-                && self.secrets.iter().any(|s| {
-                    s.len() > rest.len() && s.starts_with(rest) && full.is_none_or(|f| s.len() > f)
-                });
-            if may_grow {
-                break;
-            }
-            match full {
-                Some(n) => {
-                    out.extend_from_slice(b"***");
-                    i += n;
-                }
-                None => {
-                    out.push(self.buf[i]);
-                    i += 1;
+        let n = self.buf.len();
+        let limit = if finish {
+            n
+        } else {
+            (0..n)
+                .find(|&k| {
+                    let rest = &self.buf[k..];
+                    self.secrets
+                        .iter()
+                        .any(|s| s.len() > rest.len() && s.starts_with(rest))
+                })
+                .unwrap_or(n)
+        };
+        let mut cover = vec![false; n];
+        for c in cover.iter_mut().take(self.covered.min(n)) {
+            *c = true;
+        }
+        let mut reach = self.covered;
+        for k in 0..limit {
+            for s in &self.secrets {
+                if self.buf[k..].starts_with(s) {
+                    for c in &mut cover[k..k + s.len()] {
+                        *c = true;
+                    }
+                    reach = reach.max(k + s.len());
                 }
             }
         }
-        self.buf.drain(..i);
+        let mut out = Vec::with_capacity(limit);
+        for (j, &b) in self.buf[..limit].iter().enumerate() {
+            if cover[j] {
+                if !self.in_mask {
+                    out.extend_from_slice(b"***");
+                    self.in_mask = true;
+                }
+            } else {
+                out.push(b);
+                self.in_mask = false;
+            }
+        }
+        self.buf.drain(..limit);
+        self.covered = reach.saturating_sub(limit);
         out
     }
 
@@ -246,7 +265,48 @@ mod masker_tests {
             "a secret-value b\nsecret-\n",
             "a *** b\nsecret-\n",
         );
-        all_splits(&["aaa"], "aaaaa\n", "***aa\n");
+        all_splits(&["aaa"], "aaaaa\n", "***\n");
+        all_splits(&["abc", "bcdefgh"], "xabcdefgh\n", "x***\n");
+        all_splits(&["abcd", "cdefgh"], "abcdefgh!\n", "***!\n");
+    }
+
+    /// Random secrets and outputs: streamed in random reads, the result equals masking the
+    /// whole output at once, and no secret is ever visible.
+    #[test]
+    fn fuzz_streamed_equals_whole_and_hides_secrets() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let alphabet = b"ab\nc";
+        for _ in 0..3000 {
+            let secrets: Vec<Vec<u8>> = (0..1 + rnd(3))
+                .map(|_| (0..3 + rnd(4)).map(|_| alphabet[rnd(4) as usize]).collect())
+                .collect();
+            let input: Vec<u8> = (0..rnd(30)).map(|_| alphabet[rnd(4) as usize]).collect();
+            let mut whole = Masker::new(secrets.clone());
+            let mut expected = whole.feed(&input);
+            expected.extend(whole.finish());
+            let mut m = Masker::new(secrets.clone());
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < input.len() {
+                let j = (i + 1 + rnd(5) as usize).min(input.len());
+                out.extend(m.feed(&input[i..j]));
+                i = j;
+            }
+            out.extend(m.finish());
+            assert_eq!(out, expected, "{secrets:?} {input:?}");
+            for s in &secrets {
+                assert!(
+                    !out.windows(s.len()).any(|w| w == s.as_slice()),
+                    "{s:?} in {out:?}"
+                );
+            }
+        }
     }
 
     #[test]

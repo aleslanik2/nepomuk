@@ -369,8 +369,25 @@ pub fn state_warnings(s: &State) -> Vec<String> {
             f.name
         ));
     }
-    if !s.rekey_pending.is_empty() {
-        let n = s.rekey_pending.len();
+    for g in &s.stale_groups {
+        let reads = s.grants.values().any(|x| x.to == Principal::Group(*g));
+        if let Some(group) = s.groups.get(g)
+            && reads
+        {
+            out.push(format!(
+                "the key of group {} is held by the replaced keys of a former member: a group admin who is a member should run `nepomuk group remove {} <that former member>` to give it a new key",
+                group.name, group.name
+            ));
+        }
+    }
+    let pending: std::collections::BTreeSet<Id> = s
+        .rekey_pending
+        .keys()
+        .chain(s.stale_keys.keys())
+        .copied()
+        .collect();
+    if !pending.is_empty() {
+        let n = pending.len();
         out.push(format!(
             "{n} folder{} or secret{} still readable by someone who lost access to {}: an admin of the parent folder should run `nepomuk rekey --pending`",
             if n == 1 { "" } else { "s" },

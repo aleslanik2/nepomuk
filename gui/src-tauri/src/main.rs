@@ -24,6 +24,10 @@ const API_VERSION: u64 = 1;
 
 struct AppState {
     sidecar: Mutex<Option<Arc<Sidecar>>>,
+    /// Counts locks; an operation that spans a lock (a save dialog) checks it.
+    locks: std::sync::atomic::AtomicU64,
+    /// One lock at a time (the window and the screen-lock watcher may both lock).
+    locking: Mutex<()>,
     /// What the sidecar was started for, to start a fresh one after a forced lock.
     target: Mutex<Option<(Option<PathBuf>, Option<PathBuf>)>>,
     clipboard: clipboard::SecretClipboard,
@@ -90,6 +94,11 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// process is ended – which forgets the identity – and a fresh, locked one is started.
 fn lock_now(app: &AppHandle) -> Value {
     let state = app.state::<AppState>();
+    let _one = state.locking.lock().unwrap();
+    state
+        .locks
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.clipboard.clear_secret();
     let Some(sc) = state.sidecar.lock().unwrap().clone() else {
         return json!({ "locked": true, "restarted": false });
     };
@@ -99,10 +108,13 @@ fn lock_now(app: &AppHandle) -> Value {
     sc.kill();
     state.sidecar.lock().unwrap().take();
     let target = state.target.lock().unwrap().clone();
-    let restarted = target
-        .and_then(|(v, p)| Sidecar::spawn(app.clone(), v, p).ok())
-        .map(|fresh| *state.sidecar.lock().unwrap() = Some(fresh))
-        .is_some();
+    let fresh = target.and_then(|(v, p)| Sidecar::spawn(app.clone(), v, p).ok());
+    let restarted = fresh.is_some();
+    if let Some(fresh) = fresh {
+        // The ended process could not forget identities cached by the Touch ID agent.
+        let _ = fresh.call_within("session.lock", json!({}), Some(LOCK_WAIT));
+        *state.sidecar.lock().unwrap() = Some(fresh);
+    }
     json!({ "locked": true, "restarted": restarted })
 }
 
@@ -237,10 +249,11 @@ async fn save_secret(
     spec: String,
     default_name: String,
 ) -> Result<Option<String>, Value> {
-    let sc = state.current()?;
+    state.current()?;
+    let locks = state.locks.load(std::sync::atomic::Ordering::SeqCst);
     blocking(move || {
-        let v = sc.call("node.get", json!({ "path": spec }))?;
-        let bytes = secret_bytes(&v)?;
+        // Ask where first; fetch the secret only afterwards, and not at all if the session was
+        // locked while the (native, unclosable) save dialog was open.
         let Some(path) = app
             .dialog()
             .file()
@@ -250,6 +263,12 @@ async fn save_secret(
         else {
             return Ok(None);
         };
+        let state = app.state::<AppState>();
+        if state.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+            return Err(err("PASSWORD_REQUIRED", "the session was locked"));
+        }
+        let v = state.current()?.call("node.get", json!({ "path": spec }))?;
+        let bytes = secret_bytes(&v)?;
         write_private(&path, &bytes)
             .map_err(|e| err("GENERAL", format!("cannot write {}: {e}", path.display())))?;
         Ok(Some(path.display().to_string()))
@@ -359,6 +378,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sidecar: Mutex::new(None),
+            locks: std::sync::atomic::AtomicU64::new(0),
+            locking: Mutex::new(()),
             target: Mutex::new(None),
             clipboard: clipboard::SecretClipboard::start(),
         })

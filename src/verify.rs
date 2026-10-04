@@ -141,6 +141,26 @@ impl State {
         }
     }
 
+    /// After a rekey of `node`: its subtree has new keys, except that nodes a stale group can
+    /// read are readable by replaced keys again (the new keys are wrapped for the group).
+    fn clear_stale_keys(&mut self, node: Id) {
+        let sub = self.subtree(node);
+        for n in &sub {
+            self.stale_keys.remove(n);
+        }
+        let again: Vec<(Id, Id)> = self
+            .grants_on(&sub)
+            .iter()
+            .filter_map(|g| match g.to {
+                Principal::Group(gr) if self.stale_groups.contains(&gr) => Some((g.node, gr)),
+                _ => None,
+            })
+            .collect();
+        for (n, gr) in again {
+            self.stale_keys.entry(n).or_default().insert(gr);
+        }
+    }
+
     /// Clears pending rekeys in the subtree, for everyone or only for `who`.
     fn clear_rekey_pending(&mut self, node: Id, who: Option<Principal>) {
         for n in self.subtree(node) {
@@ -246,14 +266,13 @@ pub fn checkpoint_master_fp(file: &VaultFile) -> Option<String> {
     cp.state.users.get(&cp.state.master).map(user_fp)
 }
 
-/// Stands for a user's replaced keys in `rekey_pending`: an id derived from those keys, which
-/// is never a real user or group.
-pub fn replaced_keys_principal(kem: &crypto::KemPublic, sig: &crypto::SigPublic) -> Principal {
+/// The reason recorded in `stale_keys` for a user's replaced keys: an id derived from them.
+pub fn replaced_keys_id(kem: &crypto::KemPublic, sig: &crypto::SigPublic) -> Id {
     let h = crypto::sha3(&[
         b"nepomuk/replaced-keys",
         crypto::fingerprint(kem, sig).as_bytes(),
     ]);
-    Principal::User(Id(h[..16].try_into().unwrap()))
+    Id(h[..16].try_into().unwrap())
 }
 
 fn sig_err(m: impl Into<String>) -> Error {
@@ -528,13 +547,14 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "these keys already belong to a user",
             )?;
             // The old keys still know the keys of everything they could read (from the
-            // history), and nothing below re-encrypts it: those nodes wait for a rekey. They are
-            // recorded under the old keys, not the user, so re-granting access to the new keys
-            // does not clear them – only a rekey does.
+            // history): what they read now, what they lost access to without a rekey (pending
+            // under the user), and the keys of their groups. All of it is recorded under the
+            // old keys, so granting the new keys access again does not clear it – only a rekey
+            // (and, for a group, a new group key) does.
             let uid = *user;
-            let old = replaced_keys_principal(&u.kem, &u.sig);
+            let reason = replaced_keys_id(&u.kem, &u.sig);
             let groups = s.user_groups(uid);
-            let readable: BTreeSet<Id> = s
+            let mut known: BTreeSet<Id> = s
                 .grants
                 .values()
                 .filter(|g| match g.to {
@@ -543,9 +563,17 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 })
                 .map(|g| g.node)
                 .collect();
-            for n in readable {
-                s.mark_rekey_pending(n, old);
+            let me = Principal::User(uid);
+            for (n, who) in s.rekey_pending.iter_mut() {
+                if who.remove(&me) {
+                    known.insert(*n);
+                }
             }
+            s.rekey_pending.retain(|_, who| !who.is_empty());
+            for n in known {
+                s.stale_keys.entry(n).or_default().insert(reason);
+            }
+            s.stale_groups.extend(groups);
             // Everything wrapped for the old keys becomes useless and is removed. System
             // rights are removed too: whoever approves the new keys must not inherit rights
             // they could not grant themselves; they are granted again explicitly. With nothing
@@ -688,7 +716,13 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.sys_right(author, SysRight::GroupAdmin(*group)).is_some(),
                 "requires `group-admin` of the group",
             )?;
-            require(g.members.contains_key(user), "not a member")?;
+            // Removing someone who is no longer a member only gives the group a new key; that is
+            // allowed while replaced keys of a former member hold the current one.
+            require(
+                g.members.contains_key(user)
+                    || (s.stale_groups.contains(group) && s.users.contains_key(user)),
+                "not a member",
+            )?;
             let expected: BTreeSet<Id> = g.members.keys().filter(|m| *m != user).copied().collect();
             let got: BTreeSet<Id> = members.keys().copied().collect();
             require(
@@ -718,6 +752,8 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for x in grants {
                 s.mark_rekey_pending(x.node, Principal::User(*user));
             }
+            // A new group key: replaced keys of former members no longer open its grants.
+            s.stale_groups.remove(&gid);
             if let Some(m) = s.sysrights.get_mut(user) {
                 m.remove(&SysRight::GroupAdmin(gid));
             }
@@ -805,6 +841,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             s.remove_grants_where(|g| sub.contains(&g.node));
             s.rotation.retain(|k| !sub.contains(k));
             s.rekey_pending.retain(|k, _| !sub.contains(k));
+            s.stale_keys.retain(|k, _| !sub.contains(k));
         }
         Op::Grant { grant } => {
             node_exists(s, grant.node)?;
@@ -833,6 +870,12 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             s.grants.insert(grant.id, grant.clone());
             // Access again: what they still know is no longer a leak.
             s.clear_rekey_pending(grant.node, Some(grant.to));
+            // Wrapped for a group key that replaced keys hold: they can read it.
+            if let Principal::Group(g) = grant.to
+                && s.stale_groups.contains(&g)
+            {
+                s.stale_keys.entry(grant.node).or_default().insert(g);
+            }
         }
         Op::Revoke { grant } => {
             let g = s.grants.get(grant).ok_or_else(|| deny("unknown grant"))?;
@@ -895,6 +938,7 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.former_master = None;
             }
             s.clear_rekey_pending(*node, None);
+            s.clear_stale_keys(*node);
         }
         Op::GrantSystemRight {
             user,

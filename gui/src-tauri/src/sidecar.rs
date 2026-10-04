@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use serde_json::{Value, json};
@@ -15,6 +15,8 @@ type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, Value>>>>>;
 
 pub struct Sidecar {
     child: Mutex<Child>,
+    /// Ended on purpose (a forced lock): its exit is not reported to the window.
+    ended: Arc<AtomicBool>,
     stdin: Mutex<ChildStdin>,
     pending: Pending,
     next: AtomicU64,
@@ -71,6 +73,13 @@ impl Sidecar {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Its own process group: a forced lock ends it together with anything it started
+        // (`exec`), which still holds secrets.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -86,6 +95,8 @@ impl Sidecar {
         let stdout = child.stdout.take().unwrap();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let reader_ended = ended.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -111,10 +122,13 @@ impl Sidecar {
             for (_, tx) in reader_pending.lock().unwrap().drain() {
                 let _ = tx.send(Err(err("GUI_CLI_EXITED", "the nepomuk process exited")));
             }
-            let _ = app.emit("nepomuk:exited", ());
+            if !reader_ended.load(Ordering::SeqCst) {
+                let _ = app.emit("nepomuk:exited", ());
+            }
         });
         Ok(Arc::new(Sidecar {
             child: Mutex::new(child),
+            ended,
             stdin: Mutex::new(stdin),
             pending,
             next: AtomicU64::new(1),
@@ -170,9 +184,18 @@ impl Sidecar {
         }
     }
 
-    /// Ends the process now; it holds the unlocked identity only in memory.
+    /// Ends the process now – it holds the unlocked identity only in memory – and, on Unix,
+    /// everything it started that is still in its process group (`exec` children). Children
+    /// that left the group (daemons) and, on Windows, any child keep running.
     pub fn kill(&self) {
+        self.ended.store(true, Ordering::SeqCst);
         if let Ok(mut c) = self.child.lock() {
+            #[cfg(unix)]
+            if let Ok(pid) = i32::try_from(c.id()) {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
             let _ = c.kill();
             let _ = c.wait();
         }
