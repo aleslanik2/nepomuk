@@ -250,7 +250,7 @@ mod masker_tests {
         for a in 0..=n {
             for b in a..=n {
                 let out = run(secrets, &[&input[..a], &input[a..b], &input[b..]]);
-                assert_eq!(out, expected, "split at {a}/{b} of {input:?}");
+                assert!(out == expected, "split at {a}/{b}: wrong output");
             }
         }
     }
@@ -282,7 +282,8 @@ mod masker_tests {
             x % m
         };
         let alphabet = b"ab\nc";
-        for _ in 0..3000 {
+        // Failure messages name the case number only: the generated values stand for secrets.
+        for case in 0..3000 {
             let secrets: Vec<Vec<u8>> = (0..1 + rnd(3))
                 .map(|_| (0..3 + rnd(4)).map(|_| alphabet[rnd(4) as usize]).collect())
                 .collect();
@@ -299,11 +300,11 @@ mod masker_tests {
                 i = j;
             }
             out.extend(m.finish());
-            assert_eq!(out, expected, "{secrets:?} {input:?}");
+            assert!(out == expected, "case {case}: streamed output differs");
             for s in &secrets {
                 assert!(
                     !out.windows(s.len()).any(|w| w == s.as_slice()),
-                    "{s:?} in {out:?}"
+                    "case {case}: a secret is visible"
                 );
             }
         }
