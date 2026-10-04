@@ -219,6 +219,7 @@ async fn copy_secret(
     seconds: Option<u64>,
 ) -> Result<(), Value> {
     let sc = state.current()?;
+    let locks = state.locks.load(std::sync::atomic::Ordering::SeqCst);
     let v = blocking(move || sc.call("node.get", json!({ "path": spec }))).await??;
     if v.get("value").is_none() {
         return Err(err(
@@ -228,6 +229,12 @@ async fn copy_secret(
     }
     let bytes = secret_bytes(&v)?;
     let text = Zeroizing::new(String::from_utf8_lossy(&bytes).to_string());
+    // Under the lock guard: a lock either happened before (then nothing is copied) or comes
+    // after and clears the clipboard.
+    let _one = state.locking.lock().unwrap();
+    if state.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+        return Err(err("PASSWORD_REQUIRED", "the session was locked"));
+    }
     state.clipboard.copy_secret(
         text,
         Duration::from_secs(seconds.unwrap_or(30).clamp(5, 600)),
@@ -269,6 +276,10 @@ async fn save_secret(
         }
         let v = state.current()?.call("node.get", json!({ "path": spec }))?;
         let bytes = secret_bytes(&v)?;
+        let _one = state.locking.lock().unwrap();
+        if state.locks.load(std::sync::atomic::Ordering::SeqCst) != locks {
+            return Err(err("PASSWORD_REQUIRED", "the session was locked"));
+        }
         write_private(&path, &bytes)
             .map_err(|e| err("GENERAL", format!("cannot write {}: {e}", path.display())))?;
         Ok(Some(path.display().to_string()))

@@ -1162,6 +1162,7 @@ impl<'a> Tx<'a> {
             })
             .map(|g| g.node)
             .collect();
+        let mut unrotated: BTreeSet<Id> = BTreeSet::new();
         for g in &all_groups {
             let can = self
                 .state
@@ -1191,9 +1192,10 @@ impl<'a> Tx<'a> {
                     .filter(|m| **m != user)
                     .filter_map(|m| self.state.users.get(m).map(|u| u.name.clone()))
                     .collect();
+                unrotated.insert(*g);
                 self.tasks.push(match others.first() {
                     Some(_) => format!(
-                        "give group {0} a new key – the replaced keys of {old_name} hold the current one: a group admin who is a member runs `nepomuk group remove {0} {old_name}`",
+                        "give group {0} a new key – the replaced keys of {old_name} hold the current one: a group admin who is a member runs `nepomuk group add {0} {old_name}`, `nepomuk group remove {0} {old_name}` and `nepomuk group add {0} {old_name}`",
                         group.name
                     ),
                     None => format!(
@@ -1250,7 +1252,7 @@ impl<'a> Tx<'a> {
                         delegate: *d,
                     })?;
                 }
-            } else {
+            } else if !unrotated.contains(&g) {
                 self.tasks.push(format!(
                     "add {old_name} back to group {}",
                     self.state.groups[&g].name

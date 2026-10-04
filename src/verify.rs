@@ -716,13 +716,8 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.sys_right(author, SysRight::GroupAdmin(*group)).is_some(),
                 "requires `group-admin` of the group",
             )?;
-            // Removing someone who is no longer a member only gives the group a new key; that is
-            // allowed while replaced keys of a former member hold the current one.
-            require(
-                g.members.contains_key(user)
-                    || (s.stale_groups.contains(group) && s.users.contains_key(user)),
-                "not a member",
-            )?;
+            require(g.members.contains_key(user), "not a member")?;
+            require(&g.kem != kem, "the group needs a new key")?;
             let expected: BTreeSet<Id> = g.members.keys().filter(|m| *m != user).copied().collect();
             let got: BTreeSet<Id> = members.keys().copied().collect();
             require(
@@ -751,6 +746,16 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             }
             for x in grants {
                 s.mark_rekey_pending(x.node, Principal::User(*user));
+            }
+            // What the group lost earlier without a rekey, the removed member knew too.
+            let lost: Vec<Id> = s
+                .rekey_pending
+                .iter()
+                .filter(|(_, who)| who.contains(&Principal::Group(gid)))
+                .map(|(n, _)| *n)
+                .collect();
+            for n in lost {
+                s.mark_rekey_pending(n, Principal::User(*user));
             }
             // A new group key: replaced keys of former members no longer open its grants.
             s.stale_groups.remove(&gid);
@@ -821,6 +826,21 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "requires `write` on the new parent",
             )?;
             check_rewrapped(s, grants, &s.subtree(*id))?;
+            // Whoever still knows the key of a folder it leaves also knows its key: the marks
+            // of the former ancestors come along.
+            let former: Vec<Id> = s.ancestors(*id).into_iter().skip(1).collect();
+            let stale: BTreeSet<Id> = former
+                .iter()
+                .filter_map(|a| s.stale_keys.get(a))
+                .flatten()
+                .copied()
+                .collect();
+            let pending: BTreeSet<Principal> = former
+                .iter()
+                .filter_map(|a| s.rekey_pending.get(a))
+                .flatten()
+                .copied()
+                .collect();
             let n = s.nodes.get_mut(id).unwrap();
             n.parent = Some(*parent);
             n.wrapped_key = Some(wrapped_key.clone());
@@ -828,6 +848,12 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             n.name_commit = *name_commit;
             for g in grants {
                 s.grants.insert(g.id, g.clone());
+            }
+            if !stale.is_empty() {
+                s.stale_keys.entry(*id).or_default().extend(stale);
+            }
+            for p in pending {
+                s.mark_rekey_pending(*id, p);
             }
         }
         Op::DeleteNode { id } => {

@@ -375,8 +375,8 @@ pub fn state_warnings(s: &State) -> Vec<String> {
             && reads
         {
             out.push(format!(
-                "the key of group {} is held by the replaced keys of a former member: a group admin who is a member should run `nepomuk group remove {} <that former member>` to give it a new key",
-                group.name, group.name
+                "the key of group {} is held by the replaced keys of a former member: a group admin who is a member should give it a new key (`nepomuk group remove` of a member, then `group add` again)",
+                group.name
             ));
         }
     }
