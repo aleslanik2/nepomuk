@@ -1,5 +1,6 @@
-/* nepomuk GUI – "the seal". Ink sidebar, cool vellum, sealing-wax crimson reserved for sealed
-   values and the one primary action on a screen. */
+/* nepomuk GUI – "the vault door". Colours come from the app icon (gui/assets/icon.svg): a navy
+   sidebar, cool vellum, and the door's teal reserved for sealed values and the one primary action
+   on a screen. Crimson is kept only for danger: errors, conflicts and destructive actions. */
 
 @font-face {
   font-family: "Atkinson Next";
@@ -27,17 +28,29 @@
 }
 
 :root {
-  --ink: #1b2233;
-  --ink-2: #26304a;
-  --ink-text: #c9d0de;
-  --vellum: #eef0f3;
+  --brand-navy: #16233f;
+  --brand-teal: #5fb4aa;
+
+  --ink: #16233f;
+  --ink-2: #22335a;
+  --ink-text: #c5cedf;
+  --vellum: #eef2f4;
   --surface: #ffffff;
-  --line: #d6dbe3;
-  --text: #1b2233;
-  --muted: #5b6475;
-  --seal: #9e1b32;
-  --seal-deep: #70121f;
-  --seal-soft: #f6e4e7;
+  --line: #d5dce4;
+  --text: #16233f;
+  --muted: #5b6478;
+  --accent: #2b7a71;
+  --accent-deep: #1f5e57;
+  --accent-soft: #dff1ee;
+  --on-accent: #ffffff;
+  --accent-on-ink: var(--brand-teal);
+  --danger: #9e1b32;
+  --danger-deep: #70121f;
+  --danger-soft: #f6e4e7;
+  --danger-solid: #9e1b32;
+  --halo-disc: #2b7a71;
+  --halo-ring: #1f5e57;
+  --halo-star: #f0c75e;
   --brass: #b08d3c;
   --ok: #2f6f4f;
   --warn: #8a5a00;
@@ -57,17 +70,23 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --ink: #0f1422;
-    --ink-2: #1c2438;
-    --ink-text: #b9c2d3;
-    --vellum: #171c29;
-    --surface: #1f2636;
-    --line: #313a50;
-    --text: #e6e9ef;
-    --muted: #9aa3b5;
-    --seal: #c2394f;
-    --seal-deep: #e0677b;
-    --seal-soft: #3a1d26;
+    --ink: #0b1324;
+    --ink-2: #1a2847;
+    --ink-text: #b4bfd3;
+    --vellum: #101a2e;
+    --surface: #16233f;
+    --line: #2c3d63;
+    --text: #e8edf4;
+    --muted: #9aa6bf;
+    --accent: #5fb4aa;
+    --accent-deep: #8ed0c7;
+    --accent-soft: #1c3a44;
+    --on-accent: #0b1324;
+    --danger: #ec8394;
+    --danger-deep: #ec8394;
+    --danger-soft: #3a1d26;
+    --danger-solid: #b3304a;
+    --halo-ring: #5fb4aa;
     --brass: #d2b064;
     --ok: #6fbf94;
     --warn: #e0b35a;
@@ -110,11 +129,11 @@ button, .button {
 }
 button:hover { border-color: var(--muted); }
 button:disabled { opacity: 0.5; cursor: default; }
-button.primary { background: var(--seal); border-color: var(--seal); color: #fff; }
-button.primary:hover { background: var(--seal-deep); border-color: var(--seal-deep); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
 button.quiet { border-color: transparent; background: transparent; color: var(--muted); }
 button.quiet:hover { color: var(--text); }
-button.danger { color: var(--seal); border-color: var(--seal); background: transparent; }
+button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
 button.small { padding: 0.15rem 0.55rem; font-size: var(--step--1); }
 
 input, select, textarea {
@@ -151,7 +170,8 @@ form { display: grid; gap: 1rem; }
   justify-content: space-between;
   gap: 2rem;
 }
-.gate-side .wordmark { color: #fff; font-size: var(--step-3); font-weight: 700; letter-spacing: -0.02em; }
+.gate-side .wordmark { color: #fff; font-size: var(--step-3); font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: center; gap: 0.75rem; }
+.gate-side .wordmark img { width: 3rem; height: 3rem; flex: none; }
 .gate-side p { color: var(--ink-text); }
 .gate-main { padding: 3rem clamp(1.5rem, 6vw, 5rem); display: grid; align-content: center; gap: 1.5rem; max-width: 720px; }
 .gate-main form { max-width: 440px; }
@@ -162,7 +182,7 @@ form { display: grid; gap: 1rem; }
 .recent button { font-weight: 400; text-align: left; font-family: var(--mono); font-size: var(--step--1); }
 .tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); }
 .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); }
-.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--seal); }
+.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 
 /* ------------------------------------------------------------------ Fingerprint */
 
@@ -173,7 +193,7 @@ form { display: grid; gap: 1rem; }
 .gate-side .fp-text { color: #fff; }
 .match { font-weight: 600; font-size: var(--step--1); }
 .match.yes { color: var(--ok); }
-.match.no { color: var(--seal); }
+.match.no { color: var(--danger); }
 
 /* ------------------------------------------------------------------ Shell */
 
@@ -188,8 +208,8 @@ form { display: grid; gap: 1rem; }
   padding: 0.5rem 0.75rem; border-radius: var(--radius-s); display: flex; justify-content: space-between;
 }
 .sidebar nav button:hover { background: var(--ink-2); color: #fff; }
-.sidebar nav button[aria-current="page"] { background: var(--ink-2); color: #fff; box-shadow: inset 3px 0 0 var(--seal); }
-.sidebar nav .count { background: var(--seal); color: #fff; border-radius: 999px; padding: 0 0.45rem; font-size: 0.75rem; }
+.sidebar nav button[aria-current="page"] { background: var(--ink-2); color: #fff; box-shadow: inset 3px 0 0 var(--accent-on-ink); }
+.sidebar nav .count { background: var(--accent-on-ink); color: var(--ink); border-radius: 999px; padding: 0 0.45rem; font-size: 0.75rem; }
 .sidebar .me { margin-top: auto; padding: 1rem 1.25rem; border-top: 1px solid var(--ink-2); display: grid; gap: 0.5rem; }
 .sidebar .me strong { color: #fff; word-break: break-all; }
 .sidebar .me button { background: transparent; color: var(--ink-text); border-color: var(--ink-2); }
@@ -203,7 +223,7 @@ form { display: grid; gap: 1rem; }
 .status { display: flex; align-items: center; gap: 0.5rem; font-size: var(--step--1); color: var(--muted); }
 .status .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--ok); }
 .status.ahead .dot, .status.offline .dot { background: var(--warn); }
-.status.conflict .dot { background: var(--seal); }
+.status.conflict .dot { background: var(--danger); }
 .content { flex: 1; overflow: auto; padding: 1.5rem; min-height: 0; }
 .page { display: grid; gap: 1.25rem; max-width: 1080px; }
 .page-head { display: flex; justify-content: space-between; align-items: end; gap: 1rem; flex-wrap: wrap; }
@@ -219,7 +239,7 @@ form { display: grid; gap: 1rem; }
 .tree ul { list-style: none; margin: 0; padding: 0; }
 .tree-row { display: flex; align-items: center; }
 .tree-row:hover { background: var(--vellum); }
-.tree-row:has(> button[aria-selected="true"]) { background: var(--seal-soft); box-shadow: inset 3px 0 0 var(--seal); }
+.tree-row:has(> button[aria-selected="true"]) { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
 .tree-row > button[role="treeitem"] {
   flex: 1; min-width: 0; text-align: left; border: none; border-radius: 0; background: none; font-weight: 400;
   padding: 0.28rem 0.75rem 0.28rem 0.2rem; display: flex; gap: 0.45rem; align-items: center; color: var(--text);
@@ -231,7 +251,7 @@ form { display: grid; gap: 1rem; }
 button.twisty:hover { color: var(--text); }
 .tree .glyph { width: 1rem; color: var(--muted); flex: none; text-align: center; }
 .tree .flag { margin-left: auto; font-size: 0.72rem; font-weight: 600; }
-.tree .flag.rot { color: var(--seal); }
+.tree .flag.rot { color: var(--danger); }
 .tree .flag.exp { color: var(--warn); }
 
 .detail { padding: 1.5rem; display: grid; gap: 1.5rem; align-content: start; overflow: auto; }
@@ -242,7 +262,7 @@ button.twisty:hover { color: var(--text); }
 .description { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 65ch; }
 .notice { border-radius: var(--radius-s); padding: 0.6rem 0.85rem; font-size: var(--step--1); }
 .notice.warn { background: var(--warn-soft); color: var(--warn); }
-.notice.seal { background: var(--seal-soft); color: var(--seal-deep); }
+.notice.seal { background: var(--danger-soft); color: var(--danger-deep); }
 
 /* A value stays sealed until the user breaks the seal. */
 .values { display: grid; gap: 0.6rem; }
@@ -250,7 +270,7 @@ button.twisty:hover { color: var(--text); }
 .value .name { font-weight: 600; font-size: var(--step--1); word-break: break-all; }
 .seal-chip {
   font-family: var(--mono); font-size: var(--step--1);
-  border: 1px dashed var(--seal); color: var(--seal); background: var(--seal-soft);
+  border: 1px dashed var(--accent); color: var(--accent-deep); background: var(--accent-soft);
   border-radius: var(--radius-s); padding: 0.35rem 0.6rem; min-height: 2.1rem;
   display: flex; align-items: center; overflow: hidden;
 }
@@ -271,7 +291,7 @@ td { padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); vertical-alig
 tr:last-child td { border-bottom: none; }
 td.mono { word-break: break-all; }
 .tag { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 0 0.4rem; border-radius: var(--radius-s); background: var(--vellum); border: 1px solid var(--line); margin: 0 0.25rem 0.2rem 0; }
-.tag.seal { color: var(--seal); border-color: var(--seal); background: transparent; }
+.tag.seal { color: var(--danger); border-color: var(--danger); background: transparent; }
 .tag.brass { color: var(--brass); border-color: var(--brass); background: transparent; }
 
 .empty { padding: 2rem; display: grid; gap: 0.75rem; justify-items: start; color: var(--muted); }
@@ -287,17 +307,17 @@ pre.output { background: var(--ink); color: var(--ink-text); font-family: var(--
 
 dialog {
   border: 1px solid var(--line); border-radius: var(--radius-m); padding: 0; width: min(560px, 92vw);
-  background: var(--surface); color: var(--text); box-shadow: 0 24px 60px rgba(15, 20, 34, 0.35);
+  background: var(--surface); color: var(--text); box-shadow: 0 24px 60px rgba(11, 19, 36, 0.35);
 }
-dialog::backdrop { background: rgba(15, 20, 34, 0.45); }
+dialog::backdrop { background: rgba(11, 19, 36, 0.45); }
 dialog .dialog-body { padding: 1.5rem; display: grid; gap: 1rem; }
 
 #toasts { position: fixed; right: 1rem; bottom: 1rem; display: grid; gap: 0.5rem; z-index: 10; }
 .toast { background: var(--ink); color: #fff; padding: 0.7rem 1rem; border-radius: var(--radius-s); max-width: 420px; font-size: var(--step--1); box-shadow: 0 8px 24px rgba(0,0,0,0.25); }
-.toast.error { background: var(--seal-deep); }
+.toast.error { background: var(--danger-solid); }
 .toast code { font-family: var(--mono); opacity: 0.8; margin-left: 0.4rem; }
 
-.spinner { width: 1rem; height: 1rem; border: 2px solid var(--line); border-top-color: var(--seal); border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
+.spinner { width: 1rem; height: 1rem; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 900px) {
@@ -311,9 +331,9 @@ dialog .dialog-body { padding: 1.5rem; display: grid; gap: 1rem; }
 }
 
 .stack { display: grid; gap: 1rem; }
-.halo-disc { fill: var(--seal); }
-.halo-ring { fill: none; stroke: var(--seal-deep); stroke-width: 2.5; }
-.halo-star { fill: var(--brass); }
+.halo-disc { fill: var(--halo-disc); }
+.halo-ring { fill: none; stroke: var(--halo-ring); stroke-width: 2.5; }
+.halo-star { fill: var(--halo-star); }
 
 label.check { display: flex; align-items: center; gap: 0.5rem; font-weight: 400; font-size: var(--step-0); }
 label.check input { width: auto; }
