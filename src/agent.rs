@@ -411,7 +411,9 @@ mod imp {
         if sid <= 0 {
             return None;
         }
-        let leader = bsd_info(sid)?;
+        // In Terminal and iTerm the session leader is `login`, owned by root, which
+        // proc_pidinfo does not describe to other users; sysctl does.
+        let (leader_sec, leader_usec) = start_time(sid)?;
         // The peer must still be the same process (not a recycled pid).
         let after = bsd_info(pid)?;
         if (after.pbi_start_tvsec, after.pbi_start_tvusec, after.e_tdev)
@@ -424,9 +426,35 @@ mod imp {
             return None;
         }
         Some(format!(
-            "{}:{sid}:{}.{}",
-            before.e_tdev, leader.pbi_start_tvsec, leader.pbi_start_tvusec
+            "{}:{sid}:{leader_sec}.{leader_usec}",
+            before.e_tdev
         ))
+    }
+
+    /// Start time of any process, from `sysctl(KERN_PROC_PID)`: the `kinfo_proc` it returns
+    /// starts with `kp_proc.p_starttime` (a `timeval`). libc does not define `kinfo_proc`.
+    #[cfg(target_os = "macos")]
+    fn start_time(pid: libc::pid_t) -> Option<(i64, i32)> {
+        const KINFO_PROC_SIZE: usize = 648;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut buf = [0u8; KINFO_PROC_SIZE];
+        let mut len = buf.len();
+        let ok = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        if !ok || len != KINFO_PROC_SIZE {
+            return None; // no such process, or an unexpected layout
+        }
+        let sec = i64::from_ne_bytes(buf[0..8].try_into().ok()?);
+        let usec = i32::from_ne_bytes(buf[8..12].try_into().ok()?);
+        (sec > 0).then_some((sec, usec))
     }
 
     #[cfg(target_os = "macos")]
@@ -611,5 +639,24 @@ mod imp {
             std::thread::spawn(move || handle(&store, s));
         }
         0
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::*;
+
+        /// The session leader of a Terminal window is `login`, owned by root: its start time
+        /// must be readable although proc_pidinfo refuses to describe it (launchd, pid 1, too).
+        #[test]
+        fn start_time_of_a_root_process() {
+            let (sec, _) = start_time(1).expect("start time of launchd");
+            let mine = bsd_info(std::process::id() as libc::pid_t).unwrap();
+            assert!(sec > 0 && sec <= mine.pbi_start_tvsec as i64);
+            let own = start_time(std::process::id() as libc::pid_t).unwrap();
+            assert_eq!(
+                own,
+                (mine.pbi_start_tvsec as i64, mine.pbi_start_tvusec as i32)
+            );
+        }
     }
 }
