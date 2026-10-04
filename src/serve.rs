@@ -545,7 +545,6 @@ pub fn run(mut ctx: Ctx) -> i32 {
             ctx.unlocked.borrow_mut().take();
             notify("session.expired", json!({ "reason": "inactivity" }));
         }
-        last = Instant::now();
         if msg.trim().is_empty() {
             continue;
         }
@@ -558,6 +557,11 @@ pub fn run(mut ctx: Ctx) -> i32 {
                 continue;
             }
         };
+        // Background requests of the GUI (`"passive": true`, e.g. its status poll) are not
+        // activity: otherwise the inactivity lock would never fire while the app is open.
+        if req["params"]["passive"] != true {
+            last = Instant::now();
+        }
         let id = req.get("id").cloned();
         let Some(method) = req
             .get("method")

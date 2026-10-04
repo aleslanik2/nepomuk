@@ -260,6 +260,24 @@ pub struct Locations {
     /// Canonical vault path → vault id (hex).
     #[serde(default)]
     pub vaults: BTreeMap<String, String>,
+    /// Project folder (of its `.nepomuk.toml`) → the vault it used last and where. A project
+    /// that names another file or branch could otherwise divert to a vault of the repository
+    /// owner's choosing, or to a copy nobody else reads.
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectSeen>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProjectSeen {
+    pub vault: String,
+    pub location: String,
+}
+
+fn project_key(dir: &Path) -> String {
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn locations_path() -> PathBuf {
@@ -297,22 +315,49 @@ impl Locations {
         }
     }
 
-    /// The vault seen at `path` before, if it is a different one than `vault`.
-    pub fn previous(&self, path: &Path, vault: Id) -> Option<Id> {
-        self.vaults
+    /// The vault seen at `path`, or used by `project`, before – if it is a different one than
+    /// `vault`.
+    pub fn previous(&self, path: &Path, project: Option<&Path>, vault: Id) -> Option<Id> {
+        let at_path = self
+            .vaults
             .get(&location_key(path))
-            .and_then(|h| Id::parse(h))
+            .and_then(|h| Id::parse(h));
+        let in_project = project
+            .and_then(|d| self.projects.get(&project_key(d)))
+            .and_then(|p| Id::parse(&p.vault));
+        at_path
             .filter(|id| *id != vault)
+            .or(in_project.filter(|id| *id != vault))
+    }
+
+    /// Where `project` used this same `vault` before, if that was somewhere else.
+    pub fn moved(&self, project: Option<&Path>, location: &str, vault: Id) -> Option<String> {
+        let seen = self.projects.get(&project_key(project?))?;
+        (Id::parse(&seen.vault) == Some(vault) && seen.location != location)
+            .then(|| seen.location.clone())
     }
 
     /// Remembers `vault` at `path`; writes only when something changed.
-    pub fn record(path: &Path, vault: Id) -> Result<()> {
+    pub fn record(path: &Path, project: Option<&Path>, location: &str, vault: Id) -> Result<()> {
         let mut l = Locations::load()?;
         let key = location_key(path);
-        if l.vaults.get(&key) == Some(&vault.hex()) {
+        let seen = ProjectSeen {
+            vault: vault.hex(),
+            location: location.to_string(),
+        };
+        let project = project.map(project_key);
+        let same_project = project.as_ref().is_none_or(|p| {
+            l.projects
+                .get(p)
+                .is_some_and(|s| s.vault == seen.vault && s.location == seen.location)
+        });
+        if l.vaults.get(&key) == Some(&vault.hex()) && same_project {
             return Ok(());
         }
         l.vaults.insert(key, vault.hex());
+        if let Some(p) = project {
+            l.projects.insert(p, seen);
+        }
         write_private(&locations_path(), &serde_json::to_vec_pretty(&l).unwrap())
     }
 }

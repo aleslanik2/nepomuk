@@ -653,12 +653,23 @@ fn trust_and_root_of_trust() {
         ],
     );
     assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
+    // Outside CI the environment does not pin a vault seen for the first time (it may come
+    // from the project's .envrc).
+    let r = fresh(
+        &["--identity", id, "info"],
+        &[
+            ("NEPOMUK_PASSPHRASE", MASTER_PASS),
+            ("NEPOMUK_ROOT_FP", &fp),
+        ],
+    );
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT");
     // CI: pinned through the environment.
     let r = fresh(
         &["--identity", id, "info"],
         &[
             ("NEPOMUK_PASSPHRASE", MASTER_PASS),
             ("NEPOMUK_ROOT_FP", &fp),
+            ("CI", "true"),
         ],
     );
     r.data();
@@ -793,7 +804,7 @@ fn master_transfer() {
     assert_eq!(info["master"], true);
     assert_eq!(e.m(&["whoami"]).data()["master"], false);
     // Other clients (e.g. CI pinned to the old master) must confirm the new fingerprint.
-    let mut c = e.command(&["info"], &[("NEPOMUK_ROOT_FP", &old_fp)]);
+    let mut c = e.command(&["info"], &[("NEPOMUK_ROOT_FP", &old_fp), ("CI", "true")]);
     c.env("NEPOMUK_STATE_DIR", e.path("state-ci"))
         .env(
             "NEPOMUK_IDENTITY",
@@ -1343,4 +1354,47 @@ fn descriptions_on_folders_and_secrets() {
     assert_eq!(e.m(&["describe", "/infra", "bad\u{7}"]).err_code(), "USAGE");
     assert_eq!(e.m(&["describe", "/missing", "x"]).err_code(), "NOT_FOUND");
     e.m(&["verify", "--full"]).ok();
+}
+
+/// Audit 2026-10-04: a project that names another file is not a first start. Another vault
+/// there needs `trust --replace`; a copy of the same vault is announced.
+#[test]
+fn project_pointing_elsewhere_is_noticed() {
+    let e = Env::new("project-moved");
+    let other = Env::new("project-moved-other");
+    let id = e.master_identity();
+    let id = id.to_str().unwrap();
+    let run = |args: &[&str]| {
+        let mut c = e.command(args, &[("NEPOMUK_PASSPHRASE", MASTER_PASS)]);
+        c.env_remove("NEPOMUK_VAULT");
+        let out = c.output().unwrap();
+        Res {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    };
+    let toml = e.path(".nepomuk.toml");
+    std::fs::write(&toml, "vault = \"vault.nepomuk\"\n").unwrap();
+    run(&["--identity", id, "info"]).data();
+
+    // The repository now names a different vault of its own making.
+    std::fs::copy(&other.vault, e.path("theirs.nepomuk")).unwrap();
+    std::fs::write(&toml, "vault = \"theirs.nepomuk\"\n").unwrap();
+    let r = run(&["--identity", id, "info"]);
+    assert_eq!(r.err_code(), "UNTRUSTED_ROOT", "{}", r.stdout);
+    assert_eq!(
+        r.json()["error"]["details"]["needs_replace"],
+        true,
+        "{}",
+        r.stdout
+    );
+
+    // A copy of the same vault elsewhere opens, with a warning.
+    std::fs::copy(&e.vault, e.path("copy.nepomuk")).unwrap();
+    std::fs::write(&toml, "vault = \"copy.nepomuk\"\n").unwrap();
+    let r = run(&["--identity", id, "info"]);
+    let out = format!("{}{}", r.stdout, r.stderr);
+    assert!(out.contains("used this vault at"), "{out}");
+    r.data();
 }

@@ -404,3 +404,57 @@ fn serve_stdio_session() {
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }
+
+/// Audit 2026-10-04: the GUI's status poll (`passive`) must not keep the session unlocked.
+#[test]
+fn passive_requests_do_not_keep_the_session_unlocked() {
+    let e = Env::new("serve-idle");
+    e.m(&["mkdir", "/infra"]).ok();
+    e.m_in(&["put", "/infra/pw"], b"v").ok();
+    std::fs::write(e.path("cfg/config.toml"), "session_timeout = 2\n").unwrap();
+    let mut child = e
+        .command(&["serve", "--stdio"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut call = |id: u64, method: &str, params: Value| -> Value {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        )
+        .unwrap();
+        loop {
+            let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            if v.get("id") == Some(&json!(id)) {
+                return v;
+            }
+        }
+    };
+    let id = e.master_identity();
+    let unlock = json!({ "identity": id.to_str().unwrap(), "password": MASTER_PASS });
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // Real requests keep it alive…
+    call(1, "session.unlock", unlock.clone());
+    for i in 0..4 {
+        pause();
+        call(10 + i, "vault.status", json!({}));
+    }
+    let r = call(20, "node.get", json!({ "path": "/infra/pw" }));
+    assert_eq!(r["result"]["value"], "v", "{r}");
+
+    // …background polls do not.
+    for i in 0..4 {
+        pause();
+        call(30 + i, "vault.status", json!({ "passive": true }));
+    }
+    let r = call(40, "node.get", json!({ "path": "/infra/pw" }));
+    assert_eq!(r["error"]["data"]["code"], "PASSWORD_REQUIRED", "{r}");
+    drop(stdin);
+    let _ = child.wait();
+}
