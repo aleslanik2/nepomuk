@@ -270,7 +270,7 @@ mod imp {
 
     fn start() -> Result<()> {
         use std::os::unix::process::CommandExt;
-        let exe = std::env::current_exe()?;
+        let exe = agent_exe().ok_or_else(|| Error::general("cannot find the nepomuk program"))?;
         std::process::Command::new(exe)
             .args(["agent", "--daemon"])
             .stdin(std::process::Stdio::null())
@@ -313,10 +313,20 @@ mod imp {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
         };
-        match (peer_pid(s).and_then(exe_of), std::env::current_exe()) {
-            (Some(peer), Ok(me)) => same(&peer, &me),
+        match (peer_pid(s).and_then(exe_of), agent_exe()) {
+            (Some(peer), Some(me)) => same(&peer, &me),
             _ => false,
         }
+    }
+
+    /// The program the agent runs as: this one. Tests that drive the library from a test
+    /// binary name the CLI instead (debug builds only).
+    fn agent_exe() -> Option<PathBuf> {
+        #[cfg(debug_assertions)]
+        if let Some(p) = std::env::var_os("NEPOMUK_AGENT_EXE") {
+            return Some(PathBuf::from(p));
+        }
+        std::env::current_exe().ok()
     }
 
     fn peer_pid(s: &UnixStream) -> Option<libc::pid_t> {
