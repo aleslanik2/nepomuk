@@ -291,18 +291,19 @@ Each commit carries one or more operations applied atomically. The client verifi
 | --- | --- |
 | `AddUser`, `DisableUser`, `ReplaceIdentity` | master or `users`; `ReplaceIdentity` removes all grants, memberships and system rights of the user (re-granted only by holders of the rights, with `+delegate` for system rights), so re-enabling a disabled user grants nothing |
 | `UpdateOwnCredential` (password change, Argon2id parameters) | the user themselves |
-| `RotateOwnKeys` (password change, §4.4) | the user themselves, not the master; with a proof of possession of the new keys; may re-wrap only the user's own grants (metadata unchanged) and memberships |
+| `RotateOwnKeys` (password change, §4.4) | the user themselves, not the master; with a proof of possession of the new keys; may re-wrap only the user's own grants (metadata unchanged) and memberships. The old keys still open what they could read (old password + history), so it is recorded like replaced keys (`stale_keys`, the user's groups in `stale_groups`) until a `Rekey` or a new group key; a dropped membership also drops `group-admin` of that group |
 | `CreateGroup` | master or `groups` |
-| `AddMember`, `RemoveMember` | master or `group-admin` of the group; `AddMember` also requires membership |
+| `AddMember`, `RemoveMember` | master or `group-admin` of the group who is also a member |
 | `CreateNode` | `write` on the parent |
 | `UpdateNode` (content, including the description) | `write` on the node |
 | `RenameNode`, `DeleteNode` | `write` on the parent |
+| `MoveNode` | `write` on the old and the new parent; the author's right on the node must not rise by the move (e.g. from `write` in a shared folder to `admin` in its own), unless the author is `admin` on the node already |
 | `Grant read/write` | `share` on the node, not above the own right |
 | `Grant share/admin`, `Revoke` | `admin` on the node |
 | `Rekey` (new NK for a subtree) | `admin` on the node's parent or master |
 | `GrantSystemRight` | the same right with `+delegate`, or master |
 | `MarkRotation`, `ClearRotation` | `write` on the node |
-| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1) |
+| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1). A disabled user still in a group knows the group key: `DisableUser` puts its groups in `stale_groups` until a group admin removes it (`RemoveMember` gives the group a new key), so rekeys and grants for the group stay recorded |
 | `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
 ### 8.1 Revocation and rekey

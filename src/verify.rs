@@ -161,6 +161,40 @@ impl State {
         }
     }
 
+    /// A user's keys are replaced (ReplaceIdentity) or rotated (RotateOwnKeys): the old keys
+    /// still know the keys of everything they could read, from the history – what they read
+    /// now, what they lost access to without a rekey (pending under the user or one of its
+    /// groups), and the keys of their groups. All of it is recorded under `reason` (the old
+    /// keys), so granting the user access again does not clear it – only a rekey (and, for a
+    /// group, a new group key) does.
+    fn mark_replaced_keys(&mut self, uid: Id, reason: Id) {
+        let groups = self.user_groups(uid);
+        let mut known: BTreeSet<Id> = self
+            .grants
+            .values()
+            .filter(|g| match g.to {
+                Principal::User(x) => x == uid,
+                Principal::Group(gr) => groups.contains(&gr),
+            })
+            .map(|g| g.node)
+            .collect();
+        // For the group itself a pending entry stays; the member knew those keys too.
+        let me = Principal::User(uid);
+        for (n, who) in self.rekey_pending.iter_mut() {
+            let via_group = who
+                .iter()
+                .any(|p| matches!(p, Principal::Group(g) if groups.contains(g)));
+            if who.remove(&me) || via_group {
+                known.insert(*n);
+            }
+        }
+        self.rekey_pending.retain(|_, who| !who.is_empty());
+        for n in known {
+            self.stale_keys.entry(n).or_default().insert(reason);
+        }
+        self.stale_groups.extend(groups);
+    }
+
     /// Clears pending rekeys in the subtree, for everyone or only for `who`.
     fn clear_rekey_pending(&mut self, node: Id, who: Option<Principal>) {
         for n in self.subtree(node) {
@@ -524,6 +558,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for n in nodes {
                 s.mark_rekey_pending(n, Principal::User(uid));
             }
+            // It also keeps the keys of its groups: until a group admin removes it (a new
+            // group key), every rekey and grant for those groups is readable by it.
+            s.stale_groups.extend(groups);
         }
         Op::ReplaceIdentity {
             user,
@@ -546,39 +583,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                     .any(|o| o.id != *user && (o.kem == *kem || o.sig == *sig)),
                 "these keys already belong to a user",
             )?;
-            // The old keys still know the keys of everything they could read (from the
-            // history): what they read now, what they lost access to without a rekey (pending
-            // under the user), and the keys of their groups. All of it is recorded under the
-            // old keys, so granting the new keys access again does not clear it – only a rekey
-            // (and, for a group, a new group key) does.
             let uid = *user;
             let reason = replaced_keys_id(&u.kem, &u.sig);
-            let groups = s.user_groups(uid);
-            let mut known: BTreeSet<Id> = s
-                .grants
-                .values()
-                .filter(|g| match g.to {
-                    Principal::User(x) => x == uid,
-                    Principal::Group(gr) => groups.contains(&gr),
-                })
-                .map(|g| g.node)
-                .collect();
-            // Pending under the user, or under a group the user is in (the member knew those
-            // keys too; for the group itself the entry stays).
-            let me = Principal::User(uid);
-            for (n, who) in s.rekey_pending.iter_mut() {
-                let via_group = who
-                    .iter()
-                    .any(|p| matches!(p, Principal::Group(g) if groups.contains(g)));
-                if who.remove(&me) || via_group {
-                    known.insert(*n);
-                }
-            }
-            s.rekey_pending.retain(|_, who| !who.is_empty());
-            for n in known {
-                s.stale_keys.entry(n).or_default().insert(reason);
-            }
-            s.stale_groups.extend(groups);
+            s.mark_replaced_keys(uid, reason);
             // Everything wrapped for the old keys becomes useless and is removed. System
             // rights are removed too: whoever approves the new keys must not inherit rights
             // they could not grant themselves; they are granted again explicitly. With nothing
@@ -643,6 +650,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                     "not a member of the group",
                 )?;
             }
+            // The old password and the history still open the old keys: what they could read
+            // is recorded like replaced keys, before the grants are re-wrapped.
+            let reason = replaced_keys_id(&u.kem, &u.sig);
+            s.mark_replaced_keys(author, reason);
             // Everything wrapped for the old keys is replaced or dropped.
             s.remove_grants_where(|g| g.to == me && !seen.contains(&g.id));
             for g in grants {
@@ -658,6 +669,9 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                     }
                     None => {
                         group.members.remove(&author);
+                        if let Some(m) = s.sysrights.get_mut(&author) {
+                            m.remove(&SysRight::GroupAdmin(*gid));
+                        }
                     }
                 }
             }
@@ -720,6 +734,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             require(
                 s.sys_right(author, SysRight::GroupAdmin(*group)).is_some(),
                 "requires `group-admin` of the group",
+            )?;
+            require(
+                s.is_master(author) || g.members.contains_key(&author),
+                "only a member of the group can remove members",
             )?;
             require(g.members.contains_key(user), "not a member")?;
             require(&g.kem != kem, "the group needs a new key")?;
@@ -829,6 +847,13 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             require(
                 s.has_right(author, *parent, Right::Write),
                 "requires `write` on the new parent",
+            )?;
+            // A move must not raise the author's own right on what it moves (e.g. `write` in
+            // a shared folder into a folder it administers), unless it is admin there already.
+            let before = s.effective_right(author, *id);
+            require(
+                before == Some(Right::Admin) || s.effective_right(author, *parent) <= before,
+                "moving it would give you more rights on it; requires `admin` on it",
             )?;
             check_rewrapped(s, grants, &s.subtree(*id))?;
             // Whoever still knows the key of a folder it leaves also knows its key: the marks

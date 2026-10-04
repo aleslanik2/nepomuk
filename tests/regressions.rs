@@ -1450,3 +1450,204 @@ fn replaced_keys_marks_cover_group_losses_and_earlier_moves() {
     let (_, v, _, _) = t.commit().unwrap();
     assert!(v.state.stale_keys.contains_key(&n));
 }
+
+/// Audit 2026-10-04, H1: a disabled user who is still in a group knows the group key, so the
+/// group stays marked until a group admin removes the user, and rekeys or new grants for it
+/// are recorded instead of silently clearing the record.
+#[test]
+fn disabled_member_keeps_its_groups_marked_until_removed() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&alice, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    let a = t.user_named("alice").unwrap();
+    let i = t.user_named("it").unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, a).unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.put(
+        "/grp/s1",
+        Content::Text {
+            value: "old".into(),
+        },
+        None,
+    )
+    .unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    // Offboarding with only `users` cannot remove her from the group.
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.offboard(a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.groups[&g].members.contains_key(&a));
+    assert!(v.state.stale_groups.contains(&g));
+
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rekey_pending().unwrap();
+    t.mkdir("/later", false).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/later").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let grp = v.state.nodes.keys().copied().find(|n| {
+        v.state
+            .grants
+            .values()
+            .any(|x| x.node == *n && x.to == Principal::Group(g))
+    });
+    assert!(grp.is_some());
+    assert!(
+        v.state
+            .stale_keys
+            .values()
+            .filter(|why| why.contains(&g))
+            .count()
+            >= 2,
+        "/grp and /later stay marked for the group: {:?}",
+        v.state.stale_keys
+    );
+    let warnings = nepomuk::queries::state_warnings(&v.state).join("\n");
+    assert!(warnings.contains("disabled user alice"), "{warnings}");
+
+    // Removing her gives the group a new key; what remains is an ordinary rekey.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.group_remove(g, a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    // The master's `group remove` also rekeys what she could read.
+    assert!(v.state.stale_groups.is_empty());
+    assert!(v.state.stale_keys.is_empty() && v.state.rekey_pending.is_empty());
+    assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
+}
+
+/// Audit 2026-10-04, M1: after a password change the old password and the git history still
+/// open the old keys, so what they could read is recorded until it is rekeyed.
+#[test]
+fn rotated_keys_are_recorded_until_rekeyed() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    let b = t.user_named("bob").unwrap();
+    t.mkdir("/team", false).unwrap();
+    t.grant(Principal::User(b), Right::Read, "/team").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let team = Access::build(&v.state, b, &bob).resolve("/team").unwrap();
+
+    let new = Unlocked::generate("bob", IdentityKind::Local);
+    let mut t = Tx::new(&v, &bob).unwrap();
+    t.rotate_own_keys(
+        new.kem.public().clone(),
+        new.sig.public().clone(),
+        None,
+        new.proof(IdentityKind::Local, None),
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let old = nepomuk::verify::replaced_keys_id(bob.kem.public(), bob.sig.public());
+    assert!(v.state.stale_keys[&team].contains(&old));
+    // Bob still reads with the new keys; the master rekeys and the record goes away.
+    assert!(Access::build(&v.state, b, &new).resolve("/team").is_some());
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rekey_pending().unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.stale_keys.is_empty());
+}
+
+/// Audit 2026-10-04: moving must not turn `write` in a shared folder into `admin`.
+#[test]
+fn move_cannot_raise_the_authors_right() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&alice, None)).unwrap();
+    let a = t.user_named("alice").unwrap();
+    t.mkdir("/mine", false).unwrap();
+    t.mkdir("/shared/sub", true).unwrap();
+    t.mkdir("/other", false).unwrap();
+    t.put("/shared/secret", Content::Text { value: "x".into() }, None)
+        .unwrap();
+    t.grant(Principal::User(a), Right::Admin, "/mine").unwrap();
+    t.grant(Principal::User(a), Right::Write, "/shared")
+        .unwrap();
+    t.grant(Principal::User(a), Right::Write, "/other").unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    let mut t = Tx::new(&v, &alice).unwrap();
+    let e = t.mv("/shared/secret", "/mine/secret").unwrap_err();
+    assert_eq!(e.code, Code::AccessDenied, "{}", e.message);
+    // Same right at the new place, or admin already: fine.
+    t.mv("/shared/secret", "/shared/sub/secret").unwrap();
+    t.mv("/shared/sub/secret", "/other/secret").unwrap();
+    t.mkdir("/mine/x", false).unwrap();
+    t.mv("/mine/x", "/shared/x").unwrap();
+    t.commit().unwrap();
+}
+
+/// Audit 2026-10-04: `group-admin` goes with the membership, and only members (or the
+/// master) can remove members.
+#[test]
+fn group_admin_goes_with_the_membership() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let carol = Unlocked::generate("carol", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&bob, None)).unwrap();
+    t.user_add(&Request::new(&carol, None)).unwrap();
+    let b = t.user_named("bob").unwrap();
+    let c = t.user_named("carol").unwrap();
+    t.sysgrant(b, SysRight::Groups, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &bob).unwrap();
+    let g = t.group_create("g").unwrap();
+    t.group_add(g, c).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    // Bob rotates his keys and leaves the group: the group-admin right goes too.
+    let mut s = v.state.clone();
+    let new = Unlocked::generate("bob", IdentityKind::Local);
+    nepomuk::verify::apply_op(
+        &mut s,
+        b,
+        &Op::RotateOwnKeys {
+            kem: new.kem.public().clone(),
+            sig: new.sig.public().clone(),
+            credential: None,
+            proof: new.proof(IdentityKind::Local, None),
+            grants: vec![],
+            memberships: Default::default(),
+        },
+    )
+    .unwrap();
+    assert!(!s.groups[&g].members.contains_key(&b));
+    assert!(
+        !s.sysrights
+            .get(&b)
+            .is_some_and(|m| m.contains_key(&SysRight::GroupAdmin(g)))
+    );
+
+    // A non-member with group-admin (e.g. from an older vault) cannot remove members.
+    s.sysrights
+        .entry(b)
+        .or_default()
+        .insert(SysRight::GroupAdmin(g), true);
+    let k = Unlocked::generate("x", IdentityKind::Local);
+    let e = nepomuk::verify::apply_op(
+        &mut s,
+        b,
+        &Op::RemoveMember {
+            group: g,
+            user: c,
+            kem: k.kem.public().clone(),
+            members: Default::default(),
+            grants: vec![],
+        },
+    )
+    .unwrap_err();
+    assert!(e.message.contains("only a member"), "{}", e.message);
+}

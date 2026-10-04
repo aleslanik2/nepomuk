@@ -374,10 +374,28 @@ pub fn state_warnings(s: &State) -> Vec<String> {
         if let Some(group) = s.groups.get(g)
             && reads
         {
-            out.push(format!(
-                "the key of group {} is held by the replaced keys of a former member: a group admin who is a member should give it a new key (`nepomuk group remove` of a member, then `group add` again)",
-                group.name
-            ));
+            let disabled: Vec<&str> = group
+                .members
+                .keys()
+                .filter_map(|m| s.users.get(m))
+                .filter(|u| u.disabled)
+                .map(|u| u.name.as_str())
+                .collect();
+            if disabled.is_empty() {
+                out.push(format!(
+                    "the key of group {} is held by replaced or rotated keys of a member: a group admin who is a member should give it a new key (`nepomuk group remove` of a member, then `group add` again)",
+                    group.name
+                ));
+            } else {
+                out.push(format!(
+                    "group {} still contains the disabled user{} {}, who know{} its key: a group admin who is a member should remove {} (`nepomuk group remove`)",
+                    group.name,
+                    if disabled.len() == 1 { "" } else { "s" },
+                    disabled.join(", "),
+                    if disabled.len() == 1 { "s" } else { "" },
+                    if disabled.len() == 1 { "the user" } else { "them" }
+                ));
+            }
         }
     }
     let pending: std::collections::BTreeSet<Id> = s
