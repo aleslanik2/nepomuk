@@ -8,8 +8,9 @@
 //! Limits on what a cached identity can be used for:
 //! - **It gets only the decryption key.** The CLI that unlocked the identity sends the KEM key
 //!   material and the public signing key, never the seed (which also derives the signing key),
-//!   and only to an agent that is the same program run by the same user (peer UID and
-//!   executable checked), not to whatever listens on the socket. Clients get the public keys
+//!   and only to an agent run by the same user that is, on macOS, the same program (peer UID
+//!   and executable checked; Linux hides a non-dumpable agent's executable, so there only the
+//!   UID), not to whatever listens on the socket. Clients get the public keys
 //!   and ask the agent to unwrap keys wrapped for the identity (grants, group keys, pending
 //!   changes of that vault); like `ssh-agent`, it never hands out the private key, so a program
 //!   that reaches it can use the identity only while it is cached, not keep it.
@@ -302,9 +303,15 @@ mod imp {
     type Store = Arc<Mutex<HashMap<(String, String), Entry>>>;
 
     /// The process at the other end of the socket is this user running this same program.
+    /// On Linux only the user is checked: the agent makes itself non-dumpable, which hides its
+    /// executable (`/proc/<pid>/exe`) from processes of the same user – as any other program
+    /// can, so the check would prove nothing there.
     fn server_is_agent(s: &UnixStream) -> bool {
         if !peer_is_me(s) {
             return false;
+        }
+        if cfg!(target_os = "linux") {
+            return true;
         }
         let same = |a: &std::path::Path, b: &std::path::Path| match (
             std::fs::canonicalize(a),
@@ -346,22 +353,7 @@ mod imp {
             } == 0;
             (ok && pid > 0).then_some(pid)
         }
-        #[cfg(target_os = "linux")]
-        {
-            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            let ok = unsafe {
-                libc::getsockopt(
-                    s.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    &mut cred as *mut _ as *mut libc::c_void,
-                    &mut len,
-                )
-            } == 0;
-            (ok && cred.pid > 0).then_some(cred.pid)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = s.as_raw_fd();
             None
@@ -383,11 +375,7 @@ mod imp {
             use std::os::unix::ffi::OsStringExt;
             Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
         }
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         {
             let _ = pid;
             None
@@ -765,7 +753,7 @@ mod imp {
         0
     }
 
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(test, target_os = "macos"))]
     mod server_tests {
         use super::*;
 

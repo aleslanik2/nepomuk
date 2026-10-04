@@ -507,7 +507,7 @@ A long-running process started by the GUI; JSON-RPC 2.0 over stdin and stdout, o
 - Only this process holds the unlocked identity, in locked memory; the GUI forgets the password once it is handed over.
 - Forgets the identity after inactivity (default 10 min), on a `lock` request, and when the screen is locked (signal from the GUI).
 - The Touch ID helper is run only from the folder of the CLI binary (no PATH lookup; `NEPOMUK_TOUCHID_HELPER` only in debug builds), since `seal` hands it the plain password. The Secure Enclave key is not bound to a program (that needs a code-signed helper), so another process of the user that reads the sealed record can ask for a fingerprint with its own text: the prompt does not prove who asks.
-- The agent receives only the KEM key material and the public signing key, never the seed, and the CLI sends it only after checking that the socket's peer is the same user running the same executable.
+- The agent receives only the KEM key material and the public signing key, never the seed, and the CLI sends it only after checking that the socket's peer is the same user and, on macOS, the same executable (Linux hides the executable of a non-dumpable process from other processes of the user, so there only the UID is checked).
 - A Touch ID unlock in the session never puts the identity into the Touch ID agent, and `session.lock` (the app's Lock button and screen lock) also clears every identity the agent holds for the command line, like `nepomuk lock`.
 - Opens no socket or port; exits when stdin is closed.
 - Methods correspond to CLI commands: `vault.status`, `node.list`, `node.get`, `node.put`, `grant.add`, `user.offboard`, `sync.run`, `session.unlock`, `session.lock` …
