@@ -506,10 +506,11 @@ export const ctx = {
   },
 };
 
-export async function refreshStatus() {
+export async function refreshStatus(passive = false) {
   if (!refs.statusEl) return;
   try {
-    const st = await rpc("vault.status");
+    // The periodic poll is not user activity: it must not keep the CLI session unlocked.
+    const st = await rpc("vault.status", passive ? { passive: true } : {});
     state.status = st;
     const text = {
       "up-to-date": "Up to date",
@@ -581,7 +582,7 @@ function watchActivity() {
     const idleMin = settings.get("idleMinutes", 10);
     if (state.unlocked && Date.now() - state.lastActivity > idleMin * 60_000) lock("Locked after inactivity.");
   }, 15_000);
-  setInterval(() => { if (state.unlocked) refreshStatus(); }, 60_000);
+  setInterval(() => { if (state.unlocked) refreshStatus(true); }, 60_000);
 }
 
 async function boot() {

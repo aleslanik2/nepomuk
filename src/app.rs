@@ -525,6 +525,24 @@ fn pin_for(
             .with("pinned", p.clone())
             .with("environment", fp));
         }
+        if mem.pin.is_none() {
+            // Outside CI the environment may come from the project (.envrc, IDE settings):
+            // a vault seen for the first time is pinned only by `nepomuk trust`.
+            if !ctx.ci() {
+                return Err(Error::new(
+                    Code::UntrustedRoot,
+                    "NEPOMUK_ROOT_FP is only for CI; on this computer verify the fingerprint out of band and run `nepomuk trust <fingerprint>`",
+                )
+                .with("vault_id", vault.hex())
+                .with("environment", fp));
+            }
+            // Nor does it replace a vault that was pinned at this place before.
+            let err = Error::new(Code::UntrustedRoot, "untrusted vault");
+            let checked = with_replaced_vault(err, ctx, loc, vault)?;
+            if checked.details.contains_key("needs_replace") {
+                return Err(checked);
+            }
+        }
         return Ok(fp);
     }
     if let Some(p) = &mem.pin {
@@ -549,13 +567,31 @@ fn pin_for(
     if let Some(fp) = project_fp {
         err = err.with("project_fingerprint", fp);
     }
-    Err(with_replaced_vault(err, loc, vault)?)
+    Err(with_replaced_vault(err, ctx, loc, vault)?)
+}
+
+/// Where the vault is read from, for noticing that a project points somewhere else.
+fn location_desc(loc: &Location) -> String {
+    let key = config::location_key(&loc.path);
+    match &loc.git {
+        Some(g) => format!("{key} ({})", g.remote_ref()),
+        None => key,
+    }
+}
+
+fn project_dir(ctx: &Ctx) -> Option<&std::path::Path> {
+    ctx.project.as_ref().map(|p| p.dir.as_path())
 }
 
 /// A vault without a pin at a place where another, pinned vault was opened before is not a
 /// first start: the file has been swapped. Say so, and require `trust --replace`.
-fn with_replaced_vault(err: Error, loc: &Location, vault: crate::model::Id) -> Result<Error> {
-    let Some(prev) = config::Locations::load()?.previous(&loc.path, vault) else {
+fn with_replaced_vault(
+    err: Error,
+    ctx: &Ctx,
+    loc: &Location,
+    vault: crate::model::Id,
+) -> Result<Error> {
+    let Some(prev) = config::Locations::load()?.previous(&loc.path, project_dir(ctx), vault) else {
         return Ok(err);
     };
     let Some(prev_pin) = VaultMemory::load(prev)?.pin else {
@@ -564,7 +600,7 @@ fn with_replaced_vault(err: Error, loc: &Location, vault: crate::model::Id) -> R
     let mut e = Error::new(
         Code::UntrustedRoot,
         format!(
-            "{} held another vault before, pinned to {prev_pin}; this file is a different vault with a different master. If this was not announced to you, do not trust it",
+            "{} (or this project) held another vault before, pinned to {prev_pin}; this file is a different vault with a different master. If this was not announced to you, do not trust it",
             loc.path.display()
         ),
     );
@@ -691,8 +727,15 @@ pub fn open_vault(ctx: &Ctx, fetch: bool) -> Result<Opened> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
-    if !ctx.ci() {
-        config::Locations::record(&loc.path, vault)?;
+    // Only a vault pinned on this computer marks its place (not one pinned by the environment).
+    if !ctx.ci() && mem.pin.as_deref() == Some(pin.as_str()) {
+        let here = location_desc(&loc);
+        if let Some(before) = config::Locations::load()?.moved(project_dir(ctx), &here, vault) {
+            ctx.warn(format!(
+                "this project used this vault at {before} before and now at {here}; if the project did not announce the move, your changes may go to a copy nobody else reads"
+            ));
+        }
+        config::Locations::record(&loc.path, project_dir(ctx), &here, vault)?;
     }
     Ok(Opened { loc, loaded, v })
 }
@@ -1442,7 +1485,12 @@ pub fn init(ctx: &Ctx, name: &str, out: Option<PathBuf>) -> Result<Value> {
     mem.head = Some(hex::encode(file.head_hash()));
     mem.checkpoint = Some(hex::encode(file.head_hash()));
     mem.save(file.vault_id)?;
-    config::Locations::record(&loc.path, file.vault_id)?;
+    config::Locations::record(
+        &loc.path,
+        project_dir(ctx),
+        &location_desc(&loc),
+        file.vault_id,
+    )?;
     Ok(json!({
         "vault": loc.path.display().to_string(),
         "vault_id": file.vault_id.hex(),
@@ -1470,10 +1518,11 @@ pub fn trust(ctx: &Ctx, fp: &str, replace: bool) -> Result<Value> {
     let signer = claimed_master_fp(&file).unwrap_or_default();
     let replacing = mem.pin.clone().filter(|p| p != fp);
     let proven = mem.pin.as_deref() == Some(signer.as_str()) || mem.former.contains(&signer);
-    let replacing_vault = match config::Locations::load()?.previous(&loc.path, vault) {
-        Some(prev) => VaultMemory::load(prev)?.pin.map(|p| (prev, p)),
-        None => None,
-    };
+    let replacing_vault =
+        match config::Locations::load()?.previous(&loc.path, project_dir(ctx), vault) {
+            Some(prev) => VaultMemory::load(prev)?.pin.map(|p| (prev, p)),
+            None => None,
+        };
     let unproven_change = replacing.is_some() && !(proven && signer != fp);
     if !replace && (unproven_change || replacing_vault.is_some()) {
         let mut e = Error::new(
@@ -1531,7 +1580,7 @@ pub fn trust(ctx: &Ctx, fp: &str, replace: bool) -> Result<Value> {
     }
     remember(&mut mem, &v);
     mem.save(vault)?;
-    config::Locations::record(&loc.path, vault)?;
+    config::Locations::record(&loc.path, project_dir(ctx), &location_desc(&loc), vault)?;
     let previous = replacing.or(previous).or(replacing_vault.map(|(_, p)| p));
     Ok(json!({ "vault_id": vault.hex(), "pinned": fp, "previous": previous, "seq": v.seq }))
 }
