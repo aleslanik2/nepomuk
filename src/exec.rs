@@ -147,8 +147,8 @@ pub fn cleanup_stale() {
 /// split across two reads is still caught.
 pub struct Masker {
     secrets: Vec<Vec<u8>>,
+    /// Bytes read but not yet emitted (raw, before masking).
     buf: Vec<u8>,
-    hold: usize,
 }
 
 impl Masker {
@@ -156,47 +156,105 @@ impl Masker {
         secrets.retain(|s| s.len() >= 3);
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
-        let hold = secrets.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         Masker {
             secrets,
             buf: Vec::new(),
-            hold,
         }
     }
 
-    fn replace(&mut self) {
-        for s in &self.secrets {
-            let mut out = Vec::with_capacity(self.buf.len());
-            let mut i = 0;
-            while i < self.buf.len() {
-                if self.buf[i..].starts_with(s) {
+    /// Masks the buffer from the left: at each position the longest secret that matches there
+    /// is replaced. Unless `finish`, it stops at the first position where a secret could still
+    /// begin (the rest of the buffer is a prefix of a secret that would match there, or of a
+    /// longer one than what matches now) and keeps the rest for the next read – whatever the
+    /// bytes are, newlines included.
+    fn process(&mut self, finish: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.buf.len());
+        let mut i = 0;
+        while i < self.buf.len() {
+            let rest = &self.buf[i..];
+            let full = self
+                .secrets
+                .iter()
+                .find(|s| rest.starts_with(s))
+                .map(Vec::len);
+            let may_grow = !finish
+                && self.secrets.iter().any(|s| {
+                    s.len() > rest.len() && s.starts_with(rest) && full.is_none_or(|f| s.len() > f)
+                });
+            if may_grow {
+                break;
+            }
+            match full {
+                Some(n) => {
                     out.extend_from_slice(b"***");
-                    i += s.len();
-                } else {
+                    i += n;
+                }
+                None => {
                     out.push(self.buf[i]);
                     i += 1;
                 }
             }
-            self.buf = out;
         }
+        self.buf.drain(..i);
+        out
     }
 
     /// Feeds bytes; returns what can be emitted now.
     pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         self.buf.extend_from_slice(data);
-        self.replace();
-        let cut = if self.buf.ends_with(b"\n") {
-            self.buf.len()
-        } else {
-            self.buf.len().saturating_sub(self.hold)
-        };
-        // Never emit a partial "***" boundary problem: the replacement is already done.
-        self.buf.drain(..cut).collect()
+        self.process(false)
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
-        self.replace();
-        std::mem::take(&mut self.buf)
+        self.process(true)
+    }
+}
+
+#[cfg(test)]
+mod masker_tests {
+    use super::Masker;
+
+    fn run(secrets: &[&str], chunks: &[&str]) -> String {
+        let mut m = Masker::new(secrets.iter().map(|s| s.as_bytes().to_vec()).collect());
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(m.feed(c.as_bytes()));
+        }
+        out.extend(m.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Every way of splitting `input` into two or three reads gives the same, fully masked
+    /// output.
+    fn all_splits(secrets: &[&str], input: &str, expected: &str) {
+        let n = input.len();
+        for a in 0..=n {
+            for b in a..=n {
+                let out = run(secrets, &[&input[..a], &input[a..b], &input[b..]]);
+                assert_eq!(out, expected, "split at {a}/{b} of {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_and_multiline_secrets_never_leak() {
+        all_splits(&["abc", "abcdef"], "abcdef\n", "***\n");
+        all_splits(&["abc", "abcdef"], "x abc y abcdef z\n", "x *** y *** z\n");
+        all_splits(&["ab\ncd"], "ab\ncd\n", "***\n");
+        all_splits(
+            &["secret-value"],
+            "a secret-value b\nsecret-\n",
+            "a *** b\nsecret-\n",
+        );
+        all_splits(&["aaa"], "aaaaa\n", "***aa\n");
+    }
+
+    #[test]
+    fn plain_output_is_emitted_without_delay() {
+        let mut m = Masker::new(vec![b"secret".to_vec()]);
+        assert_eq!(m.feed(b"hello\n"), b"hello\n");
+        assert_eq!(m.feed(b"a se"), b"a ");
+        assert_eq!(m.feed(b"xy"), b"sexy");
     }
 }
 

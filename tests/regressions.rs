@@ -1142,7 +1142,12 @@ fn replaced_keys_cannot_read_later_content() {
     }
     // The old group key does not open the group's new grants.
     let (_, old_group) = old.groups.get(&g).unwrap();
-    for gr in v3.state.grants.values().filter(|x| x.to == Principal::Group(g)) {
+    for gr in v3
+        .state
+        .grants
+        .values()
+        .filter(|x| x.to == Principal::Group(g))
+    {
         let aad = keyring::aad_grant(v3.state.vault_id, gr.node, gr.to);
         assert!(crypto::unwrap(old_group, &gr.wrapped, &aad).is_err());
     }

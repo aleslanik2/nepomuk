@@ -257,18 +257,84 @@ async fn save_secret(
     .await?
 }
 
+/// Writes a secret so that only the user can read it, also when the file already exists: the
+/// data goes to a new `0600` file next to the target, which then replaces it (a symlink at the
+/// target is replaced, not followed). The permissions of an existing file are not inherited.
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("not a file name"))?;
+    // `create_new` below refuses an existing file, so the name only has to be unlikely.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(
+        ".{}.nepomuk-{}-{nanos}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(data)?;
-    f.sync_all()
+    let result = (|| {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn export_tightens_an_existing_file_and_replaces_symlinks() {
+        let dir = std::env::temp_dir().join(format!("nepomuk-gui-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("secret.p12");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private(&target, b"new secret").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new secret");
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        super::write_private(&link, b"x").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left.len(), 3, "{left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Locks the session whenever the screen gets locked.

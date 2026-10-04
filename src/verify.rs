@@ -249,7 +249,10 @@ pub fn checkpoint_master_fp(file: &VaultFile) -> Option<String> {
 /// Stands for a user's replaced keys in `rekey_pending`: an id derived from those keys, which
 /// is never a real user or group.
 pub fn replaced_keys_principal(kem: &crypto::KemPublic, sig: &crypto::SigPublic) -> Principal {
-    let h = crypto::sha3(&[b"nepomuk/replaced-keys", crypto::fingerprint(kem, sig).as_bytes()]);
+    let h = crypto::sha3(&[
+        b"nepomuk/replaced-keys",
+        crypto::fingerprint(kem, sig).as_bytes(),
+    ]);
     Principal::User(Id(h[..16].try_into().unwrap()))
 }
 
