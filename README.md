@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
+    <img src="docs/brand/logo.svg" alt="nepomuk" width="320">
+  </picture>
+</p>
+
 # nepomuk
 
 **A post-quantum secrets vault that lives in a single file in git – with permissions enforced by cryptography, not by code.**

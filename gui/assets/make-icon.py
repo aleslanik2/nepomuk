@@ -1,4 +1,7 @@
-"""Renders the nepomuk app icon (a wax seal with a halo of five stars) to icon-source.png.
+"""Renders the nepomuk app icon (the vault door: an N behind a framed, hinged door) to icon-source.png.
+
+The same drawing is kept as vector art in icon.svg (200 x 200 units); this script rasterises it
+without any dependencies so the PNG can be regenerated anywhere.
 
 Pure Python, no dependencies: `python3 make-icon.py`, then `cargo tauri icon icon-source.png`.
 """
@@ -7,29 +10,32 @@ import struct
 import zlib
 
 N = 1024
-C = N / 2
+# The door is drawn on a 200-unit grid; leave a margin so the rounded square sits inside the
+# canvas like other desktop app icons.
+SIZE = 880
+OFFSET = (N - SIZE) / 2
+UNIT = SIZE / 200
 
-WAX = (158, 27, 50)
-WAX_LIGHT = (190, 48, 70)
-WAX_DARK = (112, 18, 36)
-BRASS = (214, 178, 96)
+NAVY = (22, 35, 63)  # #16233F
+TEAL = (95, 180, 170)  # #5FB4AA
+WHITE = (255, 255, 255)
 
 
 def smooth(d):
-    """Coverage from a signed distance (negative inside), one pixel of anti-aliasing."""
+    """Coverage from a signed distance in pixels (negative inside), one pixel of anti-aliasing."""
     return max(0.0, min(1.0, 0.5 - d))
 
 
-def star_points(cx, cy, r_out, r_in, rot):
-    pts = []
-    for i in range(10):
-        r = r_out if i % 2 == 0 else r_in
-        a = rot + i * math.pi / 5
-        pts.append((cx + r * math.sin(a), cy - r * math.cos(a)))
-    return pts
+def round_box(x, y, left, top, width, height, radius):
+    """Signed distance in grid units to a rounded rectangle."""
+    hw, hh = width / 2, height / 2
+    qx = abs(x - (left + hw)) - (hw - radius)
+    qy = abs(y - (top + hh)) - (hh - radius)
+    outside = math.hypot(max(qx, 0.0), max(qy, 0.0))
+    return outside + min(max(qx, qy), 0.0) - radius
 
 
-def poly_sdf(x, y, pts):
+def poly(x, y, pts):
     d = float("inf")
     inside = False
     n = len(pts)
@@ -39,36 +45,24 @@ def poly_sdf(x, y, pts):
         ex, ey = bx - ax, by - ay
         wx, wy = x - ax, y - ay
         t = max(0.0, min(1.0, (wx * ex + wy * ey) / (ex * ex + ey * ey)))
-        dx, dy = wx - ex * t, wy - ey * t
-        d = min(d, math.hypot(dx, dy))
+        d = min(d, math.hypot(wx - ex * t, wy - ey * t))
         if (ay > y) != (by > y) and x < ax + (y - ay) * ex / ey:
             inside = not inside
     return -d if inside else d
 
 
-stars = []
-for k in range(5):
-    a = math.radians(-60 + k * 30)  # an arc above the keyhole
-    cx = C + 262 * math.sin(a)
-    cy = C - 40 - 262 * math.cos(a)
-    pts = star_points(cx, cy, 44, 18, 0)
-    stars.append((pts, cx - 50, cx + 50, cy - 50, cy + 50))
+def scaled(pts, k=0.82):
+    """The N sits on the door at 82 % of its full size, centred."""
+    return [(100 + (px - 100) * k, 100 + (py - 100) * k) for px, py in pts]
 
 
-def keyhole_sdf(x, y):
-    d_circle = math.hypot(x - C, y - (C + 40)) - 66
-    # Trapezoid below the circle.
-    top, bottom = C + 60, C + 250
-    half_top, half_bottom = 30, 58
-    if y < top:
-        d_trap = top - y
-    elif y > bottom:
-        d_trap = y - bottom
-    else:
-        half = half_top + (half_bottom - half_top) * (y - top) / (bottom - top)
-        d_trap = abs(x - C) - half
-        d_trap = max(d_trap, top - y, y - bottom)
-    return min(d_circle, d_trap)
+def rect_pts(left, top, width, height):
+    return [(left, top), (left + width, top), (left + width, top + height), (left, top + height)]
+
+
+STEM_LEFT = scaled(rect_pts(52, 52, 24, 96))
+STEM_RIGHT = scaled(rect_pts(124, 52, 24, 96))
+DIAGONAL = scaled([(52, 52), (76, 52), (148, 148), (124, 148)])
 
 
 def mix(a, b, t):
@@ -78,30 +72,23 @@ def mix(a, b, t):
 rows = []
 for py in range(N):
     row = bytearray([0])
-    y = py + 0.5
+    y = (py + 0.5 - OFFSET) / UNIT
     for px in range(N):
-        x = px + 0.5
-        dx, dy = x - C, y - C
-        r = math.hypot(dx, dy)
-        th = math.atan2(dy, dx)
-        edge = 452 + 12 * math.sin(9 * th) + 6 * math.sin(23 * th + 1.3) + 4 * math.sin(41 * th + 0.4)
-        alpha = smooth(r - edge)
+        x = (px + 0.5 - OFFSET) / UNIT
+        alpha = smooth(round_box(x, y, 0, 0, 200, 200, 46) * UNIT)
         if alpha <= 0:
             row += b"\x00\x00\x00\x00"
             continue
-        # Light from the upper left.
-        shade = max(0.0, min(1.0, 0.55 - (dx + dy) / (2.4 * N)))
-        col = mix(WAX_DARK, WAX_LIGHT, shade)
-        # Pressed ring.
-        ring = smooth(abs(r - 352) - 10)
-        col = mix(col, WAX_DARK, ring * 0.85)
-        rim = smooth(abs(r - 366) - 2)
-        col = mix(col, WAX_LIGHT, rim * 0.6)
-        col = mix(col, WAX_DARK, smooth(keyhole_sdf(x, y)) * 0.95)
-        for pts, x0, x1, y0, y1 in stars:
-            if x0 <= x <= x1 and y0 <= y <= y1:
-                col = mix(col, BRASS, smooth(poly_sdf(x, y, pts)))
-        row += bytes([int(col[0]), int(col[1]), int(col[2]), int(alpha * 255)])
+        col = NAVY
+        # Door frame: a 4-unit outline of a rounded square inset by 24.
+        col = mix(col, TEAL, smooth((abs(round_box(x, y, 24, 24, 152, 152, 28)) - 2) * UNIT))
+        # Hinges on the left edge of the frame.
+        hinge = min(round_box(x, y, 17, 58, 10, 24, 3), round_box(x, y, 17, 118, 10, 24, 3))
+        col = mix(col, TEAL, smooth(hinge * UNIT))
+        if 50 <= x <= 150 and 50 <= y <= 150:
+            col = mix(col, WHITE, smooth(min(poly(x, y, STEM_LEFT), poly(x, y, STEM_RIGHT)) * UNIT))
+            col = mix(col, TEAL, smooth(poly(x, y, DIAGONAL) * UNIT))
+        row += bytes([round(col[0]), round(col[1]), round(col[2]), round(alpha * 255)])
     rows.append(bytes(row))
 
 

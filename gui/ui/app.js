@@ -30,7 +30,7 @@ function remember(entry) {
 function gate(sideText, ...main) {
   return h("div", { class: "gate" },
     h("aside", { class: "gate-side" },
-      h("div", { class: "stack" }, h("div", { class: "wordmark" }, "nepomuk"), sideText),
+      h("div", { class: "stack" }, h("div", { class: "wordmark" }, h("img", { src: "icon.svg", alt: "" }), "nepomuk"), sideText),
       h("p", { class: "muted" }, "Keys never leave this computer. Every change is signed and checked by every client.")),
     h("main", { class: "gate-main" }, ...main));
 }
