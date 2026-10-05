@@ -115,9 +115,36 @@ pub fn notice(user: &config::UserConfig) -> Option<String> {
     c.notified_at = Some(now);
     save(&c);
     Some(format!(
-        "nepomuk {latest} is available (you have {}); run `nepomuk upgrade`",
-        current()
+        "nepomuk {latest} is available (you have {}); run `{}`",
+        current(),
+        upgrade_command()
     ))
+}
+
+/// Installed by Homebrew: the binary lives in its Cellar, and only `brew` may replace it.
+pub fn homebrew() -> bool {
+    std::env::current_exe()
+        .and_then(|e| e.canonicalize())
+        .is_ok_and(|e| e.components().any(|c| c.as_os_str() == "Cellar"))
+}
+
+/// How this installation is upgraded.
+pub fn upgrade_command() -> &'static str {
+    if homebrew() {
+        "brew upgrade nepomuk"
+    } else {
+        "nepomuk upgrade"
+    }
+}
+
+/// The desktop app installed by the Homebrew cask: `brew upgrade --cask` updates it.
+fn app_from_homebrew() -> bool {
+    [
+        "/opt/homebrew/Caskroom/nepomuk-gui",
+        "/usr/local/Caskroom/nepomuk-gui",
+    ]
+    .iter()
+    .any(|p| Path::new(p).is_dir())
 }
 
 fn spawn_refresh() {
@@ -369,6 +396,11 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
             "this nepomuk is part of the desktop app; upgrade the command line installation instead",
         ));
     }
+    if homebrew() {
+        return Err(Error::usage(
+            "this nepomuk was installed by Homebrew; run `brew upgrade nepomuk` (and `brew upgrade --cask nepomuk-gui` for the app)",
+        ));
+    }
     // A fresh directory only this user can enter: the release key, the signed sums and the
     // installer that is run must not be replaceable by other users of a shared temp dir.
     let work = std::env::temp_dir().join(format!(
@@ -403,7 +435,8 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
             ));
         }
         let app = installed_app(&exe_dir);
-        let with_gui = gui.unwrap_or(app.is_some());
+        // An app from the Homebrew cask is left to `brew upgrade --cask`.
+        let with_gui = gui.unwrap_or(app.is_some() && !app_from_homebrew());
         // The installer reads its defaults from the environment too; a pinned hash there
         // would replace the signature check, so only the arguments given here count.
         let installer_env = [
