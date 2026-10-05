@@ -1,7 +1,7 @@
 //! Replaying and verifying the log (§5.4, §7, §8): every client checks every signature and
 //! that each operation's author held the required right at that moment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::crypto;
 use crate::error::{Code, Error, Result};
@@ -40,9 +40,10 @@ impl State {
     /// Node and all its ancestors, starting with the node itself.
     pub fn ancestors(&self, node: Id) -> Vec<Id> {
         let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut cur = Some(node);
         while let Some(id) = cur {
-            if out.contains(&id) {
+            if !seen.insert(id) {
                 break;
             }
             out.push(id);
@@ -59,17 +60,33 @@ impl State {
             .collect()
     }
 
-    /// The node and all its descendants in pre-order.
+    /// The node and all its descendants in pre-order. One pass over the nodes: the log is
+    /// written by its users, and a large folder must not make every client quadratic.
     pub fn subtree(&self, node: Id) -> Vec<Id> {
+        let mut kids: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+        for n in self.nodes.values() {
+            if let Some(p) = n.parent {
+                kids.entry(p).or_default().push(n.id);
+            }
+        }
         let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut stack = vec![node];
         while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
             out.push(id);
-            let mut kids = self.children(id);
-            kids.reverse();
-            stack.extend(kids);
+            if let Some(k) = kids.get(&id) {
+                stack.extend(k.iter().rev());
+            }
         }
         out
+    }
+
+    /// Number of folders above the node.
+    fn depth(&self, node: Id) -> usize {
+        self.ancestors(node).len() - 1
     }
 
     pub fn grants_on(&self, nodes: &[Id]) -> Vec<&Grant> {
@@ -394,6 +411,13 @@ pub fn verify_file_with(file: VaultFile, pinned_fp: &str, former: &[String]) -> 
         ) {
             return Err(sig_err(format!("#{}: invalid signature", body.seq)).with("seq", body.seq));
         }
+        if body.ops.len() > MAX_OPS {
+            return Err(Error::new(
+                Code::UnauthorizedOperation,
+                format!("#{}: too many operations in one commit", body.seq),
+            )
+            .with("seq", body.seq));
+        }
         let mut next = state.clone();
         for op in &body.ops {
             apply_op(&mut next, body.author, op).map_err(|e| {
@@ -463,6 +487,12 @@ fn touched_node(op: &Op) -> Option<Id> {
 
 // ---------------------------------------------------------------- Authorization of operations
 
+/// Limits on what one author can make every client replay (§7): far above any real vault,
+/// low enough that verification stays fast.
+pub const MAX_DEPTH: usize = 64;
+pub const MAX_NODES: usize = 100_000;
+pub const MAX_OPS: usize = 10_000;
+
 fn deny(m: impl Into<String>) -> Error {
     Error::unauthorized(m)
 }
@@ -523,6 +553,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "user name already exists",
             )?;
             require(!user.disabled, "new user must be enabled")?;
+            require(
+                crate::identity::validate_name(&user.name).is_ok(),
+                "invalid user name",
+            )?;
             check_identity(
                 &user.name,
                 user.kind,
@@ -692,6 +726,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(!s.groups.contains_key(&group.id), "group id already exists")?;
             require(
+                crate::identity::validate_name(&group.name).is_ok(),
+                "invalid group name",
+            )?;
+            require(
                 s.group_by_name(&group.name).is_none(),
                 "group name already exists",
             )?;
@@ -817,6 +855,8 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.has_right(author, parent, Right::Write),
                 "requires `write` on the parent",
             )?;
+            require(s.nodes.len() < MAX_NODES, "too many nodes in the vault")?;
+            require(s.depth(parent) < MAX_DEPTH, "folders nested too deep")?;
             s.nodes.insert(node.id, node.clone());
         }
         Op::UpdateNode { id, content } => {
@@ -875,7 +915,17 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 before == Some(Right::Admin) || s.effective_right(author, *parent) <= before,
                 "moving it would give you more rights on it; requires `admin` on it",
             )?;
-            check_rewrapped(s, grants, &s.subtree(*id))?;
+            let sub = s.subtree(*id);
+            check_rewrapped(s, grants, &sub)?;
+            let below = sub
+                .iter()
+                .map(|n| s.depth(*n) - s.depth(*id))
+                .max()
+                .unwrap_or(0);
+            require(
+                s.depth(*parent) + 1 + below <= MAX_DEPTH,
+                "folders nested too deep",
+            )?;
             // Whoever still knows the key of a folder it leaves also knows its key: the marks
             // of the former ancestors come along.
             let former: Vec<Id> = s.ancestors(*id).into_iter().skip(1).collect();

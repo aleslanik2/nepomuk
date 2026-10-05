@@ -1748,3 +1748,71 @@ fn group_removal_drops_disabled_members() {
     assert!(Access::build(&v.state, a, &alice).nodes.is_empty());
     assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
 }
+
+/// Audit 2026-10-05, L1: names are checked only by honest writers. A node whose decrypted name
+/// would forge a path or terminal output is not shown, and the verifier refuses such user and
+/// group names.
+#[test]
+fn deceptive_names_from_the_vault_are_refused() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mkdir("/p", false).unwrap();
+    t.put("/p/doc", Content::Text { value: "x".into() }, None)
+        .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let me = tx::find_me(&v.state, &master).unwrap();
+    let acc = Access::build(&v.state, me, &master);
+    let doc = acc.resolve("/p/doc").unwrap();
+    let key = acc.key(doc).unwrap().clone();
+    for evil in ["a/b", "x\u{1b}]52;c;aGk=\u{7}", "\u{202e}cod.exe", ".."] {
+        let mut s = v.state.clone();
+        let sealed = keyring::seal_name(s.vault_id, doc, &key, evil);
+        let n = s.nodes.get_mut(&doc).unwrap();
+        n.name = sealed.sealed;
+        n.name_commit = sealed.commit;
+        let acc = Access::build(&s, me, &master);
+        assert!(acc.resolve("/p").is_some());
+        assert!(!acc.nodes.contains_key(&doc), "{evil:?} is shown");
+    }
+
+    let other = Unlocked::generate("other", IdentityKind::Local);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&other, None)).unwrap();
+    t.group_create("devs").unwrap();
+    let base = v.state.clone();
+    let mut user_op = t.ops[0].clone();
+    if let Op::AddUser { user } = &mut user_op {
+        user.name = "other\u{1b}[2J".into();
+    }
+    let e = nepomuk::verify::apply_op(&mut base.clone(), me, &user_op).unwrap_err();
+    assert!(e.message.contains("invalid user name"), "{}", e.message);
+    let mut group_op = t.ops[1].clone();
+    if let Op::CreateGroup { group } = &mut group_op {
+        group.name = "de\u{202e}vs".into();
+    }
+    let e = nepomuk::verify::apply_op(&mut base.clone(), me, &group_op).unwrap_err();
+    assert!(e.message.contains("invalid group name"), "{}", e.message);
+}
+
+/// Audit 2026-10-05, L2: every client replays the whole log, so one author must not be able to
+/// make it unbearably slow: nesting depth and the size of a commit are limited.
+#[test]
+fn replay_limits_depth_and_commit_size() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let v = new_vault(&master);
+    let deepest = format!("/{}", vec!["d"; nepomuk::verify::MAX_DEPTH].join("/"));
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mkdir(&deepest, true).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let e = t.mkdir(&format!("{deepest}/x"), false).unwrap_err();
+    assert!(e.message.contains("nested too deep"), "{}", e.message);
+
+    let me = tx::find_me(&v.state, &master).unwrap();
+    let ops = vec![Op::MarkRotation { node: v.state.root }; nepomuk::verify::MAX_OPS + 1];
+    let mut f = v.file.clone();
+    sign_commit(&mut f, &master, me, v.seq + 1, ops);
+    let e = verify_file(f, &master.fingerprint()).unwrap_err();
+    assert!(e.message.contains("too many operations"), "{}", e.message);
+}

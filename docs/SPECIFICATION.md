@@ -258,7 +258,7 @@ The file `vault.nepomuk` is a signed snapshot (checkpoint) followed by a chain o
 ### 7.1 Root of trust
 
 - Master key fingerprint = SHA3-256 of its length-prefixed public keys, displayed as `npk1…` (bech32).
-- The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override. Outside CI (no `CI`, `GITHUB_ACTIONS`, … variable) the variable never pins a vault seen for the first time, since the environment may come from the project (`.envrc`, IDE settings); in CI it does not replace a vault pinned at the same place before, and a vault pinned only by the environment does not mark its place.
+- The client knows it from a local pin (`nepomuk trust`, automatic on `init`) or from the `NEPOMUK_ROOT_FP` variable (CI). When a local pin exists, a different `NEPOMUK_ROOT_FP` is an error, not an override. Outside CI (no `CI`, `GITHUB_ACTIONS`, … variable) the variable never pins a vault seen for the first time, since the environment may come from the project (`.envrc`, IDE settings); the CI variables can come from there too, so with stdin on a terminal they count only together with an explicit `--ci`; in CI it does not replace a vault pinned at the same place before, and a vault pinned only by the environment does not mark its place.
 - `root_fp` in `.nepomuk.toml` is only a hint: it is shown next to the fingerprint the file claims, but never pinned automatically, because whoever controls the project repository could ship a vault of their own with a matching fingerprint. A pin that differs from it produces a warning.
 - Without a pin nepomuk does not open the file.
 - Replacing a pin is what an attacker who swaps the vault file wants, so `nepomuk trust` replaces a different pin only with `--replace` – unless the file proves the change: its checkpoint is signed by the master pinned here (or a former one) and its log transfers the master role to the new fingerprint. After the new master has compacted, that proof is gone and `--replace` is needed. Errors that would need it carry `needs_replace` and the currently pinned fingerprint.
@@ -306,6 +306,11 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1). A disabled user still in a group knows the group key: `DisableUser` puts its groups in `stale_groups` until a group admin removes it (`RemoveMember` gives the group a new key), so rekeys and grants for the group stay recorded. `RemoveMember` may leave disabled members out of the new group key; they then leave the group too, and the group stays in `stale_groups` while a disabled member remains |
 | `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
+Everything in the log is written by its users, and a custom client writes anything, so every client also checks what honest clients only produce:
+
+- user and group names consist of letters, digits and `@._+-` (`AddUser`, `CreateGroup`); a node whose decrypted name is empty, `.`, `..`, contains `/`, `#`, control or invisible/bidirectional formatting characters, or is longer than 255 bytes is not shown; text from the vault is printed with control characters escaped;
+- folders are nested at most 64 levels, a vault holds at most 100 000 nodes and a commit at most 10 000 operations, so that replaying the log stays fast for everyone.
+
 ### 8.1 Revocation and rekey
 
 1. `Revoke` removes the grant.
@@ -348,6 +353,7 @@ The company vault has its own repository, included in projects as a submodule. n
 - The submodule checkout is not modified; the submodule pointer in the project is not the source of the version.
 - Offline: reads come from the last fetched version with a warning about its age.
 - The vault path comes from `.nepomuk.toml`, i.e. from whoever controls the project repository. git is run with `safe.bareRepository=explicit`, `core.fsmonitor=false` and `protocol.ext.allow=never`, and a work tree whose top level has no `.git` is refused: a bare repository committed into a project carries its own `config`, which git would otherwise execute (e.g. through `fsmonitor` or the `ext::` transport) before any signature is checked.
+- A `.nepomuk.toml` is looked up in the current directory and its ancestors; on Unix one owned by another user is refused (as git's `safe.directory`), since a file planted e.g. in `/tmp` would decide where secrets are written. root may use any (CI containers with a checkout of another uid).
 
 ### 9.2 Writing with automatic push
 
@@ -358,7 +364,7 @@ The company vault has its own repository, included in projects as a submodule. n
 5. Push rejected → automatic `sync` and a new attempt, at most 5×, then `SYNC_CONTENTION`.
 6. The operation is complete only after a successful push.
 
-Offline, writes fail (`OFFLINE`). As an emergency option, `--offline`: a local commit and a persistent "not pushed" warning until the next `sync`.
+Offline, writes fail (`OFFLINE`). As an emergency option, `--offline`: a local commit and a persistent "not pushed" warning until the next `sync`. The queued intents are encrypted for the identity and signed by it; `sync` refuses a queue without a valid signature, since it would sign and push whatever the file contains.
 
 **Git commit messages** must not reveal anything: `nepomuk: #42 by alice (3 operations)`, no paths or names.
 
@@ -666,7 +672,7 @@ Proposed tree: `/infra`, `/projects/<project>/{signing,ci,runtime}`, `/teams/<te
 - Disable force-push and deletion of `main` (server-side rollback protection).
 - Do not require pull requests on `main` – it would block the automatic push.
 - Push only for people who have some write right in nepomuk; CI gets only a read-only deploy key.
-- These controls are defense in depth; the vault's security does not depend on them.
+- Confidentiality and the authorization of every change do not depend on these controls. Rollback protection does in part: a client detects a rollback or fork only against what it has seen itself (§7.2), so without protected `main` someone who lost their rights but can still push could reset the branch to a version from before the revocation and continue from there, accepted by any client that never saw the newer version. Protecting `main` and removing push access on offboarding are therefore required.
 
 ### 15.5 Binary distribution
 

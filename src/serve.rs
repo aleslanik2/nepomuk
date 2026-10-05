@@ -348,7 +348,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
                 crate::identity::Unlocked::generate(&email, crate::model::IdentityKind::Password);
             let cred = crate::identity::password_credential(&id, &password)?;
             let req = crate::identity::Request::new(&id, Some(cred));
-            std::fs::write(&out, req.to_text())?;
+            crate::config::write_private(&out, req.to_text().as_bytes())?;
             Ok(
                 json!({ "name": email, "request": out.display().to_string(), "fingerprint": req.fingerprint() }),
             )
@@ -370,7 +370,7 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
             crate::config::write_private(&out, f.to_text().as_bytes())?;
             let req = crate::identity::Request::new(&id, None);
             let req_path = out.with_extension("request");
-            std::fs::write(&req_path, req.to_text())?;
+            crate::config::write_private(&req_path, req.to_text().as_bytes())?;
             Ok(
                 json!({ "name": name, "identity": out.display().to_string(), "request": req_path.display().to_string(), "fingerprint": id.fingerprint() }),
             )
@@ -506,6 +506,8 @@ fn dispatch(ctx: &mut Ctx, method: &str, p: &Value) -> Result<Value> {
 }
 
 pub fn run(mut ctx: Ctx) -> i32 {
+    // Secret files of an `exec.run` whose process was killed (a forced lock in the GUI).
+    crate::exec::cleanup_stale();
     ctx.opts.json = true;
     ctx.opts.session = true;
     let timeout = Duration::from_secs(ctx.user.session_timeout.unwrap_or(DEFAULT_TIMEOUT));

@@ -496,17 +496,22 @@ fn run_inner(spec: ExecSpec, command: &[String], capture: bool) -> Result<(i32, 
         .map_err(|e| Error::general(format!("cannot start {}: {e}", command[0])))?;
     CHILD.store(child.id() as i32, Ordering::SeqCst);
     #[cfg(unix)]
-    unsafe {
+    let previous = unsafe {
         let h = forward as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGHUP, h);
+        let term = libc::signal(libc::SIGTERM, h);
+        let hup = libc::signal(libc::SIGHUP, h);
         // Ctrl+C on a terminal reaches the whole process group already.
-        if libc::isatty(0) == 1 {
-            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        let int = if libc::isatty(0) == 1 {
+            libc::signal(libc::SIGINT, libc::SIG_IGN)
         } else {
-            libc::signal(libc::SIGINT, h);
-        }
-    }
+            libc::signal(libc::SIGINT, h)
+        };
+        [
+            (libc::SIGTERM, term),
+            (libc::SIGHUP, hup),
+            (libc::SIGINT, int),
+        ]
+    };
     let mut threads: Vec<std::thread::JoinHandle<Vec<u8>>> = Vec::new();
     if spec.mask {
         let out = child.stdout.take().unwrap();
@@ -543,6 +548,11 @@ fn run_inner(spec: ExecSpec, command: &[String], capture: bool) -> Result<(i32, 
     captured.resize(2, String::new());
     CHILD.store(0, Ordering::SeqCst);
     drop(cleanup);
+    // `serve` keeps running: a later SIGTERM must end it again.
+    #[cfg(unix)]
+    for (sig, h) in previous {
+        unsafe { libc::signal(sig, h) };
+    }
     for m in mask.iter_mut() {
         zeroize::Zeroize::zeroize(m);
     }

@@ -31,6 +31,9 @@ struct AppState {
     /// What the sidecar was started for, to start a fresh one after a forced lock.
     target: Mutex<Option<(Option<PathBuf>, Option<PathBuf>)>>,
     clipboard: clipboard::SecretClipboard,
+    /// Files the user chose in a system dialog: the only ones the webview may have the CLI
+    /// read or write.
+    picked: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppState {
@@ -81,9 +84,22 @@ async fn connect(
 }
 
 #[tauri::command]
-async fn disconnect(state: State<'_, AppState>) -> Result<(), Value> {
-    state.sidecar.lock().unwrap().take();
-    Ok(())
+async fn disconnect(app: AppHandle) -> Result<(), Value> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let _one = state.locking.lock().unwrap();
+        state
+            .locks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.clipboard.clear_secret();
+        // A running `exec` keeps a reference: end the process (and its children) explicitly.
+        let sc = state.sidecar.lock().unwrap().take();
+        if let Some(sc) = sc {
+            let _ = sc.call_within("session.lock", json!({}), Some(LOCK_WAIT));
+            sc.kill();
+        }
+    })
+    .await
 }
 
 /// How long a lock may wait for the CLI before the CLI is ended instead.
@@ -123,6 +139,63 @@ async fn lock_session(app: AppHandle) -> Result<Value, Value> {
     blocking(move || lock_now(&app)).await
 }
 
+/// CLI methods the window may call. The backend calls `version` and `session.lock` itself;
+/// anything the CLI adds later is not exposed until it is listed here.
+const RPC_METHODS: &[&str] = &[
+    "session.unlock",
+    "update.status",
+    "touchid.status",
+    "touchid.disable",
+    "vault.status",
+    "vault.info",
+    "vault.verify",
+    "vault.log",
+    "vault.trust",
+    "whoami",
+    "node.list",
+    "node.get",
+    "node.put",
+    "node.mkdir",
+    "node.describe",
+    "node.rm",
+    "node.mv",
+    "node.rekey",
+    "access.list",
+    "grant.add",
+    "grant.revoke",
+    "sysright.grant",
+    "sysright.revoke",
+    "user.list",
+    "user.add",
+    "user.disable",
+    "user.offboard",
+    "user.replace",
+    "group.list",
+    "group.create",
+    "group.add",
+    "group.remove",
+    "rotation.list",
+    "rotation.done",
+    "sync.run",
+    "identity.request",
+    "identity.new",
+    "request.inspect",
+    "identity.local",
+    "templates.list",
+    "user.access",
+    "exec.profiles",
+    "passgen",
+    "password.check",
+    "exec.run",
+];
+
+/// Parameters naming a file the CLI reads or writes: they must come from a system dialog.
+const PATH_PARAMS: &[(&str, &str)] = &[
+    ("identity.request", "out"),
+    ("identity.new", "out"),
+    ("request.inspect", "path"),
+];
+
 /// Forwards one JSON-RPC call to the CLI.
 #[tauri::command]
 async fn rpc(
@@ -130,8 +203,38 @@ async fn rpc(
     method: String,
     params: Option<Value>,
 ) -> Result<Value, Value> {
+    if !RPC_METHODS.contains(&method.as_str()) {
+        return Err(err(
+            "GUI_METHOD_DENIED",
+            format!("{method} is not available"),
+        ));
+    }
+    let params = params.unwrap_or_else(|| json!({}));
+    for (m, key) in PATH_PARAMS {
+        if *m == method {
+            let path = params.get(*key).and_then(Value::as_str).unwrap_or_default();
+            if !state.picked.lock().unwrap().contains(path) {
+                return Err(err(
+                    "GUI_PATH_DENIED",
+                    "choose the file in the system dialog",
+                ));
+            }
+        }
+    }
     let sc = state.current()?;
-    blocking(move || sc.call(&method, params.unwrap_or_else(|| json!({})))).await?
+    blocking(move || sc.call(&method, params)).await?
+}
+
+/// Remembers a file chosen in a system dialog (see `PATH_PARAMS`).
+fn remember(app: &AppHandle, path: Option<String>) -> Option<String> {
+    if let Some(p) = &path {
+        app.state::<AppState>()
+            .picked
+            .lock()
+            .unwrap()
+            .insert(p.clone());
+    }
+    path
 }
 
 fn path_string(p: tauri_plugin_dialog::FilePath) -> Option<String> {
@@ -143,7 +246,7 @@ fn path_string(p: tauri_plugin_dialog::FilePath) -> Option<String> {
 async fn pick(app: AppHandle, kind: String) -> Result<Option<String>, Value> {
     blocking(move || {
         let d = app.dialog().file();
-        match kind.as_str() {
+        let path = match kind.as_str() {
             "vault" => d
                 .set_title("Open a vault")
                 .add_filter("nepomuk vault", &["nepomuk"])
@@ -161,7 +264,8 @@ async fn pick(app: AppHandle, kind: String) -> Result<Option<String>, Value> {
                 .blocking_pick_file(),
             _ => d.blocking_pick_file(),
         }
-        .and_then(path_string)
+        .and_then(path_string);
+        remember(&app, path)
     })
     .await
 }
@@ -169,11 +273,13 @@ async fn pick(app: AppHandle, kind: String) -> Result<Option<String>, Value> {
 #[tauri::command]
 async fn pick_save(app: AppHandle, default_name: String) -> Result<Option<String>, Value> {
     blocking(move || {
-        app.dialog()
+        let path = app
+            .dialog()
             .file()
             .set_file_name(&default_name)
             .blocking_save_file()
-            .and_then(path_string)
+            .and_then(path_string);
+        remember(&app, path)
     })
     .await
 }
@@ -188,15 +294,29 @@ async fn pick_file_b64(app: AppHandle) -> Result<Option<Value>, Value> {
             .set_title("Choose a file to store")
             .blocking_pick_file()
             .and_then(|p| p.into_path().ok())?;
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_FILE) {
+            return Some(Err(err(
+                "GUI_FILE_TOO_LARGE",
+                format!(
+                    "{} is larger than {} MiB",
+                    path.display(),
+                    MAX_FILE / 1024 / 1024
+                ),
+            )));
+        }
         let data = Zeroizing::new(std::fs::read(&path).ok()?);
-        Some(json!({
+        Some(Ok(json!({
             "name": path.file_name().map(|n| n.to_string_lossy().to_string()),
             "size": data.len(),
             "base64": base64::engine::general_purpose::STANDARD.encode(&*data),
-        }))
+        })))
     })
-    .await
+    .await?
+    .transpose()
 }
+
+/// Files stored from the GUI pass through the webview as base64; the vault lives in git.
+const MAX_FILE: u64 = 16 * 1024 * 1024;
 
 fn secret_bytes(v: &Value) -> Result<Zeroizing<Vec<u8>>, Value> {
     if let Some(s) = v.get("value").and_then(Value::as_str) {
@@ -397,6 +517,7 @@ fn main() {
             locking: Mutex::new(()),
             target: Mutex::new(None),
             clipboard: clipboard::SecretClipboard::start(),
+            picked: Mutex::new(Default::default()),
         })
         .setup(|app| {
             watch_screen_lock(app.handle().clone());
@@ -414,6 +535,14 @@ fn main() {
             copy_plain,
             save_secret
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the nepomuk GUI");
+        .build(tauri::generate_context!())
+        .expect("error while building the nepomuk GUI")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // A copied secret would otherwise stay on the clipboard after the app is gone.
+                app.state::<AppState>()
+                    .clipboard
+                    .clear_secret_now(Duration::from_secs(1));
+            }
+        });
 }

@@ -27,10 +27,13 @@ pub fn err(code: &str, message: impl Into<String>) -> Value {
     json!({ "code": code, "message": message.into(), "details": {} })
 }
 
-/// The CLI next to the GUI executable (Tauri bundles `externalBin` there), `NEPOMUK_CLI`
-/// for development, or `nepomuk` from PATH.
+/// The CLI next to the GUI executable (Tauri bundles `externalBin` there). It receives the
+/// password, so a release build uses nothing else; development builds also take `NEPOMUK_CLI`
+/// or `nepomuk` from PATH.
 pub fn locate_cli() -> PathBuf {
-    if let Some(p) = std::env::var_os("NEPOMUK_CLI") {
+    if cfg!(debug_assertions)
+        && let Some(p) = std::env::var_os("NEPOMUK_CLI")
+    {
         return PathBuf::from(p);
     }
     let exe_name = if cfg!(windows) {
@@ -42,7 +45,7 @@ pub fn locate_cli() -> PathBuf {
         && let Some(dir) = exe.parent()
     {
         let p = dir.join(exe_name);
-        if p.is_file() {
+        if p.is_file() || !cfg!(debug_assertions) {
             return p;
         }
     }
@@ -187,11 +190,24 @@ impl Sidecar {
     /// Ends the process now – it holds the unlocked identity only in memory – and, on Unix,
     /// everything it started that is still in its process group (`exec` children). Children
     /// that left the group (daemons) and, on Windows, any child keep running.
+    ///
+    /// SIGTERM first: the CLI passes it on to a running `exec` command and then removes the
+    /// secret files it wrote for it (macOS), which SIGKILL would leave behind.
     pub fn kill(&self) {
         self.ended.store(true, Ordering::SeqCst);
         if let Ok(mut c) = self.child.lock() {
             #[cfg(unix)]
             if let Ok(pid) = i32::try_from(c.id()) {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                let until = std::time::Instant::now() + TERM_WAIT;
+                while std::time::Instant::now() < until {
+                    if matches!(c.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
@@ -202,13 +218,14 @@ impl Sidecar {
     }
 }
 
+/// How long `kill` gives the CLI to clean up after SIGTERM.
+#[cfg(unix)]
+const TERM_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Closing stdin ends `serve --stdio`, which forgets the identity.
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        // Together with what it started: `exec` children hold secrets too.
+        self.kill();
     }
 }
 

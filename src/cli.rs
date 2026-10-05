@@ -476,6 +476,20 @@ fn scalar(v: &Value) -> String {
     }
 }
 
+/// Text from the vault is written by its users; a terminal must not interpret it (escape
+/// sequences can rewrite earlier lines, set the clipboard or fake links).
+fn for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\n' || c == '\t' || !crate::tx::is_deceptive(c) {
+            out.push(c);
+        } else {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        }
+    }
+    out
+}
+
 pub fn print_ok(ctx: &Ctx, out: &Out) {
     let warnings: Vec<String> = ctx.warnings.borrow().clone();
     if ctx.opts.json {
@@ -491,7 +505,7 @@ pub fn print_ok(ctx: &Ctx, out: &Out) {
         );
     } else {
         for w in &warnings {
-            eprintln!("warning: {w}");
+            eprintln!("warning: {}", for_terminal(w));
         }
         let text = match &out.human {
             Some(h) => h.clone(),
@@ -501,6 +515,7 @@ pub fn print_ok(ctx: &Ctx, out: &Out) {
                 s
             }
         };
+        let text = for_terminal(&text);
         print!("{text}");
         if !text.is_empty() && !text.ends_with('\n') {
             println!();
@@ -552,9 +567,9 @@ pub fn print_err(json_mode: bool, e: &Error) {
     if json_mode {
         println!("{}", error_json(e));
     } else {
-        eprintln!("error: {} [{}]", e.message, e.code.as_str());
+        eprintln!("error: {} [{}]", for_terminal(&e.message), e.code.as_str());
         for (k, v) in &e.details {
-            eprintln!("  {k}: {}", scalar(v));
+            eprintln!("  {k}: {}", for_terminal(&scalar(v)));
         }
     }
 }
@@ -563,6 +578,7 @@ pub fn print_err(json_mode: bool, e: &Error) {
 
 pub fn main() -> i32 {
     crate::memory::harden_process();
+    crate::config::take_secret_env();
     let args: Vec<String> = std::env::args().collect();
     let json_mode = args.iter().any(|a| a == "--json");
     let cli = match Cli::try_parse_from(&args) {
@@ -592,6 +608,13 @@ pub fn main() -> i32 {
         }
     };
     let g = cli.global;
+    // Children (exec, the agent, git) must not inherit the password descriptor.
+    #[cfg(unix)]
+    if let Some(fd) = g.password_fd
+        && fd >= 0
+    {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     let opts = Options {
         vault: g.vault,
         json: g.json,
@@ -642,7 +665,7 @@ pub fn main() -> i32 {
         Err(e) => {
             if !ctx.opts.json {
                 for w in ctx.warnings.borrow().iter() {
-                    eprintln!("warning: {w}");
+                    eprintln!("warning: {}", for_terminal(w));
                 }
             }
             print_err(ctx.opts.json, &e);
@@ -1164,7 +1187,7 @@ pub fn run(ctx: &Ctx, cmd: Cmd) -> Result<Out> {
             ))
         }
         Cmd::GitTextconv { file } => {
-            print!("{}", textconv(&std::fs::read(&file)?));
+            print!("{}", for_terminal(&textconv(&std::fs::read(&file)?)));
             Ok(Out {
                 data: Value::Null,
                 human: None,
@@ -1347,7 +1370,7 @@ fn identity_cmd(ctx: &Ctx, c: IdentityCmd) -> Result<Out> {
                     "use --email <email>, --local (identity file) or --ssh-key <key>",
                 ));
             };
-            std::fs::write(&out, req.to_text())?;
+            crate::config::write_private(&out, req.to_text().as_bytes())?;
             let h = format!(
                 "Request written to {}\nFingerprint: {}\nSend the file to an administrator and confirm the fingerprint with them.\n",
                 out.display(),
@@ -1627,7 +1650,7 @@ fn get(ctx: &Ctx, spec: &str, out: Option<PathBuf>) -> Result<Out> {
     }
     stdout.flush()?;
     for w in ctx.warnings.borrow().iter() {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", for_terminal(w));
     }
     Ok(Out {
         data: Value::Null,
@@ -1659,7 +1682,7 @@ fn exec(ctx: &Ctx, name: &str, mask: bool, no_mask: bool, command: &[String]) ->
     let (env, files) = queries::profile_values(ctx, &o, &profile)?;
     drop(o);
     for w in ctx.warnings.borrow().iter() {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", for_terminal(w));
     }
     let mask = !no_mask && (mask || ctx.ci());
     let code = crate::exec::run(crate::exec::ExecSpec { env, files, mask }, command)?;

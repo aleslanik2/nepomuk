@@ -14,6 +14,8 @@ enum Msg {
     },
     /// Clears a copied secret now (the session got locked).
     ClearSecret,
+    /// Clears a copied secret and reports back (the app quits).
+    ClearAndAck(mpsc::Sender<()>),
 }
 
 pub struct SecretClipboard {
@@ -40,25 +42,23 @@ impl SecretClipboard {
                         secret,
                         clear_after,
                     }) => {
-                        let set = cb.set();
-                        let set = if secret { exclude(set) } else { set };
-                        if set.text(text.as_str()).is_ok() && secret {
+                        let ok = if secret {
+                            set_secret(&mut cb, &text)
+                        } else {
+                            cb.set().text(text.as_str()).is_ok()
+                        };
+                        if ok && secret {
                             armed = Some((text, std::time::Instant::now() + clear_after));
                         } else {
                             armed = None;
                         }
                     }
                     Ok(Msg::ClearSecret) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some((value, _)) = armed.take() {
-                            // Clear only if nothing else was copied meanwhile.
-                            if cb
-                                .get_text()
-                                .map(Zeroizing::new)
-                                .is_ok_and(|t| *t == *value)
-                            {
-                                let _ = cb.clear();
-                            }
-                        }
+                        clear_if_unchanged(&mut cb, armed.take());
+                    }
+                    Ok(Msg::ClearAndAck(ack)) => {
+                        clear_if_unchanged(&mut cb, armed.take());
+                        let _ = ack.send(());
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -80,6 +80,15 @@ impl SecretClipboard {
         let _ = self.tx.send(Msg::ClearSecret);
     }
 
+    /// Clears a copied secret and waits (at most `limit`) until it is done: the clipboard
+    /// outlives the app on macOS and Windows.
+    pub fn clear_secret_now(&self, limit: Duration) {
+        let (ack, done) = mpsc::channel();
+        if self.tx.send(Msg::ClearAndAck(ack)).is_ok() {
+            let _ = done.recv_timeout(limit);
+        }
+    }
+
     pub fn copy_plain(&self, text: String) {
         let _ = self.tx.send(Msg::Copy {
             text: Zeroizing::new(text),
@@ -89,20 +98,75 @@ impl SecretClipboard {
     }
 }
 
+/// Clears the clipboard if it still holds `armed`, i.e. nothing else was copied meanwhile.
+fn clear_if_unchanged(
+    cb: &mut arboard::Clipboard,
+    armed: Option<(Zeroizing<String>, std::time::Instant)>,
+) {
+    if let Some((value, _)) = armed
+        && cb
+            .get_text()
+            .map(Zeroizing::new)
+            .is_ok_and(|t| *t == *value)
+    {
+        let _ = cb.clear();
+    }
+}
+
+/// macOS: arboard marks the item concealed only after writing it, and lets Universal
+/// Clipboard hand it to the user's other devices. Written directly instead: for this Mac only,
+/// with the concealed and transient markers in the same change.
 #[cfg(target_os = "macos")]
-fn exclude(set: arboard::Set<'_>) -> arboard::Set<'_> {
-    use arboard::SetExtApple;
-    set.exclude_from_history()
+fn set_secret(_cb: &mut arboard::Clipboard, text: &str) -> bool {
+    set_secret_on(&objc2_app_kit::NSPasteboard::generalPasteboard(), text)
+}
+
+#[cfg(target_os = "macos")]
+fn set_secret_on(pb: &objc2_app_kit::NSPasteboard, text: &str) -> bool {
+    use objc2_app_kit::{NSPasteboardContentsOptions, NSPasteboardTypeString};
+    use objc2_foundation::{NSData, NSString};
+    pb.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+    let ok = pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+    let empty = NSData::new();
+    for marker in [
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.TransientType",
+    ] {
+        pb.setData_forType(Some(&empty), &NSString::from_str(marker));
+    }
+    ok
 }
 
 #[cfg(windows)]
-fn exclude(set: arboard::Set<'_>) -> arboard::Set<'_> {
+fn set_secret(cb: &mut arboard::Clipboard, text: &str) -> bool {
     use arboard::SetExtWindows;
-    set.exclude_from_history()
+    cb.set().exclude_from_history().text(text).is_ok()
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn exclude(set: arboard::Set<'_>) -> arboard::Set<'_> {
+fn set_secret(cb: &mut arboard::Clipboard, text: &str) -> bool {
     use arboard::SetExtLinux;
-    set.exclude_from_history()
+    cb.set().exclude_from_history().text(text).is_ok()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+
+    #[test]
+    fn secret_is_concealed_and_transient() {
+        // A private pasteboard: the test must not touch the user's clipboard.
+        let pb = NSPasteboard::pasteboardWithUniqueName();
+        assert!(super::set_secret_on(&pb, "hunter2"));
+        let s = pb.stringForType(unsafe { NSPasteboardTypeString }).unwrap();
+        assert_eq!(s.to_string(), "hunter2");
+        let types: Vec<String> = pb.types().unwrap().iter().map(|t| t.to_string()).collect();
+        for marker in [
+            "org.nspasteboard.ConcealedType",
+            "org.nspasteboard.TransientType",
+        ] {
+            assert!(types.iter().any(|t| t == marker), "{types:?}");
+        }
+        pb.clearContents();
+    }
 }

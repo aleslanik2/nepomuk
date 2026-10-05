@@ -300,6 +300,11 @@ impl Access {
                 let Ok(cname) = open_name(self.vault, c, &ck) else {
                     continue;
                 };
+                // Names are checked only by honest writers: one with `/`, control or bidi
+                // characters would forge paths or terminal output for every reader.
+                if crate::tx::validate_name(&cname).is_err() {
+                    continue;
+                }
                 let salt = name_salt(&ck);
                 if c.name_commit != name_commit(self.vault, child, &salt, &cname) {
                     continue;

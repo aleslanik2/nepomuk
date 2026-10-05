@@ -148,7 +148,7 @@ impl Ctx {
             return Ok(l);
         }
         for v in env {
-            if let Ok(x) = std::env::var(v) {
+            if let Some(x) = config::env_var(v) {
                 return Ok(Zeroizing::new(x));
             }
         }
@@ -165,7 +165,7 @@ impl Ctx {
         let tty = self.password_override.borrow().is_none()
             && self.opts.password_fd.is_none()
             && !self.opts.password_stdin
-            && !env.iter().any(|v| std::env::var(v).is_ok())
+            && !env.iter().any(|v| config::env_var(v).is_some())
             && !self.opts.json
             && tty_available();
         let p = self.secret(prompt, env)?;
@@ -528,7 +528,10 @@ fn pin_for(
         if mem.pin.is_none() {
             // Outside CI the environment may come from the project (.envrc, IDE settings):
             // a vault seen for the first time is pinned only by `nepomuk trust`.
-            if !ctx.ci() {
+            // CI detected from the environment can come from the same .envrc; a terminal
+            // means a person is at the keyboard, so there it takes an explicit `--ci`.
+            let ci = ctx.opts.ci || (config::is_ci() && !std::io::stdin().is_terminal());
+            if !ci {
                 return Err(Error::new(
                     Code::UntrustedRoot,
                     "NEPOMUK_ROOT_FP is only for CI; on this computer verify the fingerprint out of band and run `nepomuk trust <fingerprint>`",
@@ -1271,10 +1274,19 @@ struct PendingItem {
 struct PendingFile {
     identity: String,
     items: crypto::Wrapped,
+    /// Signature of the identity over vault id and `items`: the items are wrapped for the
+    /// public key only, so without it anyone who can write the state directory could queue
+    /// changes that `sync` would sign and push.
+    #[serde(default, with = "serde_bytes")]
+    sig: Vec<u8>,
 }
 
 fn pending_aad(vault: crate::model::Id) -> Vec<u8> {
     [&vault.0[..], b"pending"].concat()
+}
+
+fn pending_signed(vault: crate::model::Id, items: &crypto::Wrapped) -> Vec<u8> {
+    [&vault.0[..], &to_cbor(items)].concat()
 }
 
 fn load_pending(ctx: &Ctx, vault: crate::model::Id, id: &dyn Keys) -> Result<Vec<PendingItem>> {
@@ -1286,6 +1298,20 @@ fn load_pending(ctx: &Ctx, vault: crate::model::Id, id: &dyn Keys) -> Result<Vec
     if f.identity != id.fingerprint() {
         ctx.warn("pending offline changes belong to another identity and were left untouched");
         return Ok(Vec::new());
+    }
+    if !crypto::verify(
+        id.sig_public(),
+        "pending",
+        &pending_signed(vault, &f.items),
+        &f.sig,
+    ) {
+        return Err(Error::new(
+            Code::General,
+            format!(
+                "{}: pending offline changes are not signed by your identity; remove the file if you did not expect it",
+                p.display()
+            ),
+        ));
     }
     let plain = id.unwrap(&f.items, &pending_aad(vault))?;
     from_cbor(&plain)
@@ -1299,11 +1325,13 @@ fn save_pending(vault: crate::model::Id, id: &dyn Keys, items: &[PendingItem]) -
     }
     let plain = Zeroizing::new(to_cbor(&items));
     let items = crypto::wrap(id.kem_public(), &plain, &pending_aad(vault))?;
+    let sig = id.sign("pending", &pending_signed(vault, &items))?;
     config::write_private(
         &p,
         &to_cbor(&PendingFile {
             identity: id.fingerprint(),
             items,
+            sig,
         }),
     )
 }

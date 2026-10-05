@@ -329,6 +329,26 @@ impl KemSecret {
     }
 }
 
+// The wipe below relies on the key pair being exactly the two keys' bytes.
+const _: () = assert!(
+    std::mem::size_of::<mlkem1024::MlKem1024KeyPair>()
+        == mlkem1024::MlKem1024PrivateKey::len() + mlkem1024::MlKem1024PublicKey::len()
+        && std::mem::align_of::<mlkem1024::MlKem1024KeyPair>() == 1
+);
+
+impl Drop for KemSecret {
+    fn drop(&mut self) {
+        // libcrux offers no mutable access to the private key: wipe the key pair's memory.
+        // SAFETY: an ML-KEM key pair consists of byte arrays only (no padding, no pointers),
+        // so all-zero bytes are a valid value; it is not used after this.
+        unsafe {
+            let p = &mut self.pq as *mut mlkem1024::MlKem1024KeyPair as *mut u8;
+            std::slice::from_raw_parts_mut(p, std::mem::size_of::<mlkem1024::MlKem1024KeyPair>())
+                .zeroize();
+        }
+    }
+}
+
 pub struct SigSecret {
     pq: ml_dsa_65::MLDSA65KeyPair,
     ec: ed25519_dalek::SigningKey,
@@ -502,8 +522,18 @@ pub fn check_kem_public(k: &KemPublic) -> Result<()> {
     if !mlkem1024::validate_public_key(&mlkem1024::MlKem1024PublicKey::from(pq)) {
         return Err(Error::format("invalid ML-KEM public key"));
     }
-    if k.ec.len() != 32 {
-        return Err(Error::format("bad X25519 public key"));
+    let ec: [u8; 32] =
+        k.ec.as_slice()
+            .try_into()
+            .map_err(|_| Error::format("bad X25519 public key"))?;
+    // A low-order point makes every shared secret known; the hybrid would then rest on
+    // ML-KEM alone. Any clamped scalar maps such a point to zero.
+    let probe = x25519_dalek::StaticSecret::from([0x42u8; 32]);
+    if !probe
+        .diffie_hellman(&x25519_dalek::PublicKey::from(ec))
+        .was_contributory()
+    {
+        return Err(Error::format("weak X25519 public key"));
     }
     Ok(())
 }
@@ -511,6 +541,21 @@ pub fn check_kem_public(k: &KemPublic) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_order_x25519_keys_are_refused() {
+        let good = KemSecret::from_seed(&[7u8; 64], "test").public().clone();
+        check_kem_public(&good).unwrap();
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        for ec in [[0u8; 32], one] {
+            let k = KemPublic {
+                pq: good.pq.clone(),
+                ec: ec.to_vec(),
+            };
+            assert!(check_kem_public(&k).is_err());
+        }
+    }
 
     #[test]
     fn sign_verify_roundtrip() {

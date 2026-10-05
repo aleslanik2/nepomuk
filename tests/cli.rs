@@ -1398,3 +1398,70 @@ fn project_pointing_elsewhere_is_noticed() {
     assert!(out.contains("used this vault at"), "{out}");
     r.data();
 }
+
+/// Audit 2026-10-05: `CI=true` from a project's .envrc must not let NEPOMUK_ROOT_FP pin a vault
+/// for someone at a terminal; there it takes an explicit `--ci`.
+#[cfg(unix)]
+#[test]
+fn root_fp_from_environment_needs_explicit_ci_in_a_terminal() {
+    let e = Env::new("root-fp-tty");
+    let fp = e.m(&["info"]).data()["master_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = e.master_identity();
+    let id = id.to_str().unwrap();
+    // Runs one command with its stdin on a pseudo-terminal and a fresh local state.
+    let in_tty = |args: &[&str]| -> String {
+        let c = e.command(
+            args,
+            &[
+                ("NEPOMUK_PASSPHRASE", MASTER_PASS),
+                ("NEPOMUK_ROOT_FP", &fp),
+                ("CI", "true"),
+            ],
+        );
+        let mut line = String::from("env -i");
+        for (k, v) in c.get_envs() {
+            if let Some(v) = v {
+                let v = if k == "NEPOMUK_STATE_DIR" {
+                    e.path("state-tty").into_os_string()
+                } else {
+                    v.to_os_string()
+                };
+                line.push(' ');
+                line.push_str(&sh_quote(&format!(
+                    "{}={}",
+                    k.to_string_lossy(),
+                    v.to_string_lossy()
+                )));
+            }
+        }
+        line.push(' ');
+        line.push_str(&sh_quote(&c.get_program().to_string_lossy()));
+        for a in c.get_args() {
+            line.push(' ');
+            line.push_str(&sh_quote(&a.to_string_lossy()));
+        }
+        line.push_str(" 2>/dev/null");
+        let mut s = std::process::Command::new("script");
+        if cfg!(target_os = "macos") {
+            s.args(["-q", "/dev/null", "sh", "-c", &line]);
+        } else {
+            s.args(["-qec", &line, "/dev/null"]);
+        }
+        let out = s
+            .current_dir(e.path(""))
+            .stdin(std::process::Stdio::piped())
+            .output()
+            .expect("script(1)");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let out = in_tty(&["--identity", id, "info"]);
+    assert!(out.contains("UNTRUSTED_ROOT"), "{out}");
+    let out = in_tty(&["--ci", "--identity", id, "info"]);
+    assert!(
+        out.contains("\"ok\":true") || out.contains("\"ok\": true"),
+        "{out}"
+    );
+}

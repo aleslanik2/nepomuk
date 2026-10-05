@@ -55,6 +55,10 @@ EOF
 say() { printf 'nepomuk-install: %s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 
+# Everything below runs only from the last line: a download cut short by `curl | sh` is a
+# syntax error, never half an installation.
+main() {
+
 VERSION="${NEPOMUK_VERSION:-latest}"
 INSTALL_DIR="${NEPOMUK_INSTALL_DIR:-}"
 EXPECTED_SHA="${NEPOMUK_SHA256:-}"
@@ -478,3 +482,6 @@ if [ "$GUI" = 1 ]; then
     say "installed the nepomuk desktop app to $GUI_INSTALLED"
     if [ "$OS" = macos ]; then say "start it from Launchpad or with: open \"$GUI_INSTALLED\""; fi
 fi
+}
+
+main "$@"
