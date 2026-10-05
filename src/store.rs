@@ -57,7 +57,9 @@ impl From<Error> for SaveError {
 /// `config`) that arrived as files in a clone:
 /// - `safe.bareRepository=explicit` stops git from discovering a bare repository committed into
 ///   the project (git ≥ 2.38; older versions ignore it, [`Location::detect`] checks again);
-/// - `core.fsmonitor` and the `ext::` transport would run commands from that config.
+/// - `core.fsmonitor` and the `ext::` transport would run commands from that config;
+/// - hooks (`pre-push`, …) run nothing nepomuk needs, and a repository unpacked from an archive
+///   may bring its own `.git/hooks`.
 fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.args([
@@ -67,6 +69,8 @@ fn git(dir: &Path) -> Command {
         "core.fsmonitor=false",
         "-c",
         "protocol.ext.allow=never",
+        "-c",
+        "core.hooksPath=/dev/null",
     ]);
     c.arg("-C").arg(dir);
     c.env("GIT_TERMINAL_PROMPT", "0");

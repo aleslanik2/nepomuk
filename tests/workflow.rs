@@ -195,6 +195,91 @@ fn offline_changes_and_sync() {
     assert_eq!(e.m(&["get", "/s/token"]).data()["value"], "mine");
 }
 
+/// Audit 2026-10-05: the offline queue is wrapped for the public key only; without the
+/// identity's signature anyone who can write the state directory could queue changes.
+#[test]
+fn unsigned_offline_changes_are_not_replayed() {
+    let e = git_env("offline-forged");
+    e.m(&["mkdir", "/s"]).ok();
+    e.m_in(&["--offline", "put", "/s/new"], b"queued").ok();
+    let pending = std::fs::read_dir(e.path("state/pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = std::fs::read(&pending).unwrap();
+    let mut v: ciborium::Value = ciborium::from_reader(&original[..]).unwrap();
+    if let ciborium::Value::Map(m) = &mut v {
+        m.retain(|(k, _)| k.as_text() != Some("sig"));
+    }
+    let mut forged = Vec::new();
+    ciborium::into_writer(&v, &mut forged).unwrap();
+    std::fs::write(&pending, forged).unwrap();
+    let r = e.m(&["sync"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stdout.contains("not signed"), "{}", r.stdout);
+    assert_eq!(e.m(&["get", "/s/new"]).err_code(), "NOT_FOUND");
+
+    std::fs::write(&pending, original).unwrap();
+    e.m(&["sync"]).ok();
+    assert_eq!(e.m(&["get", "/s/new"]).data()["value"], "queued");
+}
+
+/// Audit 2026-10-05: the `--password-fd` descriptor is not inherited by the command `exec`
+/// runs, so it cannot read the passphrase again.
+#[cfg(unix)]
+#[test]
+fn exec_child_does_not_inherit_the_password_fd() {
+    let e = Env::new("exec-fd");
+    e.m(&["mkdir", "/infra"]).ok();
+    e.m_in(&["put", "/infra/pw"], b"v").ok();
+    std::fs::write(
+        e.path(".nepomuk.toml"),
+        format!(
+            "vault = \"{}\"\n\n[exec.build]\nenv.PW = \"/infra/pw\"\n",
+            e.vault.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(e.path("pw.txt"), format!("{MASTER_PASS}\n")).unwrap();
+    let id = e.master_identity();
+    let c = e.command(
+        &[
+            "--identity",
+            id.to_str().unwrap(),
+            "--password-fd",
+            "3",
+            "exec",
+            "build",
+            "--",
+            "sh",
+            "-c",
+            "if cat <&3 >/dev/null 2>&1; then echo fd-open; else echo fd-closed; fi",
+        ],
+        &[],
+    );
+    let prog = c.get_program().to_os_string();
+    let args: Vec<_> = c.get_args().map(|a| a.to_os_string()).collect();
+    let envs: Vec<_> = c
+        .get_envs()
+        .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+        .collect();
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$0\" \"$@\" 3<pw.txt")
+        .arg(prog)
+        .args(args)
+        .env_clear()
+        .envs(envs)
+        .current_dir(e.path(""))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("fd-closed"), "{stdout}");
+}
+
 #[test]
 fn exec_injects_masks_and_cleans_up() {
     let e = Env::new("exec");
@@ -403,6 +488,63 @@ fn serve_stdio_session() {
     assert_eq!(r["error"]["code"], -32601);
     drop(stdin);
     assert!(child.wait().unwrap().success());
+}
+
+/// Audit 2026-10-05: a command run by `exec.run` must not read the GUI's JSON-RPC requests.
+#[cfg(unix)]
+#[test]
+fn serve_exec_child_does_not_inherit_stdin() {
+    let e = Env::new("serve-exec");
+    e.m(&["mkdir", "/infra"]).ok();
+    e.m_in(&["put", "/infra/pw"], b"v").ok();
+    std::fs::write(
+        e.path(".nepomuk.toml"),
+        format!(
+            "vault = \"{}\"\n\n[exec.build]\nenv.PW = \"/infra/pw\"\n",
+            e.vault.display()
+        ),
+    )
+    .unwrap();
+    let mut child = e
+        .command(&["serve", "--stdio"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut call = |id: u64, method: &str, params: Value| -> Value {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        )
+        .unwrap();
+        loop {
+            let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            if v.get("id") == Some(&json!(id)) {
+                return v;
+            }
+        }
+    };
+    let id = e.master_identity();
+    call(
+        1,
+        "session.unlock",
+        json!({ "identity": id.to_str().unwrap(), "password": MASTER_PASS }),
+    );
+    let r = call(
+        2,
+        "exec.run",
+        json!({
+            "profile": "build",
+            "command": ["sh", "-c", "if [ -p /dev/stdin ]; then echo pipe; else echo other; fi"],
+        }),
+    );
+    assert_eq!(r["result"]["stdout"], "other\n", "{r}");
+    drop(stdin);
+    let _ = child.wait();
 }
 
 /// Audit 2026-10-04: the GUI's status poll (`passive`) must not keep the session unlocked.

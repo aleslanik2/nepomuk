@@ -123,6 +123,27 @@ pub struct ProjectConfig {
     pub dir: PathBuf,
 }
 
+/// A `.nepomuk.toml` found in an ancestor may belong to someone else (e.g. `/tmp` on a shared
+/// machine) and would decide where secrets are written; like git's `safe.directory`, only the
+/// user's own files are used. root (CI containers with a checkout of another uid) may use any.
+fn check_owner(p: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata(p)?.uid();
+        let me = unsafe { libc::geteuid() };
+        if uid != me && me != 0 {
+            return Err(Error::usage(format!(
+                "{} belongs to another user (uid {uid}); nepomuk only uses project files of the current user",
+                p.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = p;
+    Ok(())
+}
+
 impl ProjectConfig {
     /// Finds `.nepomuk.toml` in the current directory or its ancestors.
     pub fn discover() -> Result<Option<ProjectConfig>> {
@@ -130,6 +151,7 @@ impl ProjectConfig {
         loop {
             let p = dir.join(".nepomuk.toml");
             if p.is_file() {
+                check_owner(&p)?;
                 let s = std::fs::read_to_string(&p)?;
                 let mut c: ProjectConfig = toml::from_str(&s)
                     .map_err(|e| Error::usage(format!("{}: {e}", p.display())))?;
@@ -360,6 +382,36 @@ impl Locations {
         }
         write_private(&locations_path(), &serde_json::to_vec_pretty(&l).unwrap())
     }
+}
+
+/// Environment variables that carry passwords.
+const SECRET_ENV: [&str; 2] = ["NEPOMUK_PASSPHRASE", "NEPOMUK_PASSWORD"];
+
+static SECRET_ENV_TAKEN: std::sync::OnceLock<BTreeMap<&'static str, zeroize::Zeroizing<String>>> =
+    std::sync::OnceLock::new();
+
+/// Moves the password variables out of the process environment, so that no child (git, the
+/// agent, keytool, the installer, …) inherits them. Called once at start, before any thread.
+pub fn take_secret_env() {
+    let mut m = BTreeMap::new();
+    for v in SECRET_ENV {
+        if let Ok(x) = std::env::var(v) {
+            m.insert(v, zeroize::Zeroizing::new(x));
+            // SAFETY: called at the start of `main`, before any other thread exists.
+            unsafe { std::env::remove_var(v) };
+        }
+    }
+    let _ = SECRET_ENV_TAKEN.set(m);
+}
+
+/// A variable from the environment; password variables come from [`take_secret_env`].
+pub fn env_var(name: &str) -> Option<String> {
+    if let Some(m) = SECRET_ENV_TAKEN.get()
+        && SECRET_ENV.contains(&name)
+    {
+        return m.get(name).map(|x| x.to_string());
+    }
+    std::env::var(name).ok()
 }
 
 pub fn is_ci() -> bool {

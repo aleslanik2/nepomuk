@@ -165,7 +165,7 @@ See [docs/SPECIFICATION.md](docs/SPECIFICATION.md) for the full design: threat m
 curl -fsSL https://github.com/aleslanik2/nepomuk/releases/latest/download/install.sh | sh -s -- --gui --system
 ```
 
-This installs the latest release: the CLI into `/usr/local/bin` (using sudo) and the desktop app into Applications on macOS, as an AppImage with a menu entry on Linux, or through its installer on Windows. Without `--system` everything goes to your user account (the CLI into `~/.local/bin`); without `--gui` only the CLI is installed. Nothing is installed unless `SHA256SUMS` carries a valid release signature and every download matches it.
+This installs the latest release: the CLI into `/usr/local/bin` (using sudo) and the desktop app into Applications on macOS, as an AppImage with a menu entry on Linux, or through its installer on Windows. Without `--system` everything goes to your user account (the CLI into `~/.local/bin`); without `--gui` only the CLI is installed. Nothing is installed unless `SHA256SUMS` carries a valid release signature and every download matches it. Releases are signed with the SSH key `SHA256:ZAaNBE10XNmiLIFzzdid/hBqmzlhfwf1grn5Qb0X9XA` ([`nepomuk-release.pub`](nepomuk-release.pub)); the same key is embedded in `install.sh`, `install.ps1` and `nepomuk upgrade`.
 
 The script runs on Linux, macOS and Windows in Git Bash; for PowerShell use `install.ps1` from the same release (`-Gui`, `-System`). Other options: `--version <tag>` for a specific release, `--dir <path>` for another CLI location, `--sha256 <hash>` to pin the exact archive in CI, and `--from-source` to build with cargo (the app also needs Node.js). `nepomuk doctor` checks the installation: whether it is up to date, whether `nepomuk` in `PATH` is this installation, how the identity and the vault are configured, and whether you are a user of the vault. Later, `nepomuk upgrade` installs a newer release the same way (it updates the desktop app too, when installed); the CLI looks for new releases once a day and mentions them (`update_check = false` in `~/.config/nepomuk/config.toml` turns this off). While the repository is private, the download above does not work: set `GH_TOKEN`, get `install.sh` with `gh release download -R aleslanik2/nepomuk -p install.sh` and run `sh install.sh --gui --system`.
 
@@ -236,6 +236,7 @@ Not implemented yet: notarized / Authenticode-signed GUI installers, PQ SSH iden
 - It cannot audit **reads** – decryption happens offline on the user's machine.
 - It cannot take back what someone has already seen – after revoking access, rotate the secret at its source.
 - It cannot protect the vault if the **master key** is compromised – keep it offline and backed up (a hardware token and Shamir backup are planned).
+- It cannot stop a **rollback** on a machine that has not seen the newer version – rollback and fork detection is per client. Someone who lost their rights but can still push could reset `main` to a version from before and continue from there: machines that saw the revocation refuse it, a new machine or a fresh CI runner without a submodule pin does not. Protect `main` against force-push and deletion, and remove push access when you offboard someone (see §15.4 of the specification).
 
 ## Roadmap
 

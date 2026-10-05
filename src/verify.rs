@@ -1,7 +1,7 @@
 //! Replaying and verifying the log (§5.4, §7, §8): every client checks every signature and
 //! that each operation's author held the required right at that moment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::crypto;
 use crate::error::{Code, Error, Result};
@@ -40,9 +40,10 @@ impl State {
     /// Node and all its ancestors, starting with the node itself.
     pub fn ancestors(&self, node: Id) -> Vec<Id> {
         let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut cur = Some(node);
         while let Some(id) = cur {
-            if out.contains(&id) {
+            if !seen.insert(id) {
                 break;
             }
             out.push(id);
@@ -59,17 +60,33 @@ impl State {
             .collect()
     }
 
-    /// The node and all its descendants in pre-order.
+    /// The node and all its descendants in pre-order. One pass over the nodes: the log is
+    /// written by its users, and a large folder must not make every client quadratic.
     pub fn subtree(&self, node: Id) -> Vec<Id> {
+        let mut kids: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+        for n in self.nodes.values() {
+            if let Some(p) = n.parent {
+                kids.entry(p).or_default().push(n.id);
+            }
+        }
         let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut stack = vec![node];
         while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
             out.push(id);
-            let mut kids = self.children(id);
-            kids.reverse();
-            stack.extend(kids);
+            if let Some(k) = kids.get(&id) {
+                stack.extend(k.iter().rev());
+            }
         }
         out
+    }
+
+    /// Number of folders above the node.
+    fn depth(&self, node: Id) -> usize {
+        self.ancestors(node).len() - 1
     }
 
     pub fn grants_on(&self, nodes: &[Id]) -> Vec<&Grant> {
@@ -394,6 +411,13 @@ pub fn verify_file_with(file: VaultFile, pinned_fp: &str, former: &[String]) -> 
         ) {
             return Err(sig_err(format!("#{}: invalid signature", body.seq)).with("seq", body.seq));
         }
+        if body.ops.len() > MAX_OPS {
+            return Err(Error::new(
+                Code::UnauthorizedOperation,
+                format!("#{}: too many operations in one commit", body.seq),
+            )
+            .with("seq", body.seq));
+        }
         let mut next = state.clone();
         for op in &body.ops {
             apply_op(&mut next, body.author, op).map_err(|e| {
@@ -463,6 +487,12 @@ fn touched_node(op: &Op) -> Option<Id> {
 
 // ---------------------------------------------------------------- Authorization of operations
 
+/// Limits on what one author can make every client replay (§7): far above any real vault,
+/// low enough that verification stays fast.
+pub const MAX_DEPTH: usize = 64;
+pub const MAX_NODES: usize = 100_000;
+pub const MAX_OPS: usize = 10_000;
+
 fn deny(m: impl Into<String>) -> Error {
     Error::unauthorized(m)
 }
@@ -499,6 +529,10 @@ fn check_rewrapped(s: &State, grants: &[Grant], scope: &[Id]) -> Result<()> {
     Ok(())
 }
 
+fn disabled_user(s: &State, p: Principal) -> bool {
+    matches!(p, Principal::User(u) if s.users.get(&u).is_some_and(|u| u.disabled))
+}
+
 fn check_principal(s: &State, p: Principal) -> Result<()> {
     match p {
         Principal::User(u) => require(s.active(u), "recipient is unknown or disabled"),
@@ -519,6 +553,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 "user name already exists",
             )?;
             require(!user.disabled, "new user must be enabled")?;
+            require(
+                crate::identity::validate_name(&user.name).is_ok(),
+                "invalid user name",
+            )?;
             check_identity(
                 &user.name,
                 user.kind,
@@ -688,6 +726,10 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(!s.groups.contains_key(&group.id), "group id already exists")?;
             require(
+                crate::identity::validate_name(&group.name).is_ok(),
+                "invalid group name",
+            )?;
+            require(
                 s.group_by_name(&group.name).is_none(),
                 "group name already exists",
             )?;
@@ -741,12 +783,23 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(g.members.contains_key(user), "not a member")?;
             require(&g.kem != kem, "the group needs a new key")?;
-            let expected: BTreeSet<Id> = g.members.keys().filter(|m| *m != user).copied().collect();
+            // Disabled members may be left out: they leave the group with the removed member,
+            // so the new group key is not wrapped for someone who was offboarded.
+            let remaining: BTreeSet<Id> =
+                g.members.keys().filter(|m| *m != user).copied().collect();
+            let required: BTreeSet<Id> = remaining
+                .iter()
+                .filter(|m| s.active(**m))
+                .copied()
+                .collect();
             let got: BTreeSet<Id> = members.keys().copied().collect();
             require(
-                expected == got,
+                required.is_subset(&got) && got.is_subset(&remaining),
                 "the new group key must be wrapped for all remaining members",
             )?;
+            let mut removed: Vec<Id> = remaining.difference(&got).copied().collect();
+            removed.push(*user);
+            let keeps_disabled = got.iter().any(|m| !s.active(*m));
             let gid = *group;
             let group_grants: BTreeSet<Id> = s
                 .grants
@@ -767,23 +820,28 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for x in grants {
                 s.grants.insert(x.id, x.clone());
             }
-            for x in grants {
-                s.mark_rekey_pending(x.node, Principal::User(*user));
-            }
-            // What the group lost earlier without a rekey, the removed member knew too.
+            // What the group lost earlier without a rekey, the removed members knew too.
             let lost: Vec<Id> = s
                 .rekey_pending
                 .iter()
                 .filter(|(_, who)| who.contains(&Principal::Group(gid)))
                 .map(|(n, _)| *n)
                 .collect();
-            for n in lost {
-                s.mark_rekey_pending(n, Principal::User(*user));
+            for u in &removed {
+                for x in grants {
+                    s.mark_rekey_pending(x.node, Principal::User(*u));
+                }
+                for n in &lost {
+                    s.mark_rekey_pending(*n, Principal::User(*u));
+                }
+                if let Some(m) = s.sysrights.get_mut(u) {
+                    m.remove(&SysRight::GroupAdmin(gid));
+                }
             }
-            // A new group key: replaced keys of former members no longer open its grants.
-            s.stale_groups.remove(&gid);
-            if let Some(m) = s.sysrights.get_mut(user) {
-                m.remove(&SysRight::GroupAdmin(gid));
+            // A new group key: replaced keys of former members no longer open its grants. A
+            // disabled member that stays knows the new key, so the group stays stale.
+            if !keeps_disabled {
+                s.stale_groups.remove(&gid);
             }
         }
         Op::CreateNode { node } => {
@@ -797,6 +855,8 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.has_right(author, parent, Right::Write),
                 "requires `write` on the parent",
             )?;
+            require(s.nodes.len() < MAX_NODES, "too many nodes in the vault")?;
+            require(s.depth(parent) < MAX_DEPTH, "folders nested too deep")?;
             s.nodes.insert(node.id, node.clone());
         }
         Op::UpdateNode { id, content } => {
@@ -855,7 +915,17 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 before == Some(Right::Admin) || s.effective_right(author, *parent) <= before,
                 "moving it would give you more rights on it; requires `admin` on it",
             )?;
-            check_rewrapped(s, grants, &s.subtree(*id))?;
+            let sub = s.subtree(*id);
+            check_rewrapped(s, grants, &sub)?;
+            let below = sub
+                .iter()
+                .map(|n| s.depth(*n) - s.depth(*id))
+                .max()
+                .unwrap_or(0);
+            require(
+                s.depth(*parent) + 1 + below <= MAX_DEPTH,
+                "folders nested too deep",
+            )?;
             // Whoever still knows the key of a folder it leaves also knows its key: the marks
             // of the former ancestors come along.
             let former: Vec<Id> = s.ancestors(*id).into_iter().skip(1).collect();
@@ -977,13 +1047,23 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 expected == got && got.len() == nodes.len(),
                 "rekey must cover the whole subtree",
             )?;
-            let expected: BTreeSet<Id> = s.grants_on(&sub).iter().map(|g| g.id).collect();
+            // Grants of disabled users may be left out: they are dropped, so the new keys are
+            // not wrapped for someone who was offboarded.
+            let all: BTreeSet<Id> = s.grants_on(&sub).iter().map(|g| g.id).collect();
+            let required: BTreeSet<Id> = s
+                .grants_on(&sub)
+                .iter()
+                .filter(|g| !disabled_user(s, g.to))
+                .map(|g| g.id)
+                .collect();
             let got: BTreeSet<Id> = grants.iter().map(|g| g.id).collect();
             require(
-                expected == got,
+                required.is_subset(&got) && got.is_subset(&all),
                 "rekey must re-issue all grants in the subtree",
             )?;
             check_rewrapped(s, grants, &sub)?;
+            let dropped: BTreeSet<Id> = all.difference(&got).copied().collect();
+            s.remove_grants_where(|g| dropped.contains(&g.id));
             for rn in nodes {
                 let n = s.nodes.get_mut(&rn.id).unwrap();
                 require(
@@ -1002,6 +1082,15 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.former_master = None;
             }
             s.clear_rekey_pending(*node, None);
+            // A disabled user whose grant was re-issued knows the new keys too.
+            let known: Vec<(Id, Principal)> = grants
+                .iter()
+                .filter(|g| disabled_user(s, g.to))
+                .map(|g| (g.node, g.to))
+                .collect();
+            for (n, who) in known {
+                s.mark_rekey_pending(n, who);
+            }
             s.clear_stale_keys(*node);
         }
         Op::GrantSystemRight {

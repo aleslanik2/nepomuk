@@ -1651,3 +1651,168 @@ fn group_admin_goes_with_the_membership() {
     .unwrap_err();
     assert!(e.message.contains("only a member"), "{}", e.message);
 }
+
+/// Audit 2026-10-05, H1: rekeying after an offboarding that could not revoke the grants must
+/// not wrap the new keys for the disabled user, nor silence the pending rekey.
+#[test]
+fn rekey_drops_grants_of_disabled_users() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&alice, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    let a = t.user_named("alice").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.mkdir("/p", false).unwrap();
+    t.put(
+        "/p/s",
+        Content::Text {
+            value: "old".into(),
+        },
+        None,
+    )
+    .unwrap();
+    t.grant(Principal::User(a), Right::Read, "/p").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    // Offboarding with only `users` leaves her grant as a task.
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.offboard(a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.grants.values().any(|g| g.to == Principal::User(a)));
+    assert!(!v.state.rekey_pending.is_empty());
+
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rekey_pending().unwrap();
+    t.put(
+        "/p/s",
+        Content::Text {
+            value: "new".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(!v.state.grants.values().any(|g| g.to == Principal::User(a)));
+    assert!(v.state.rekey_pending.is_empty());
+    assert!(Access::build(&v.state, a, &alice).nodes.is_empty());
+}
+
+/// Audit 2026-10-05, H2: removing another member must not wrap the new group key for a
+/// disabled member, nor mark the group as no longer stale while it holds the key.
+#[test]
+fn group_removal_drops_disabled_members() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    for u in [&alice, &bob, &it] {
+        t.user_add(&Request::new(u, None)).unwrap();
+    }
+    let a = t.user_named("alice").unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, a).unwrap();
+    t.group_add(g, b).unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.offboard(a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.groups[&g].members.contains_key(&a));
+
+    // Bob leaves for an unrelated reason: Alice leaves with him.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.group_remove(g, b).unwrap();
+    t.put(
+        "/grp/s",
+        Content::Text {
+            value: "new".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let members = &v.state.groups[&g].members;
+    assert!(!members.contains_key(&a) && !members.contains_key(&b));
+    assert!(v.state.stale_groups.is_empty());
+    assert!(Access::build(&v.state, a, &alice).nodes.is_empty());
+    assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
+}
+
+/// Audit 2026-10-05, L1: names are checked only by honest writers. A node whose decrypted name
+/// would forge a path or terminal output is not shown, and the verifier refuses such user and
+/// group names.
+#[test]
+fn deceptive_names_from_the_vault_are_refused() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mkdir("/p", false).unwrap();
+    t.put("/p/doc", Content::Text { value: "x".into() }, None)
+        .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let me = tx::find_me(&v.state, &master).unwrap();
+    let acc = Access::build(&v.state, me, &master);
+    let doc = acc.resolve("/p/doc").unwrap();
+    let key = acc.key(doc).unwrap().clone();
+    for evil in ["a/b", "x\u{1b}]52;c;aGk=\u{7}", "\u{202e}cod.exe", ".."] {
+        let mut s = v.state.clone();
+        let sealed = keyring::seal_name(s.vault_id, doc, &key, evil);
+        let n = s.nodes.get_mut(&doc).unwrap();
+        n.name = sealed.sealed;
+        n.name_commit = sealed.commit;
+        let acc = Access::build(&s, me, &master);
+        assert!(acc.resolve("/p").is_some());
+        assert!(!acc.nodes.contains_key(&doc), "{evil:?} is shown");
+    }
+
+    let other = Unlocked::generate("other", IdentityKind::Local);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&other, None)).unwrap();
+    t.group_create("devs").unwrap();
+    let base = v.state.clone();
+    let mut user_op = t.ops[0].clone();
+    if let Op::AddUser { user } = &mut user_op {
+        user.name = "other\u{1b}[2J".into();
+    }
+    let e = nepomuk::verify::apply_op(&mut base.clone(), me, &user_op).unwrap_err();
+    assert!(e.message.contains("invalid user name"), "{}", e.message);
+    let mut group_op = t.ops[1].clone();
+    if let Op::CreateGroup { group } = &mut group_op {
+        group.name = "de\u{202e}vs".into();
+    }
+    let e = nepomuk::verify::apply_op(&mut base.clone(), me, &group_op).unwrap_err();
+    assert!(e.message.contains("invalid group name"), "{}", e.message);
+}
+
+/// Audit 2026-10-05, L2: every client replays the whole log, so one author must not be able to
+/// make it unbearably slow: nesting depth and the size of a commit are limited.
+#[test]
+fn replay_limits_depth_and_commit_size() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let v = new_vault(&master);
+    let deepest = format!("/{}", vec!["d"; nepomuk::verify::MAX_DEPTH].join("/"));
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.mkdir(&deepest, true).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let mut t = Tx::new(&v, &master).unwrap();
+    let e = t.mkdir(&format!("{deepest}/x"), false).unwrap_err();
+    assert!(e.message.contains("nested too deep"), "{}", e.message);
+
+    let me = tx::find_me(&v.state, &master).unwrap();
+    let ops = vec![Op::MarkRotation { node: v.state.root }; nepomuk::verify::MAX_OPS + 1];
+    let mut f = v.file.clone();
+    sign_commit(&mut f, &master, me, v.seq + 1, ops);
+    let e = verify_file(f, &master.fingerprint()).unwrap_err();
+    assert!(e.message.contains("too many operations"), "{}", e.message);
+}

@@ -209,8 +209,18 @@ fn base_url() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+/// Other release keys, for tests only: in a release build the environment (e.g. a project's
+/// .envrc) must not replace the key every upgrade is checked against.
+fn signers_override() -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) {
+        std::env::var_os("NEPOMUK_UPGRADE_SIGNERS")
+    } else {
+        None
+    }
+}
+
 fn signers() -> Result<String> {
-    match std::env::var_os("NEPOMUK_UPGRADE_SIGNERS") {
+    match signers_override() {
         Some(f) => Ok(std::fs::read_to_string(f)?),
         None => Ok(RELEASE_SIGNERS.to_string()),
     }
@@ -394,8 +404,19 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
         }
         let app = installed_app(&exe_dir);
         let with_gui = gui.unwrap_or(app.is_some());
+        // The installer reads its defaults from the environment too; a pinned hash there
+        // would replace the signature check, so only the arguments given here count.
+        let installer_env = [
+            "NEPOMUK_VERSION",
+            "NEPOMUK_INSTALL_DIR",
+            "NEPOMUK_SHA256",
+            "NEPOMUK_BASE_URL",
+        ];
         let status = if cfg!(windows) {
             let mut c = Command::new("powershell");
+            for v in installer_env {
+                c.env_remove(v);
+            }
             c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
                 .arg(&script);
             c.args(["-Version", tag, "-Dir"])
@@ -407,6 +428,9 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
             c.status()?
         } else {
             let mut c = Command::new("sh");
+            for v in installer_env {
+                c.env_remove(v);
+            }
             c.arg(&script)
                 .args(["--version", tag, "--dir"])
                 .arg(&exe_dir);
@@ -414,7 +438,7 @@ pub fn run(tag: &str, gui: Option<bool>) -> Result<i32> {
                 c.arg("--base-url")
                     .arg(format!("{}/{tag}", base.trim_end_matches('/')));
             }
-            if let Some(f) = std::env::var_os("NEPOMUK_UPGRADE_SIGNERS") {
+            if let Some(f) = signers_override() {
                 c.arg("--signers").arg(f);
             }
             if with_gui {
