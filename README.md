@@ -167,6 +167,15 @@ curl -fsSL https://github.com/aleslanik2/nepomuk/releases/latest/download/instal
 
 This installs the latest release: the CLI into `/usr/local/bin` (using sudo) and the desktop app into Applications on macOS, as an AppImage with a menu entry on Linux, or through its installer on Windows. Without `--system` everything goes to your user account (the CLI into `~/.local/bin`); without `--gui` only the CLI is installed. Nothing is installed unless `SHA256SUMS` carries a valid release signature and every download matches it. Releases are signed with the SSH key `SHA256:ZAaNBE10XNmiLIFzzdid/hBqmzlhfwf1grn5Qb0X9XA` ([`nepomuk-release.pub`](nepomuk-release.pub)); the same key is embedded in `install.sh`, `install.ps1` and `nepomuk upgrade`.
 
+With Homebrew (macOS, Linux):
+
+```bash
+brew install aleslanik2/nepomuk/nepomuk               # the CLI
+brew install --cask aleslanik2/nepomuk/nepomuk-gui    # the desktop app (macOS)
+```
+
+Homebrew installs the same signed release binaries (the hashes in [the tap](https://github.com/aleslanik2/homebrew-nepomuk) come from the signed `SHA256SUMS`); update them with `brew upgrade`.
+
 The script runs on Linux, macOS and Windows in Git Bash; for PowerShell use `install.ps1` from the same release (`-Gui`, `-System`). Other options: `--version <tag>` for a specific release, `--dir <path>` for another CLI location, `--sha256 <hash>` to pin the exact archive in CI, and `--from-source` to build with cargo (the app also needs Node.js). `nepomuk doctor` checks the installation: whether it is up to date, whether `nepomuk` in `PATH` is this installation, how the identity and the vault are configured, and whether you are a user of the vault. Later, `nepomuk upgrade` installs a newer release the same way (it updates the desktop app too, when installed); the CLI looks for new releases once a day and mentions them (`update_check = false` in `~/.config/nepomuk/config.toml` turns this off). While the repository is private, the download above does not work: set `GH_TOKEN`, get `install.sh` with `gh release download -R aleslanik2/nepomuk -p install.sh` and run `sh install.sh --gui --system`.
 
 ## Moving a vault from 0.2.x (obsolete)
@@ -203,6 +212,7 @@ git config merge.nepomuk.driver "nepomuk git-merge %O %A %B"
 1. Once: create the release signing key (`ssh-keygen -t ed25519 -C release@nepomuk -f nepomuk-release`) and put `release@nepomuk <public key>` into `RELEASE_SIGNERS` in `install.sh` and `$ReleaseSigners` in `install.ps1` (`scripts/release-signers.sh check` compares them).
 2. Bump `version` in `Cargo.toml`, `gui/src-tauri/Cargo.toml` and `gui/src-tauri/tauri.conf.json`, then push a tag `v<version>`. [`.github/workflows/release.yml`](.github/workflows/release.yml) runs the tests and the UI harness, builds the CLI for six targets (static musl on Linux) and the desktop app for macOS, Windows and Linux, smoke-tests both installers, and creates the release with `SHA256SUMS` over every file.
 3. Signing: with the secret `NEPOMUK_RELEASE_SIGNING_KEY` the workflow signs and publishes; without it the release stays a draft and `scripts/sign-release.sh v<version> <key>` signs it offline and publishes it.
+4. Homebrew: `scripts/update-homebrew.sh v<version> <checkout of aleslanik2/homebrew-nepomuk>` verifies the release signature and writes the formula and the cask from the signed hashes; review, commit and push the tap.
 
 ## GUI
 

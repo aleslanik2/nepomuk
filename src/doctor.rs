@@ -85,7 +85,7 @@ fn latest_check(current: &str, out: &mut Vec<Check>) {
         Some(latest) if upgrade::is_newer(&latest, current) => out.push(warn(
             "version",
             format!("nepomuk {current} is installed; {latest} is available"),
-            "run `nepomuk upgrade`",
+            format!("run `{}`", upgrade::upgrade_command()),
         )),
         Some(latest) => out.push(ok(
             "version",
