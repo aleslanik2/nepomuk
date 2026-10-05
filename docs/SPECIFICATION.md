@@ -300,16 +300,16 @@ Each commit carries one or more operations applied atomically. The client verifi
 | `MoveNode` | `write` on the old and the new parent; the author's right on the node must not rise by the move (e.g. from `write` in a shared folder to `admin` in its own), unless the author is `admin` on the node already |
 | `Grant read/write` | `share` on the node, not above the own right |
 | `Grant share/admin`, `Revoke` | `admin` on the node |
-| `Rekey` (new NK for a subtree) | `admin` on the node's parent or master |
+| `Rekey` (new NK for a subtree) | `admin` on the node's parent or master; must re-issue every grant in the subtree except those of disabled users, which may be left out and are then dropped (a re-issued one stays in `rekey_pending`) |
 | `GrantSystemRight` | the same right with `+delegate`, or master |
 | `MarkRotation`, `ClearRotation` | `write` on the node |
-| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1). A disabled user still in a group knows the group key: `DisableUser` puts its groups in `stale_groups` until a group admin removes it (`RemoveMember` gives the group a new key), so rekeys and grants for the group stay recorded |
+| `Revoke`, `RemoveMember`, `DisableUser` | as above; each records in `rekey_pending` the nodes the principal can no longer read but still holds keys to, until a `Rekey` (§8.1). A disabled user still in a group knows the group key: `DisableUser` puts its groups in `stale_groups` until a group admin removes it (`RemoveMember` gives the group a new key), so rekeys and grants for the group stay recorded. `RemoveMember` may leave disabled members out of the new group key; they then leave the group too, and the group stays in `stale_groups` while a disabled member remains |
 | `TransferMaster`, `Checkpoint` | master; `TransferMaster` records the former master until a `Rekey` of the root (§8.3) |
 
 ### 8.1 Revocation and rekey
 
 1. `Revoke` removes the grant.
-2. A `Rekey` of the affected subtree follows automatically: new NKs for the node and all descendants, re-encrypted content, keys re-wrapped under the parent, and new grants for all remaining recipients in the subtree.
+2. A `Rekey` of the affected subtree follows automatically: new NKs for the node and all descendants, re-encrypted content, keys re-wrapped under the parent, and new grants for all remaining recipients in the subtree except disabled users, whose grants are dropped.
 3. Both are in one commit; revocation without rekey is only possible with `--no-rekey` and a warning.
 4. nepomuk lists the secrets the revoked party had access to and marks them "pending rotation".
 

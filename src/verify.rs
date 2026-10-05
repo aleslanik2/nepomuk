@@ -499,6 +499,10 @@ fn check_rewrapped(s: &State, grants: &[Grant], scope: &[Id]) -> Result<()> {
     Ok(())
 }
 
+fn disabled_user(s: &State, p: Principal) -> bool {
+    matches!(p, Principal::User(u) if s.users.get(&u).is_some_and(|u| u.disabled))
+}
+
 fn check_principal(s: &State, p: Principal) -> Result<()> {
     match p {
         Principal::User(u) => require(s.active(u), "recipient is unknown or disabled"),
@@ -741,12 +745,23 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             )?;
             require(g.members.contains_key(user), "not a member")?;
             require(&g.kem != kem, "the group needs a new key")?;
-            let expected: BTreeSet<Id> = g.members.keys().filter(|m| *m != user).copied().collect();
+            // Disabled members may be left out: they leave the group with the removed member,
+            // so the new group key is not wrapped for someone who was offboarded.
+            let remaining: BTreeSet<Id> =
+                g.members.keys().filter(|m| *m != user).copied().collect();
+            let required: BTreeSet<Id> = remaining
+                .iter()
+                .filter(|m| s.active(**m))
+                .copied()
+                .collect();
             let got: BTreeSet<Id> = members.keys().copied().collect();
             require(
-                expected == got,
+                required.is_subset(&got) && got.is_subset(&remaining),
                 "the new group key must be wrapped for all remaining members",
             )?;
+            let mut removed: Vec<Id> = remaining.difference(&got).copied().collect();
+            removed.push(*user);
+            let keeps_disabled = got.iter().any(|m| !s.active(*m));
             let gid = *group;
             let group_grants: BTreeSet<Id> = s
                 .grants
@@ -767,23 +782,28 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
             for x in grants {
                 s.grants.insert(x.id, x.clone());
             }
-            for x in grants {
-                s.mark_rekey_pending(x.node, Principal::User(*user));
-            }
-            // What the group lost earlier without a rekey, the removed member knew too.
+            // What the group lost earlier without a rekey, the removed members knew too.
             let lost: Vec<Id> = s
                 .rekey_pending
                 .iter()
                 .filter(|(_, who)| who.contains(&Principal::Group(gid)))
                 .map(|(n, _)| *n)
                 .collect();
-            for n in lost {
-                s.mark_rekey_pending(n, Principal::User(*user));
+            for u in &removed {
+                for x in grants {
+                    s.mark_rekey_pending(x.node, Principal::User(*u));
+                }
+                for n in &lost {
+                    s.mark_rekey_pending(*n, Principal::User(*u));
+                }
+                if let Some(m) = s.sysrights.get_mut(u) {
+                    m.remove(&SysRight::GroupAdmin(gid));
+                }
             }
-            // A new group key: replaced keys of former members no longer open its grants.
-            s.stale_groups.remove(&gid);
-            if let Some(m) = s.sysrights.get_mut(user) {
-                m.remove(&SysRight::GroupAdmin(gid));
+            // A new group key: replaced keys of former members no longer open its grants. A
+            // disabled member that stays knows the new key, so the group stays stale.
+            if !keeps_disabled {
+                s.stale_groups.remove(&gid);
             }
         }
         Op::CreateNode { node } => {
@@ -977,13 +997,23 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 expected == got && got.len() == nodes.len(),
                 "rekey must cover the whole subtree",
             )?;
-            let expected: BTreeSet<Id> = s.grants_on(&sub).iter().map(|g| g.id).collect();
+            // Grants of disabled users may be left out: they are dropped, so the new keys are
+            // not wrapped for someone who was offboarded.
+            let all: BTreeSet<Id> = s.grants_on(&sub).iter().map(|g| g.id).collect();
+            let required: BTreeSet<Id> = s
+                .grants_on(&sub)
+                .iter()
+                .filter(|g| !disabled_user(s, g.to))
+                .map(|g| g.id)
+                .collect();
             let got: BTreeSet<Id> = grants.iter().map(|g| g.id).collect();
             require(
-                expected == got,
+                required.is_subset(&got) && got.is_subset(&all),
                 "rekey must re-issue all grants in the subtree",
             )?;
             check_rewrapped(s, grants, &sub)?;
+            let dropped: BTreeSet<Id> = all.difference(&got).copied().collect();
+            s.remove_grants_where(|g| dropped.contains(&g.id));
             for rn in nodes {
                 let n = s.nodes.get_mut(&rn.id).unwrap();
                 require(
@@ -1002,6 +1032,15 @@ pub fn apply_op(s: &mut State, author: Id, op: &Op) -> Result<()> {
                 s.former_master = None;
             }
             s.clear_rekey_pending(*node, None);
+            // A disabled user whose grant was re-issued knows the new keys too.
+            let known: Vec<(Id, Principal)> = grants
+                .iter()
+                .filter(|g| disabled_user(s, g.to))
+                .map(|g| (g.node, g.to))
+                .collect();
+            for (n, who) in known {
+                s.mark_rekey_pending(n, who);
+            }
             s.clear_stale_keys(*node);
         }
         Op::GrantSystemRight {

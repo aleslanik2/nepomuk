@@ -763,7 +763,17 @@ impl<'a> Tx<'a> {
             .proof(node)
             .ok_or_else(|| Error::access_denied(acc.path(node).unwrap_or("?")))?;
         let above = top.salts.len().saturating_sub(1);
-        let old: Vec<Grant> = self.state.grants_on(&sub).into_iter().cloned().collect();
+        // Grants of disabled users are dropped: the new keys are not wrapped for them.
+        let old: Vec<Grant> = self
+            .state
+            .grants_on(&sub)
+            .into_iter()
+            .filter(|g| match g.to {
+                Principal::User(u) => self.state.active(u),
+                Principal::Group(_) => true,
+            })
+            .cloned()
+            .collect();
         let mut grants = Vec::new();
         for g in old {
             let p = acc
@@ -1521,8 +1531,13 @@ impl<'a> Tx<'a> {
                 "you must be a member of the group to remove members",
             ));
         }
+        // Disabled members leave the group too: the new key is not wrapped for them.
         let mut members = BTreeMap::new();
-        for m in g.members.keys().filter(|m| **m != user) {
+        for m in g
+            .members
+            .keys()
+            .filter(|m| **m != user && self.state.active(**m))
+        {
             let w = crypto::wrap(
                 &self.state.users[m].kem,
                 seed.as_ref(),

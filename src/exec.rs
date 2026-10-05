@@ -487,6 +487,10 @@ fn run_inner(spec: ExecSpec, command: &[String], capture: bool) -> Result<(i32, 
     if spec.mask {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    // Under `serve --stdio` stdin carries the JSON-RPC requests (passwords, secret values).
+    if capture {
+        cmd.stdin(Stdio::null());
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::general(format!("cannot start {}: {e}", command[0])))?;

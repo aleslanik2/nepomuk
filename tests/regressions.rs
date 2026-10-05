@@ -1651,3 +1651,100 @@ fn group_admin_goes_with_the_membership() {
     .unwrap_err();
     assert!(e.message.contains("only a member"), "{}", e.message);
 }
+
+/// Audit 2026-10-05, H1: rekeying after an offboarding that could not revoke the grants must
+/// not wrap the new keys for the disabled user, nor silence the pending rekey.
+#[test]
+fn rekey_drops_grants_of_disabled_users() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.user_add(&Request::new(&alice, None)).unwrap();
+    t.user_add(&Request::new(&it, None)).unwrap();
+    let a = t.user_named("alice").unwrap();
+    let i = t.user_named("it").unwrap();
+    t.mkdir("/p", false).unwrap();
+    t.put(
+        "/p/s",
+        Content::Text {
+            value: "old".into(),
+        },
+        None,
+    )
+    .unwrap();
+    t.grant(Principal::User(a), Right::Read, "/p").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    // Offboarding with only `users` leaves her grant as a task.
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.offboard(a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.grants.values().any(|g| g.to == Principal::User(a)));
+    assert!(!v.state.rekey_pending.is_empty());
+
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.rekey_pending().unwrap();
+    t.put(
+        "/p/s",
+        Content::Text {
+            value: "new".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(!v.state.grants.values().any(|g| g.to == Principal::User(a)));
+    assert!(v.state.rekey_pending.is_empty());
+    assert!(Access::build(&v.state, a, &alice).nodes.is_empty());
+}
+
+/// Audit 2026-10-05, H2: removing another member must not wrap the new group key for a
+/// disabled member, nor mark the group as no longer stale while it holds the key.
+#[test]
+fn group_removal_drops_disabled_members() {
+    let master = Unlocked::generate("master", IdentityKind::Local);
+    let alice = Unlocked::generate("alice", IdentityKind::Local);
+    let bob = Unlocked::generate("bob", IdentityKind::Local);
+    let it = Unlocked::generate("it", IdentityKind::Local);
+    let v = new_vault(&master);
+    let mut t = Tx::new(&v, &master).unwrap();
+    for u in [&alice, &bob, &it] {
+        t.user_add(&Request::new(u, None)).unwrap();
+    }
+    let a = t.user_named("alice").unwrap();
+    let b = t.user_named("bob").unwrap();
+    let i = t.user_named("it").unwrap();
+    let g = t.group_create("devs").unwrap();
+    t.group_add(g, a).unwrap();
+    t.group_add(g, b).unwrap();
+    t.mkdir("/grp", false).unwrap();
+    t.grant(Principal::Group(g), Right::Read, "/grp").unwrap();
+    t.sysgrant(i, SysRight::Users, false).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+
+    let mut t = Tx::new(&v, &it).unwrap();
+    t.offboard(a).unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    assert!(v.state.groups[&g].members.contains_key(&a));
+
+    // Bob leaves for an unrelated reason: Alice leaves with him.
+    let mut t = Tx::new(&v, &master).unwrap();
+    t.group_remove(g, b).unwrap();
+    t.put(
+        "/grp/s",
+        Content::Text {
+            value: "new".into(),
+        },
+        None,
+    )
+    .unwrap();
+    let (_, v, _, _) = t.commit().unwrap();
+    let members = &v.state.groups[&g].members;
+    assert!(!members.contains_key(&a) && !members.contains_key(&b));
+    assert!(v.state.stale_groups.is_empty());
+    assert!(Access::build(&v.state, a, &alice).nodes.is_empty());
+    assert!(nepomuk::queries::state_warnings(&v.state).is_empty());
+}

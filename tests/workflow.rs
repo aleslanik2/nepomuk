@@ -405,6 +405,63 @@ fn serve_stdio_session() {
     assert!(child.wait().unwrap().success());
 }
 
+/// Audit 2026-10-05: a command run by `exec.run` must not read the GUI's JSON-RPC requests.
+#[cfg(unix)]
+#[test]
+fn serve_exec_child_does_not_inherit_stdin() {
+    let e = Env::new("serve-exec");
+    e.m(&["mkdir", "/infra"]).ok();
+    e.m_in(&["put", "/infra/pw"], b"v").ok();
+    std::fs::write(
+        e.path(".nepomuk.toml"),
+        format!(
+            "vault = \"{}\"\n\n[exec.build]\nenv.PW = \"/infra/pw\"\n",
+            e.vault.display()
+        ),
+    )
+    .unwrap();
+    let mut child = e
+        .command(&["serve", "--stdio"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut call = |id: u64, method: &str, params: Value| -> Value {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        )
+        .unwrap();
+        loop {
+            let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            if v.get("id") == Some(&json!(id)) {
+                return v;
+            }
+        }
+    };
+    let id = e.master_identity();
+    call(
+        1,
+        "session.unlock",
+        json!({ "identity": id.to_str().unwrap(), "password": MASTER_PASS }),
+    );
+    let r = call(
+        2,
+        "exec.run",
+        json!({
+            "profile": "build",
+            "command": ["sh", "-c", "if [ -p /dev/stdin ]; then echo pipe; else echo other; fi"],
+        }),
+    );
+    assert_eq!(r["result"]["stdout"], "other\n", "{r}");
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Audit 2026-10-04: the GUI's status poll (`passive`) must not keep the session unlocked.
 #[test]
 fn passive_requests_do_not_keep_the_session_unlocked() {
